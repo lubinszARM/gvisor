@@ -2845,6 +2845,75 @@ func TestMinMaxBufferSizes(t *testing.T) {
 	checkSendBufferSize(t, ep, tcp.DefaultSendBufferSize*30)
 }
 
+func TestBindToDeviceOption(t *testing.T) {
+	s := stack.New([]string{ipv4.ProtocolName}, []string{tcp.ProtocolName}, stack.Options{})
+
+	ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
+	if err != nil {
+		t.Fatalf("NewEndpoint failed; %v", err)
+	}
+	defer ep.Close()
+
+	// Get default value.
+	var bindToDevice tcpip.BindToDeviceOption
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt got %v, want %v", err, nil)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+
+	linkEp := loopback.New()
+	if err := s.CreateNamedNIC(321, "my_device", linkEp); err != nil {
+		t.Errorf("CreateNamedNIC failed: %v", err)
+	}
+
+	// Make an nameless NIC.
+	linkEp2 := loopback.New()
+	if err := s.CreateNIC(54321, linkEp2); err != nil {
+		t.Errorf("CreateNIC failed: %v", err)
+	}
+
+	// Bind to a device that doesn't exist, value is unchanged.
+	bindToDevice = "non_existent_device"
+	if err := ep.SetSockOpt(bindToDevice); err != tcpip.ErrUnknownDevice {
+		t.Errorf("SetSockOpt got %v, want %v", err, tcpip.ErrUnknownDevice)
+	}
+	bindToDevice = ""
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+
+	// Bind to a device that exists, value is changed.
+	bindToDevice = "my_device"
+	if err := ep.SetSockOpt(bindToDevice); err != nil {
+		t.Errorf("SetSockOpt got %v, want %v", err, nil)
+	}
+	bindToDevice = ""
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "my_device" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "my_device")
+	}
+
+	// Unbind device, value is changed.
+	bindToDevice = ""
+	if err := ep.SetSockOpt(bindToDevice); err != nil {
+		t.Errorf("SetSockOpt got %v, want %v", err, nil)
+	}
+	bindToDevice = "this should change"
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+}
+
 func makeStack() (*stack.Stack, *tcpip.Error) {
 	s := stack.New([]string{
 		ipv4.ProtocolName,

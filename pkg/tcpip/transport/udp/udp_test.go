@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"math"
 	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -57,9 +59,9 @@ const (
 )
 
 type testContext struct {
-	t      *testing.T
-	linkEP *channel.Endpoint
-	s      *stack.Stack
+	t       *testing.T
+	linkEPs []*channel.Endpoint
+	s       *stack.Stack
 
 	ep tcpip.Endpoint
 	wq waiter.Queue
@@ -71,22 +73,29 @@ type headers struct {
 }
 
 func newDualTestContext(t *testing.T, mtu uint32) *testContext {
+	return newDualTestContextMultiNic(t, mtu, 1)
+}
+
+func newDualTestContextMultiNic(t *testing.T, mtu uint32, linkEpCount int) *testContext {
 	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName}, []string{udp.ProtocolName}, stack.Options{})
+	var linkEPs []*channel.Endpoint
+	for i := 1; i < linkEpCount+1; i++ {
+		id, linkEP := channel.New(256, mtu, "")
+		if testing.Verbose() {
+			id = sniffer.New(id)
+		}
+		if err := s.CreateNamedNIC(tcpip.NICID(i), "dev"+strconv.Itoa(i), id); err != nil {
+			t.Fatalf("CreateNIC failed: %v", err)
+		}
+		linkEPs = append(linkEPs, linkEP)
 
-	id, linkEP := channel.New(256, mtu, "")
-	if testing.Verbose() {
-		id = sniffer.New(id)
-	}
-	if err := s.CreateNIC(1, id); err != nil {
-		t.Fatalf("CreateNIC failed: %v", err)
-	}
+		if err := s.AddAddress(tcpip.NICID(i), ipv4.ProtocolNumber, stackAddr); err != nil {
+			t.Fatalf("AddAddress failed: %v", err)
+		}
 
-	if err := s.AddAddress(1, ipv4.ProtocolNumber, stackAddr); err != nil {
-		t.Fatalf("AddAddress failed: %v", err)
-	}
-
-	if err := s.AddAddress(1, ipv6.ProtocolNumber, stackV6Addr); err != nil {
-		t.Fatalf("AddAddress failed: %v", err)
+		if err := s.AddAddress(tcpip.NICID(i), ipv6.ProtocolNumber, stackV6Addr); err != nil {
+			t.Fatalf("AddAddress failed: %v", err)
+		}
 	}
 
 	s.SetRouteTable([]tcpip.Route{
@@ -105,9 +114,9 @@ func newDualTestContext(t *testing.T, mtu uint32) *testContext {
 	})
 
 	return &testContext{
-		t:      t,
-		s:      s,
-		linkEP: linkEP,
+		t:       t,
+		s:       s,
+		linkEPs: linkEPs,
 	}
 }
 
@@ -129,13 +138,13 @@ func (c *testContext) createV6Endpoint(v6only bool) {
 		v = 1
 	}
 	if err := c.ep.SetSockOpt(v); err != nil {
-		c.t.Fatalf("SetSockOpt failed failed: %v", err)
+		c.t.Fatalf("SetSockOpt failed: %v", err)
 	}
 }
 
 func (c *testContext) getPacket(protocolNumber tcpip.NetworkProtocolNumber, multicast bool) []byte {
 	select {
-	case p := <-c.linkEP.C:
+	case p := <-c.linkEPs[0].C:
 		if p.Proto != protocolNumber {
 			c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, protocolNumber)
 		}
@@ -171,7 +180,7 @@ func (c *testContext) getPacket(protocolNumber tcpip.NetworkProtocolNumber, mult
 	return nil
 }
 
-func (c *testContext) sendV6Packet(payload []byte, h *headers) {
+func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpIndex int) {
 	// Allocate a buffer for data and headers.
 	buf := buffer.NewView(header.UDPMinimumSize + header.IPv6MinimumSize + len(payload))
 	copy(buf[len(buf)-len(payload):], payload)
@@ -202,10 +211,10 @@ func (c *testContext) sendV6Packet(payload []byte, h *headers) {
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEP.Inject(ipv6.ProtocolNumber, buf.ToVectorisedView())
+	c.linkEPs[linkEpIndex].Inject(ipv6.ProtocolNumber, buf.ToVectorisedView())
 }
 
-func (c *testContext) sendPacket(payload []byte, h *headers) {
+func (c *testContext) sendPacket(payload []byte, h *headers, linkEpIndex int) {
 	// Allocate a buffer for data and headers.
 	buf := buffer.NewView(header.UDPMinimumSize + header.IPv4MinimumSize + len(payload))
 	copy(buf[len(buf)-len(payload):], payload)
@@ -238,7 +247,7 @@ func (c *testContext) sendPacket(payload []byte, h *headers) {
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEP.Inject(ipv4.ProtocolNumber, buf.ToVectorisedView())
+	c.linkEPs[linkEpIndex].Inject(ipv4.ProtocolNumber, buf.ToVectorisedView())
 }
 
 func newPayload() []byte {
@@ -281,7 +290,7 @@ func TestBindPortReuse(t *testing.T) {
 
 		defer eps[i].Close()
 		if err := eps[i].SetSockOpt(reusePortOpt); err != nil {
-			c.t.Fatalf("SetSockOpt failed failed: %v", err)
+			c.t.Fatalf("SetSockOpt failed: %v", err)
 		}
 		if err := eps[i].Bind(tcpip.FullAddress{Addr: stackV6Addr, Port: stackPort}); err != nil {
 			t.Fatalf("ep.Bind(...) failed: %v", err)
@@ -296,10 +305,11 @@ func TestBindPortReuse(t *testing.T) {
 		// Send a packet.
 		port := uint16(i % nports)
 		payload := newPayload()
-		c.sendV6Packet(payload, &headers{
-			srcPort: testPort + port,
-			dstPort: stackPort,
-		})
+		c.sendV6Packet(payload,
+			&headers{
+				srcPort: testPort + port,
+				dstPort: stackPort},
+			0)
 
 		var addr tcpip.FullAddress
 		ep := <-pollChannel
@@ -333,13 +343,157 @@ func TestBindPortReuse(t *testing.T) {
 	}
 }
 
+func TestBindToDevice(t *testing.T) {
+	linkEpCount := 5
+	c := newDualTestContextMultiNic(t, defaultMTU, linkEpCount)
+	defer c.cleanup()
+
+	c.createV6Endpoint(false)
+
+	eps := make([]tcpip.Endpoint, linkEpCount, linkEpCount)
+
+	pollChannel := make(chan tcpip.Endpoint)
+	for i := 0; i < linkEpCount; i++ {
+		// Try to receive the data.
+		wq := waiter.Queue{}
+		we, ch := waiter.NewChannelEntry(nil)
+		wq.EventRegister(&we, waiter.EventIn)
+		defer wq.EventUnregister(&we)
+		defer close(ch)
+
+		var err *tcpip.Error
+		eps[i], err = c.s.NewEndpoint(udp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
+		if err != nil {
+			c.t.Fatalf("NewEndpoint failed: %v", err)
+		}
+
+		go func(ep tcpip.Endpoint) {
+			for range ch {
+				pollChannel <- ep
+			}
+		}(eps[i])
+
+		defer eps[i].Close()
+		bindToDeviceOpt := tcpip.BindToDeviceOption("dev" + strconv.Itoa(i+1))
+		if err := eps[i].SetSockOpt(bindToDeviceOpt); err != nil {
+			c.t.Fatalf("SetSockOpt failed: %v", err)
+		}
+		if err := eps[i].Bind(tcpip.FullAddress{Addr: stackV6Addr, Port: stackPort}); err != nil {
+			t.Fatalf("ep.Bind(...) failed: %v", err)
+		}
+	}
+
+	npackets := 100
+	nports := 10
+	for linkEpIndex := 0; linkEpIndex < linkEpCount; linkEpIndex++ {
+		stats := make(map[tcpip.Endpoint]int)
+		for i := 0; i < npackets; i++ {
+			// Send a packet.
+			port := uint16(i % nports)
+			payload := newPayload()
+			c.sendV6Packet(payload, &headers{
+				srcPort: testPort + port,
+				dstPort: stackPort},
+				linkEpIndex)
+
+			var addr tcpip.FullAddress
+			ep := <-pollChannel
+			_, _, err := ep.Read(&addr)
+			if err != nil {
+				c.t.Fatalf("Read failed: %v", err)
+			}
+			stats[ep]++
+		}
+		if got, want := stats[eps[linkEpIndex]], npackets; got != want {
+			t.Errorf("Wrong number of packets on eps[%d], got = %d, want = %d", linkEpIndex, got, want)
+		}
+		for otherLinkEpIndex := 0; otherLinkEpIndex < linkEpCount; otherLinkEpIndex++ {
+			if otherLinkEpIndex == linkEpIndex {
+				continue
+			}
+			if got, want := stats[eps[otherLinkEpIndex]], 0; got != want {
+				t.Errorf("Wrong number of packets on eps[%d], got = %d, want = %d", otherLinkEpIndex, got, want)
+			}
+		}
+	}
+}
+
+func TestBindToDeviceOption(t *testing.T) {
+	s := stack.New([]string{ipv4.ProtocolName}, []string{udp.ProtocolName}, stack.Options{})
+
+	ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
+	if err != nil {
+		t.Fatalf("NewEndpoint failed; %v", err)
+	}
+	defer ep.Close()
+
+	// Get default value.
+	var bindToDevice tcpip.BindToDeviceOption
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt got %v, want %v", err, nil)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+
+	linkEp := loopback.New()
+	if err := s.CreateNamedNIC(321, "my_device", linkEp); err != nil {
+		t.Errorf("CreateNamedNIC failed: %v", err)
+	}
+
+	// Make an nameless NIC.
+	linkEp2 := loopback.New()
+	if err := s.CreateNIC(54321, linkEp2); err != nil {
+		t.Errorf("CreateNIC failed: %v", err)
+	}
+
+	// Bind to a device that doesn't exist, value is unchanged.
+	bindToDevice = "non_existent_device"
+	if err := ep.SetSockOpt(bindToDevice); err != tcpip.ErrUnknownDevice {
+		t.Errorf("SetSockOpt got %v, want %v", err, tcpip.ErrUnknownDevice)
+	}
+	bindToDevice = ""
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+
+	// Bind to a device that exists, value is changed.
+	bindToDevice = "my_device"
+	if err := ep.SetSockOpt(bindToDevice); err != nil {
+		t.Errorf("SetSockOpt got %v, want %v", err, nil)
+	}
+	bindToDevice = ""
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "my_device" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "my_device")
+	}
+
+	// Unbind device, value is changed.
+	bindToDevice = ""
+	if err := ep.SetSockOpt(bindToDevice); err != nil {
+		t.Errorf("SetSockOpt got %v, want %v", err, nil)
+	}
+	bindToDevice = "this should change"
+	if err := ep.GetSockOpt(&bindToDevice); err != nil {
+		t.Errorf("GetSockOpt failed: %v", err)
+	}
+	if bindToDevice != "" {
+		t.Errorf("bindToDevice got %s, want %s", bindToDevice, "")
+	}
+}
+
 func testV4Read(c *testContext) {
 	// Send a packet.
 	payload := newPayload()
 	c.sendPacket(payload, &headers{
 		srcPort: testPort,
 		dstPort: stackPort,
-	})
+	}, 0)
 
 	// Try to receive the data.
 	we, ch := waiter.NewChannelEntry(nil)
@@ -503,8 +657,8 @@ func TestV6ReadOnV6(t *testing.T) {
 	payload := newPayload()
 	c.sendV6Packet(payload, &headers{
 		srcPort: testPort,
-		dstPort: stackPort,
-	})
+		dstPort: stackPort},
+		0)
 
 	// Try to receive the data.
 	we, ch := waiter.NewChannelEntry(nil)
