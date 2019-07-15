@@ -20,6 +20,7 @@ package linux
 const (
 	ANON_INODE_FS_MAGIC   = 0x09041934
 	DEVPTS_SUPER_MAGIC    = 0x00001cd1
+	EXT_SUPER_MAGIC       = 0xef53
 	OVERLAYFS_SUPER_MAGIC = 0x794c7630
 	PIPEFS_MAGIC          = 0x50495045
 	PROC_SUPER_MAGIC      = 0x9fa0
@@ -75,6 +76,15 @@ type Statfs struct {
 	// Spare is unused.
 	Spare [4]uint64
 }
+
+// Whence argument to lseek(2), from include/uapi/linux/fs.h.
+const (
+	SEEK_SET  = 0
+	SEEK_CUR  = 1
+	SEEK_END  = 2
+	SEEK_DATA = 3
+	SEEK_HOLE = 4
+)
 
 // Sync_file_range flags, from include/uapi/linux/fs.h
 const (

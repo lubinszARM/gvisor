@@ -1,11 +1,42 @@
 package(licenses = ["notice"])
 
-load("//tools/go_stateify:defs.bzl", "go_library")
+load("//tools/go_stateify:defs.bzl", "go_library", "go_test")
 
 go_library(
     name = "ext",
-    srcs = ["ext.go"],
+    srcs = [
+        "dentry.go",
+        "ext.go",
+        "inode.go",
+        "utils.go",
+    ],
     importpath = "gvisor.dev/gvisor/pkg/sentry/fs/ext",
     visibility = ["//pkg/sentry:internal"],
-    deps = ["//pkg/sentry/fs/ext/disklayout"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/binary",
+        "//pkg/sentry/context",
+        "//pkg/sentry/fs/ext/disklayout",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/vfs",
+        "//pkg/syserror",
+    ],
+)
+
+go_test(
+    name = "ext_test",
+    size = "small",
+    srcs = ["ext_test.go"],
+    data = [
+        "//pkg/sentry/fs/ext:assets/bigfile.txt",
+        "//pkg/sentry/fs/ext:assets/file.txt",
+        "//pkg/sentry/fs/ext:assets/tiny.ext4",
+    ],
+    embed = [":ext"],
+    deps = [
+        "//pkg/sentry/context",
+        "//pkg/sentry/context/contexttest",
+        "//pkg/sentry/vfs",
+        "//runsc/test/testutil",
+    ],
 )
