@@ -66,6 +66,7 @@ import (
 	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
@@ -583,10 +584,15 @@ func (k *Kernel) UniqueID() uint64 {
 
 // CreateProcessArgs holds arguments to kernel.CreateProcess.
 type CreateProcessArgs struct {
-	// Filename is the filename to load.
+	// Filename is the filename to load as the init binary.
 	//
-	// If this is provided as "", then the file will be guessed via Argv[0].
+	// If this is provided as "", HostFD will be checked, then the file will be guessed via Argv[0].
 	Filename string
+
+	// Host FD is a passed host FD pointing to a file to load as the init binary.
+	//
+	// This is checked if and only if Filename is "".
+	HostFD *fs.File
 
 	// Argvv is a list of arguments.
 	Argv []string
@@ -771,20 +777,34 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		defer wd.DecRef()
 	}
 
+	// If we get a Filename, we start from that.
 	if args.Filename == "" {
 		// Was anything provided?
-		if len(args.Argv) == 0 {
+		switch {
+		// Check if we got a HostFD.
+		case args.HostFD != nil:
+		// Otherwise look at Argv and see if the first argument is a valid path.
+		case len(args.Argv) == 0:
 			return nil, 0, fmt.Errorf("no filename or command provided")
-		}
-		if !filepath.IsAbs(args.Argv[0]) {
+		case !filepath.IsAbs(args.Argv[0]):
 			return nil, 0, fmt.Errorf("'%s' is not an absolute path", args.Argv[0])
+		default:
+			args.Filename = args.Argv[0]
 		}
-		args.Filename = args.Argv[0]
 	}
 
 	// Create a fresh task context.
 	remainingTraversals = uint(args.MaxSymlinkTraversals)
-	tc, se := k.LoadTaskImage(ctx, k.mounts, root, wd, &remainingTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
+
+	var tc *TaskContext
+	var se *syserr.Error
+	// Either start from the Filename path.
+	if args.Filename != "" {
+		tc, se = k.LoadTaskImage(ctx, k.mounts, root, wd, &remainingTraversals, args.Filename, args.Argv, args.Envv, k.featureSet)
+		// Or from the hostfd.
+	} else {
+		tc, se = k.LoadTaskImageFromFile(ctx, args.HostFD, &remainingTraversals, args.Argv, args.Envv)
+	}
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}

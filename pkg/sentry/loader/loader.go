@@ -62,13 +62,23 @@ func openPath(ctx context.Context, mm *fs.MountNamespace, root, wd *fs.Dirent, m
 		ctx.Infof("cannot open empty name")
 		return nil, nil, syserror.ENOENT
 	}
-
 	d, err := mm.FindInode(ctx, root, wd, name, maxTraversals)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer d.DecRef()
+	return checkFile(ctx, d, name)
+}
 
+func openFile(ctx context.Context, file *fs.File) (*fs.Dirent, *fs.File, error) {
+	if file == nil {
+		ctx.Infof("cannot open empty name")
+		return nil, nil, syserror.ENOENT
+	}
+	return checkFile(ctx, file.Dirent, "")
+}
+
+func checkFile(ctx context.Context, d *fs.Dirent, name string) (*fs.Dirent, *fs.File, error) {
 	perms := fs.PermMask{
 		// TODO(gvisor.dev/issue/160): Linux requires only execute
 		// permission, not read. However, our backing filesystems may
@@ -138,9 +148,16 @@ const (
 //  * arch.Context matching the binary arch
 //  * fs.Dirent of the binary file
 //  * Possibly updated argv
-func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, remainingTraversals *uint, fs *cpuid.FeatureSet, filename string, argv []string) (loadedELF, arch.Context, *fs.Dirent, []string, error) {
+func loadBin(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, remainingTraversals *uint, features *cpuid.FeatureSet, filename string, argv []string, file *fs.File) (loadedELF, arch.Context, *fs.Dirent, []string, error) {
 	for i := 0; i < maxLoaderAttempts; i++ {
-		d, f, err := openPath(ctx, mounts, root, wd, remainingTraversals, filename)
+		var d *fs.Dirent
+		var f *fs.File
+		var err error
+		if file != nil {
+			d, f, err = openFile(ctx, file)
+		} else {
+			d, f, err = openPath(ctx, mounts, root, wd, remainingTraversals, filename)
+		}
 		if err != nil {
 			ctx.Infof("Error opening %s: %v", filename, err)
 			return loadedELF{}, nil, nil, nil, err
@@ -165,7 +182,7 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 
 		switch {
 		case bytes.Equal(hdr[:], []byte(elfMagic)):
-			loaded, ac, err := loadELF(ctx, m, mounts, root, wd, remainingTraversals, fs, f)
+			loaded, ac, err := loadELF(ctx, m, mounts, root, wd, remainingTraversals, features, f)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
 				return loadedELF{}, nil, nil, nil, err
@@ -185,6 +202,7 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 			ctx.Infof("Unknown magic: %v", hdr)
 			return loadedELF{}, nil, nil, nil, syserror.ENOEXEC
 		}
+		file = nil
 	}
 
 	return loadedELF{}, nil, nil, nil, syserror.ELOOP
@@ -198,14 +216,13 @@ func loadPath(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespac
 // Preconditions:
 //  * The Task MemoryManager is empty.
 //  * Load is called on the Task goroutine.
-func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, fs *cpuid.FeatureSet, filename string, argv, envv []string, extraAuxv []arch.AuxEntry, vdso *VDSO) (abi.OS, arch.Context, string, *syserr.Error) {
+func Load(ctx context.Context, m *mm.MemoryManager, mounts *fs.MountNamespace, root, wd *fs.Dirent, maxTraversals *uint, fs *cpuid.FeatureSet, filename string, argv, envv []string, extraAuxv []arch.AuxEntry, vdso *VDSO, file *fs.File) (abi.OS, arch.Context, string, *syserr.Error) {
 	// Load the binary itself.
-	loaded, ac, d, argv, err := loadPath(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv)
+	loaded, ac, d, argv, err := loadBin(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv, file)
 	if err != nil {
 		return 0, nil, "", syserr.NewDynamic(fmt.Sprintf("Failed to load %s: %v", filename, err), syserr.FromError(err).ToLinux())
 	}
 	defer d.DecRef()
-
 	// Load the VDSO.
 	vdsoAddr, err := loadVDSO(ctx, m, vdso, loaded)
 	if err != nil {

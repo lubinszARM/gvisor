@@ -17,6 +17,7 @@ package kernel
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -148,10 +149,26 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, r
 	m := mm.NewMemoryManager(k, k)
 	defer m.DecUsers(ctx)
 
-	os, ac, name, err := loader.Load(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv, envv, k.extraAuxv, k.vdso)
+	os, ac, name, err := loader.Load(ctx, m, mounts, root, wd, maxTraversals, fs, filename, argv, envv, k.extraAuxv, k.vdso, nil)
 	if err != nil {
 		return nil, err
 	}
+	return k.makeTaskContext(os, ac, m, name)
+}
+
+func (k *Kernel) LoadTaskImageFromFile(ctx context.Context, file *fs.File, maxTraversals *uint, argv, envv []string) (*TaskContext, *syserr.Error) {
+	m := mm.NewMemoryManager(k, k)
+	defer m.DecUsers(ctx)
+
+	os, ac, name, err := loader.Load(ctx, m, k.mounts, file.Dirent, file.Dirent, maxTraversals, k.FeatureSet(), file.MappedName(ctx), argv, envv, k.extraAuxv, k.vdso, file)
+	if err != nil {
+		return nil, err
+	}
+	return k.makeTaskContext(os, ac, m, name)
+
+}
+
+func (k *Kernel) makeTaskContext(os abi.OS, ac arch.Context, mm *mm.MemoryManager, name string) (*TaskContext, *syserr.Error) {
 
 	// Lookup our new syscall table.
 	st, ok := LookupSyscallTable(os, ac.Arch())
@@ -161,13 +178,13 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, mounts *fs.MountNamespace, r
 		return nil, errNoSyscalls
 	}
 
-	if !m.IncUsers() {
+	if !mm.IncUsers() {
 		panic("Failed to increment users count on new MM")
 	}
 	return &TaskContext{
 		Name:          name,
 		Arch:          ac,
-		MemoryManager: m,
+		MemoryManager: mm,
 		fu:            k.futexes.Fork(),
 		st:            st,
 	}, nil
