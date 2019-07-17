@@ -73,6 +73,10 @@ func (e *endpoint) ID() *stack.NetworkEndpointID {
 	return &stack.NetworkEndpointID{ProtocolAddress}
 }
 
+func (e *endpoint) PrefixLen() int {
+	return 0
+}
+
 func (e *endpoint) MaxHeaderLength() uint16 {
 	return e.linkEP.MaxHeaderLength() + header.ARPSize
 }
@@ -128,7 +132,7 @@ func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 	return tcpip.Address(h.ProtocolAddressSender()), ProtocolAddress
 }
 
-func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, sender stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, dummyPrefixLen int, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, sender stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
 	if addr != ProtocolAddress {
 		return nil, tcpip.ErrBadLocalAddress
 	}

@@ -129,7 +129,7 @@ func (n *NIC) setSpoofing(enable bool) {
 	n.mu.Unlock()
 }
 
-func (n *NIC) getMainNICAddress(protocol tcpip.NetworkProtocolNumber) (tcpip.Address, tcpip.Subnet, *tcpip.Error) {
+func (n *NIC) getMainNICAddress(protocol tcpip.NetworkProtocolNumber) (tcpip.Address, int, *tcpip.Error) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
@@ -148,21 +148,14 @@ func (n *NIC) getMainNICAddress(protocol tcpip.NetworkProtocolNumber) (tcpip.Add
 	}
 
 	if r == nil {
-		return "", tcpip.Subnet{}, tcpip.ErrNoLinkAddress
+		return "", 0, tcpip.ErrNoLinkAddress
 	}
 
 	address := r.ep.ID().LocalAddress
+	prefixLen := r.ep.PrefixLen()
 	r.decRef()
 
-	// Find the least-constrained matching subnet for the address, if one
-	// exists, and return it.
-	var subnet tcpip.Subnet
-	for _, s := range n.subnets {
-		if s.Contains(address) && !subnet.Contains(s.ID()) {
-			subnet = s
-		}
-	}
-	return address, subnet, nil
+	return address, prefixLen, nil
 }
 
 // primaryEndpoint returns the primary endpoint of n for the given network
@@ -213,7 +206,7 @@ func (n *NIC) findEndpoint(protocol tcpip.NetworkProtocolNumber, address tcpip.A
 	n.mu.Lock()
 	ref = n.endpoints[id]
 	if ref == nil || !ref.tryIncRef() {
-		ref, _ = n.addAddressLocked(protocol, address, peb, true)
+		ref, _ = n.addAddressLocked(protocol, address, address.GetDefaultPrefixLen(), peb, true)
 		if ref != nil {
 			ref.holdsInsertRef = false
 		}
@@ -222,14 +215,14 @@ func (n *NIC) findEndpoint(protocol tcpip.NetworkProtocolNumber, address tcpip.A
 	return ref
 }
 
-func (n *NIC) addAddressLocked(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, peb PrimaryEndpointBehavior, replace bool) (*referencedNetworkEndpoint, *tcpip.Error) {
+func (n *NIC) addAddressLocked(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, prefixLen int, peb PrimaryEndpointBehavior, replace bool) (*referencedNetworkEndpoint, *tcpip.Error) {
 	netProto, ok := n.stack.networkProtocols[protocol]
 	if !ok {
 		return nil, tcpip.ErrUnknownProtocol
 	}
 
 	// Create the new network endpoint.
-	ep, err := netProto.NewEndpoint(n.id, addr, n.stack, n, n.linkEP)
+	ep, err := netProto.NewEndpoint(n.id, addr, prefixLen, n.stack, n, n.linkEP)
 	if err != nil {
 		return nil, err
 	}
@@ -278,16 +271,10 @@ func (n *NIC) addAddressLocked(protocol tcpip.NetworkProtocolNumber, addr tcpip.
 
 // AddAddress adds a new address to n, so that it starts accepting packets
 // targeted at the given address (and network protocol).
-func (n *NIC) AddAddress(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) *tcpip.Error {
-	return n.AddAddressWithOptions(protocol, addr, CanBePrimaryEndpoint)
-}
-
-// AddAddressWithOptions is the same as AddAddress, but allows you to specify
-// whether the new endpoint can be primary or not.
-func (n *NIC) AddAddressWithOptions(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, peb PrimaryEndpointBehavior) *tcpip.Error {
+func (n *NIC) AddAddress(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, prefixLen int, peb PrimaryEndpointBehavior) *tcpip.Error {
 	// Add the endpoint.
 	n.mu.Lock()
-	_, err := n.addAddressLocked(protocol, addr, peb, false)
+	_, err := n.addAddressLocked(protocol, addr, prefixLen, peb, false)
 	n.mu.Unlock()
 
 	return err
@@ -298,10 +285,11 @@ func (n *NIC) Addresses() []tcpip.ProtocolAddress {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	addrs := make([]tcpip.ProtocolAddress, 0, len(n.endpoints))
-	for nid, ep := range n.endpoints {
+	for nid, ref := range n.endpoints {
 		addrs = append(addrs, tcpip.ProtocolAddress{
-			Protocol: ep.protocol,
-			Address:  nid.LocalAddress,
+			Protocol:  ref.protocol,
+			Address:   nid.LocalAddress,
+			PrefixLen: ref.ep.PrefixLen(),
 		})
 	}
 	return addrs
@@ -415,7 +403,15 @@ func (n *NIC) joinGroup(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address
 	id := NetworkEndpointID{addr}
 	joins := n.mcastJoins[id]
 	if joins == 0 {
-		if _, err := n.addAddressLocked(protocol, addr, NeverPrimaryEndpoint, false); err != nil {
+		var prefixLen int
+		if len(addr) == header.IPv4AddressSize {
+			prefixLen = header.IPv4MulticastPrefixLength
+		} else if len(addr) == header.IPv6AddressSize {
+			prefixLen = header.IPv6MulticastPrefixLength
+		} else {
+			return tcpip.ErrBadAddress
+		}
+		if _, err := n.addAddressLocked(protocol, addr, prefixLen, NeverPrimaryEndpoint, false); err != nil {
 			return err
 		}
 	}
@@ -572,7 +568,7 @@ func (n *NIC) getRef(protocol tcpip.NetworkProtocolNumber, dst tcpip.Address) *r
 			n.mu.Unlock()
 			return ref
 		}
-		ref, err := n.addAddressLocked(protocol, dst, CanBePrimaryEndpoint, true)
+		ref, err := n.addAddressLocked(protocol, dst, dst.GetDefaultPrefixLen(), CanBePrimaryEndpoint, true)
 		n.mu.Unlock()
 		if err == nil {
 			ref.holdsInsertRef = false

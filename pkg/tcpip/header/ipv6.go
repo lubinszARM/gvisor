@@ -80,6 +80,10 @@ const (
 
 	// IPv6Any is the non-routable IPv6 "any" meta address.
 	IPv6Any tcpip.Address = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+	// IPv6MulticastPrefixLength is the prefix length in bits of the IPv6
+	// multicast address subnet.
+	IPv6MulticastPrefixLength = 8
 )
 
 // PayloadLength returns the value of the "payload length" field of the ipv6

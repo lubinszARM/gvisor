@@ -49,16 +49,18 @@ const (
 type endpoint struct {
 	nicid         tcpip.NICID
 	id            stack.NetworkEndpointID
+	prefixLen     int
 	linkEP        stack.LinkEndpoint
 	dispatcher    stack.TransportDispatcher
 	fragmentation *fragmentation.Fragmentation
 }
 
 // NewEndpoint creates a new ipv4 endpoint.
-func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, prefixLen int, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
 	e := &endpoint{
 		nicid:         nicid,
 		id:            stack.NetworkEndpointID{LocalAddress: addr},
+		prefixLen:     prefixLen,
 		linkEP:        linkEP,
 		dispatcher:    dispatcher,
 		fragmentation: fragmentation.NewFragmentation(fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
@@ -91,6 +93,11 @@ func (e *endpoint) NICID() tcpip.NICID {
 // ID returns the ipv4 endpoint ID.
 func (e *endpoint) ID() *stack.NetworkEndpointID {
 	return &e.id
+}
+
+// PrefixLen returns the ipv4 endpoint subnet prefix length in bits.
+func (e *endpoint) PrefixLen() int {
+	return e.prefixLen
 }
 
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and

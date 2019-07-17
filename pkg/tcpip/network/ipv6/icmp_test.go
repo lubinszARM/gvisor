@@ -99,7 +99,7 @@ func TestICMPCounts(t *testing.T) {
 		}},
 	)
 
-	ep, err := s.NetworkProtocolInstance(ProtocolNumber).NewEndpoint(0, lladdr1, &stubLinkAddressCache{}, &stubDispatcher{}, nil)
+	ep, err := s.NetworkProtocolInstance(ProtocolNumber).NewEndpoint(0, lladdr1, lladdr1.GetDefaultPrefixLen(), &stubLinkAddressCache{}, &stubDispatcher{}, nil)
 	if err != nil {
 		t.Fatalf("NewEndpoint(_) = _, %s, want = _, nil", err)
 	}

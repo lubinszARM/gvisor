@@ -181,6 +181,9 @@ type NetworkEndpoint interface {
 	// ID returns the network protocol endpoint ID.
 	ID() *NetworkEndpointID
 
+	// PrefixLen returns the network endpoint's subnet prefix length in bits.
+	PrefixLen() int
+
 	// NICID returns the id of the NIC this endpoint belongs to.
 	NICID() tcpip.NICID
 
@@ -208,7 +211,7 @@ type NetworkProtocol interface {
 	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
-	NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint) (NetworkEndpoint, *tcpip.Error)
+	NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, PrefixLen int, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint) (NetworkEndpoint, *tcpip.Error)
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the

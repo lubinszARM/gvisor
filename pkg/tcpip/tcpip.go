@@ -1006,6 +1006,11 @@ func isZeros(a Address) bool {
 	return true
 }
 
+// GetDefaultPrefixLen returns the address's default prefix length.
+func (a Address) GetDefaultPrefixLen() int {
+	return len(a) * 8
+}
+
 // LinkAddress is a byte slice cast as a string that represents a link address.
 // It is typically a 6-byte MAC address.
 type LinkAddress string
@@ -1049,6 +1054,9 @@ type ProtocolAddress struct {
 
 	// Address is a network address.
 	Address Address
+
+	// Address subnet prefix length in bits.
+	PrefixLen int
 }
 
 // danglingEndpointsMu protects access to danglingEndpoints.

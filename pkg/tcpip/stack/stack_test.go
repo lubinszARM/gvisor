@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"testing"
 
@@ -55,6 +56,7 @@ const (
 type fakeNetworkEndpoint struct {
 	nicid      tcpip.NICID
 	id         stack.NetworkEndpointID
+	prefixLen  int
 	proto      *fakeNetworkProtocol
 	dispatcher stack.TransportDispatcher
 	linkEP     stack.LinkEndpoint
@@ -66,6 +68,10 @@ func (f *fakeNetworkEndpoint) MTU() uint32 {
 
 func (f *fakeNetworkEndpoint) NICID() tcpip.NICID {
 	return f.nicid
+}
+
+func (f *fakeNetworkEndpoint) PrefixLen() int {
+	return f.prefixLen
 }
 
 func (*fakeNetworkEndpoint) DefaultTTL() uint8 {
@@ -174,10 +180,11 @@ func (*fakeNetworkProtocol) ParseAddresses(v buffer.View) (src, dst tcpip.Addres
 	return tcpip.Address(v[1:2]), tcpip.Address(v[0:1])
 }
 
-func (f *fakeNetworkProtocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+func (f *fakeNetworkProtocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, prefixLen int, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
 	return &fakeNetworkEndpoint{
 		nicid:      nicid,
 		id:         stack.NetworkEndpointID{addr},
+		prefixLen:  prefixLen,
 		proto:      f,
 		dispatcher: dispatcher,
 		linkEP:     linkEP,
@@ -945,7 +952,7 @@ func TestGetMainNICAddressAddPrimaryNonPrimary(t *testing.T) {
 							}
 							// Insert <canBe> primary and <never> never-primary addresses.
 							// Each one will add a network endpoint to the NIC.
-							primaryAddrAdded := make(map[tcpip.Address]tcpip.Subnet)
+							primaryAddrAdded := make(map[tcpip.Address]int)
 							for i := 0; i < canBe+never; i++ {
 								var behavior stack.PrimaryEndpointBehavior
 								if i < canBe {
@@ -953,28 +960,25 @@ func TestGetMainNICAddressAddPrimaryNonPrimary(t *testing.T) {
 								} else {
 									behavior = stack.NeverPrimaryEndpoint
 								}
-								// Add an address and in case of a primary one also add a
-								// subnet.
+								// Add an address and in case of a primary one include a
+								// prefixLen.
 								address := tcpip.Address(bytes.Repeat([]byte{byte(i)}, addrLen))
-								if err := s.AddAddressWithOptions(1, fakeNetNumber, address, behavior); err != nil {
-									t.Fatalf("AddAddressWithOptions failed: %v", err)
-								}
 								if behavior == stack.CanBePrimaryEndpoint {
-									mask := tcpip.AddressMask(strings.Repeat("\xff", len(address)))
-									subnet, err := tcpip.NewSubnet(address, mask)
-									if err != nil {
-										t.Fatalf("NewSubnet failed: %v", err)
+									prefixLen := address.GetDefaultPrefixLen()
+									if err := s.AddAddressWithPrefixLenWithOptions(1, fakeNetNumber, address, prefixLen, behavior); err != nil {
+										t.Fatalf("AddAddressWithPrefixLenWithOptions failed: %v", err)
 									}
-									if err := s.AddSubnet(1, fakeNetNumber, subnet); err != nil {
-										t.Fatalf("AddSubnet failed: %v", err)
+									// Remember the address/prefix.
+									primaryAddrAdded[address] = prefixLen
+								} else {
+									if err := s.AddAddressWithOptions(1, fakeNetNumber, address, behavior); err != nil {
+										t.Fatalf("AddAddressWithOptions failed: %v", err)
 									}
-									// Remember the address/subnet.
-									primaryAddrAdded[address] = subnet
 								}
 							}
 							// Check that GetMainNICAddress returns an address if at least
 							// one primary address was added. In that case make sure the
-							// address/subnet matches what we added.
+							// address/prefixLen matches what we added.
 							if len(primaryAddrAdded) == 0 {
 								// No primary addresses present, expect an error.
 								if _, _, err := s.GetMainNICAddress(1, fakeNetNumber); err != tcpip.ErrNoLinkAddress {
@@ -982,17 +986,17 @@ func TestGetMainNICAddressAddPrimaryNonPrimary(t *testing.T) {
 								}
 							} else {
 								// At least one primary address was added, expect a valid
-								// address and subnet.
-								gotAddress, gotSubnet, err := s.GetMainNICAddress(1, fakeNetNumber)
+								// address and prefixLen.
+								gotAddress, gotPefixLen, err := s.GetMainNICAddress(1, fakeNetNumber)
 								if err != nil {
 									t.Fatalf("GetMainNICAddress failed: %v", err)
 								}
-								expectedSubnet, ok := primaryAddrAdded[gotAddress]
+								expectedPrefixLen, ok := primaryAddrAdded[gotAddress]
 								if !ok {
 									t.Fatalf("GetMainNICAddress: got address = %v, wanted any in {%v}", gotAddress, primaryAddrAdded)
 								}
-								if gotSubnet != expectedSubnet {
-									t.Fatalf("GetMainNICAddress: got subnet = %v, wanted %v", gotSubnet, expectedSubnet)
+								if gotPefixLen != expectedPrefixLen {
+									t.Fatalf("GetMainNICAddress: got prefixLen = %v, wanted %v", gotPefixLen, expectedPrefixLen)
 								}
 							}
 						})
@@ -1011,39 +1015,28 @@ func TestGetMainNICAddressAddRemove(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name    string
-		address tcpip.Address
+		name      string
+		address   tcpip.Address
+		prefixLen int
 	}{
-		{"IPv4", "\x01\x01\x01\x01"},
-		{"IPv6", "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"},
+		{"IPv4", "\x01\x01\x01\x01", 24},
+		{"IPv6", "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", 116},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			address := tc.address
-			mask := tcpip.AddressMask(strings.Repeat("\xff", len(address)))
-			subnet, err := tcpip.NewSubnet(address, mask)
-			if err != nil {
-				t.Fatalf("NewSubnet failed: %v", err)
+			prefixLen := tc.prefixLen
+
+			if err := s.AddAddressWithPrefixLen(1, fakeNetNumber, address, prefixLen); err != nil {
+				t.Fatalf("AddAddressWithPrefixLen failed: %v", err)
 			}
 
-			if err := s.AddAddress(1, fakeNetNumber, address); err != nil {
-				t.Fatalf("AddAddress failed: %v", err)
-			}
-
-			if err := s.AddSubnet(1, fakeNetNumber, subnet); err != nil {
-				t.Fatalf("AddSubnet failed: %v", err)
-			}
-
-			// Check that we get the right initial address and subnet.
-			if gotAddress, gotSubnet, err := s.GetMainNICAddress(1, fakeNetNumber); err != nil {
+			// Check that we get the right initial address and prefix length.
+			if gotAddress, gotPrefixLen, err := s.GetMainNICAddress(1, fakeNetNumber); err != nil {
 				t.Fatalf("GetMainNICAddress failed: %v", err)
 			} else if gotAddress != address {
 				t.Fatalf("got GetMainNICAddress = (%v, ...), want = (%v, ...)", gotAddress, address)
-			} else if gotSubnet != subnet {
-				t.Fatalf("got GetMainNICAddress = (..., %v), want = (..., %v)", gotSubnet, subnet)
-			}
-
-			if err := s.RemoveSubnet(1, subnet); err != nil {
-				t.Fatalf("RemoveSubnet failed: %v", err)
+			} else if gotPrefixLen != prefixLen {
+				t.Fatalf("got GetMainNICAddress = (..., %v), want = (..., %v)", gotPrefixLen, prefixLen)
 			}
 
 			if err := s.RemoveAddress(1, address); err != nil {
@@ -1055,6 +1048,81 @@ func TestGetMainNICAddressAddRemove(t *testing.T) {
 				t.Fatalf("got s.GetMainNICAddress(...) = %v, want = %v", err, tcpip.ErrNoLinkAddress)
 			}
 		})
+	}
+}
+
+func TestAddAddressVariations(t *testing.T) {
+	s := stack.New([]string{"fakeNet"}, nil, stack.Options{})
+	id, _ := channel.New(10, defaultMTU, "")
+	if err := s.CreateNIC(1, id); err != nil {
+		t.Fatalf("CreateNIC failed: %v", err)
+	}
+
+	expectedAddresses := make([]tcpip.ProtocolAddress, 0, 2*5*4)
+	addrIdx := 1
+	for _, addrLen := range []int{4, 16} {
+		for _, prefixLen := range []int{-1, 8, 13, 20, 32} {
+			for peb := range []stack.PrimaryEndpointBehavior{-1, stack.CanBePrimaryEndpoint, stack.FirstPrimaryEndpoint, stack.NeverPrimaryEndpoint} {
+				address := tcpip.Address(bytes.Repeat([]byte{byte(addrIdx)}, addrLen))
+				addrIdx++
+				if peb == -1 {
+					if prefixLen == -1 {
+						if err := s.AddAddress(1, fakeNetNumber, address); err != nil {
+							t.Fatalf("AddAddress failed: %v", err)
+						}
+					} else {
+						if err := s.AddAddressWithPrefixLen(1, fakeNetNumber, address, prefixLen); err != nil {
+							t.Fatalf("AddAddressWithPrefixLen failed: %v", err)
+						}
+					}
+				} else {
+					var behavior stack.PrimaryEndpointBehavior = stack.PrimaryEndpointBehavior(peb)
+					if prefixLen == -1 {
+						if err := s.AddAddressWithOptions(1, fakeNetNumber, address, behavior); err != nil {
+							t.Fatalf("AddAddressWithOptions failed: %v", err)
+						}
+					} else {
+						if err := s.AddAddressWithPrefixLenWithOptions(1, fakeNetNumber, address, prefixLen, behavior); err != nil {
+							t.Fatalf("AddAddressWithPrefixLenWithOptions failed: %v", err)
+						}
+					}
+				}
+				expectedPrefixLen := prefixLen
+				if prefixLen == -1 {
+					expectedPrefixLen = address.GetDefaultPrefixLen()
+				}
+				expectedAddresses = append(expectedAddresses, tcpip.ProtocolAddress{
+					Protocol:  fakeNetNumber,
+					Address:   address,
+					PrefixLen: expectedPrefixLen,
+				})
+			}
+		}
+	}
+
+	gotAddresses := s.NICInfo()[1].ProtocolAddresses
+	if len(gotAddresses) != len(expectedAddresses) {
+		t.Fatalf("got len(NICInfo[1].ProtocolAddresses) = %d, wanted = %d", len(gotAddresses), len(expectedAddresses))
+	}
+
+	sort.SliceStable(gotAddresses, func(i, j int) bool {
+		return gotAddresses[i].Address < gotAddresses[j].Address
+	})
+	sort.SliceStable(expectedAddresses, func(i, j int) bool {
+		return expectedAddresses[i].Address < expectedAddresses[j].Address
+	})
+
+	for i, gotAddr := range gotAddresses {
+		expectedAddr := expectedAddresses[i]
+		if gotAddr.Protocol != expectedAddr.Protocol {
+			t.Errorf("got addr.Protocol = %v, wanted = %v", gotAddr.Protocol, expectedAddr.Protocol)
+		}
+		if gotAddr.Address != expectedAddr.Address {
+			t.Errorf("got addr.Address = %s, wanted = %s", gotAddr.Address, expectedAddr.Address)
+		}
+		if gotAddr.PrefixLen != expectedAddr.PrefixLen {
+			t.Errorf("got addr.PrefixLen = %d, wanted = %d", gotAddr.PrefixLen, expectedAddr.PrefixLen)
+		}
 	}
 }
 

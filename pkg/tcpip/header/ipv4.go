@@ -103,6 +103,10 @@ const (
 
 	// IPv4Any is the non-routable IPv4 "any" meta address.
 	IPv4Any tcpip.Address = "\x00\x00\x00\x00"
+
+	// IPv4MulticastPrefixLength is the prefix length in bits of the IPv4
+	// multicast address subnet.
+	IPv4MulticastPrefixLength = 4
 )
 
 // Flags that may be set in an IPv4 packet.

@@ -751,9 +751,22 @@ func (s *Stack) AddAddress(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber,
 	return s.AddAddressWithOptions(id, protocol, addr, CanBePrimaryEndpoint)
 }
 
+// AddAddressWithPrefixLen adds a new network-layer address/prefixLen to the
+// specified NIC.
+func (s *Stack) AddAddressWithPrefixLen(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, prefixLen int) *tcpip.Error {
+	return s.AddAddressWithPrefixLenWithOptions(id, protocol, addr, prefixLen, CanBePrimaryEndpoint)
+}
+
 // AddAddressWithOptions is the same as AddAddress, but allows you to specify
 // whether the new endpoint can be primary or not.
 func (s *Stack) AddAddressWithOptions(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, peb PrimaryEndpointBehavior) *tcpip.Error {
+	prefixLen := addr.GetDefaultPrefixLen()
+	return s.AddAddressWithPrefixLenWithOptions(id, protocol, addr, prefixLen, peb)
+}
+
+// AddAddressWithPrefixLenWithOptions is the same as AddAddressWithPrefixLen,
+// but allows you to specify whether the new endpoint can be primary or not.
+func (s *Stack) AddAddressWithPrefixLenWithOptions(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, prefixLen int, peb PrimaryEndpointBehavior) *tcpip.Error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -762,7 +775,7 @@ func (s *Stack) AddAddressWithOptions(id tcpip.NICID, protocol tcpip.NetworkProt
 		return tcpip.ErrUnknownNICID
 	}
 
-	return nic.AddAddressWithOptions(protocol, addr, peb)
+	return nic.AddAddress(protocol, addr, prefixLen, peb)
 }
 
 // AddSubnet adds a subnet range to the specified NIC.
@@ -821,7 +834,7 @@ func (s *Stack) RemoveAddress(id tcpip.NICID, addr tcpip.Address) *tcpip.Error {
 // contains it) for the given NIC and protocol. Returns an arbitrary endpoint's
 // address if no primary addresses exist. Returns an error if the NIC doesn't
 // exist or has no endpoints.
-func (s *Stack) GetMainNICAddress(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber) (tcpip.Address, tcpip.Subnet, *tcpip.Error) {
+func (s *Stack) GetMainNICAddress(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber) (tcpip.Address, int, *tcpip.Error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -829,7 +842,7 @@ func (s *Stack) GetMainNICAddress(id tcpip.NICID, protocol tcpip.NetworkProtocol
 		return nic.getMainNICAddress(protocol)
 	}
 
-	return "", tcpip.Subnet{}, tcpip.ErrUnknownNICID
+	return "", 0, tcpip.ErrUnknownNICID
 }
 
 func (s *Stack) getRefEP(nic *NIC, localAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) (ref *referencedNetworkEndpoint) {
