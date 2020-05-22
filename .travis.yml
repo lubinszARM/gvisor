@@ -13,7 +13,7 @@ jobs:
    - os: linux
      arch: arm64
 script:
-   - uname -a && make smoke-test
+   - uname -a && ps -ef && docker version && whoami && make smoke-test
 branches:
   except:
   # Skip copybara branches.
