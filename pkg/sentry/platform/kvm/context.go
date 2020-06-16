@@ -62,6 +62,7 @@ func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*a
 	switchOpts := ring0.SwitchOpts{
 		Registers:          &ac.StateData().Regs,
 		FloatingPointState: (*byte)(ac.FloatingPointData()),
+		ArchReg:            (*uint64)(ac.ArchRegPointer()),
 		PageTables:         localAS.pageTables,
 		Flush:              localAS.Touch(cpu),
 		FullRestore:        ac.FullRestore(),

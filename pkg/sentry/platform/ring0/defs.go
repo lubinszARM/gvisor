@@ -95,6 +95,10 @@ type SwitchOpts struct {
 	// saved and restored.
 	FloatingPointState *byte
 
+	// ArchReg is the arch-specific register state: not used on amd64.
+	// On Arm64, it is tpidr_el0.
+	ArchReg *uint64
+
 	// PageTables are the application page tables.
 	PageTables *pagetables.PageTables
 

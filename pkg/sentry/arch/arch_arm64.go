@@ -155,6 +155,11 @@ func (c *context64) SetTLS(value uintptr) bool {
 	return true
 }
 
+//
+func (c *context64) ArchRegPointer() *uint64 {
+	return &c.TPValue
+}
+
 // SetOldRSeqInterruptedIP implements Context.SetOldRSeqInterruptedIP.
 func (c *context64) SetOldRSeqInterruptedIP(value uintptr) {
 	c.Regs.Regs[3] = uint64(value)

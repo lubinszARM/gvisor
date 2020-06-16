@@ -128,6 +128,9 @@ type Context interface {
 	// SetTLS sets the current TLS pointer. Returns false if value is invalid.
 	SetTLS(value uintptr) bool
 
+	// TlsPointer returns the current TLS pointer.
+	ArchRegPointer() *uint64
+
 	// SetOldRSeqInterruptedIP sets the register that contains the old IP
 	// when an "old rseq" restartable sequence is interrupted.
 	SetOldRSeqInterruptedIP(value uintptr)
