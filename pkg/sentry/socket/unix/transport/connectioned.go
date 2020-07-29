@@ -15,10 +15,9 @@
 package transport
 
 import (
-	"sync"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -220,6 +219,11 @@ func (e *connectionedEndpoint) Close() {
 	case e.Connected():
 		e.connected.CloseSend()
 		e.receiver.CloseRecv()
+		// Still have unread data? If yes, we set this into the write
+		// end so that the peer can get ECONNRESET) when it does read.
+		if e.receiver.RecvQueuedSize() > 0 {
+			e.connected.CloseUnread()
+		}
 		c = e.connected
 		r = e.receiver
 		e.connected = nil
@@ -248,7 +252,7 @@ func (e *connectionedEndpoint) Close() {
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
 func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error {
 	if ce.Type() != e.stype {
-		return syserr.ErrConnectionRefused
+		return syserr.ErrWrongProtocolForSocket
 	}
 
 	// Check if ce is e to avoid a deadlock.
@@ -436,7 +440,7 @@ func (e *connectionedEndpoint) Bind(addr tcpip.FullAddress, commit func() *syser
 
 // SendMsg writes data and a control message to the endpoint's peer.
 // This method does not block if the data cannot be written.
-func (e *connectionedEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (uintptr, *syserr.Error) {
+func (e *connectionedEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, *syserr.Error) {
 	// Stream sockets do not support specifying the endpoint. Seqpacket
 	// sockets ignore the passed endpoint.
 	if e.stype == linux.SOCK_STREAM && to != nil {
@@ -472,6 +476,9 @@ func (e *connectionedEndpoint) Readiness(mask waiter.EventMask) waiter.EventMask
 
 // State implements socket.Socket.State.
 func (e *connectionedEndpoint) State() uint32 {
+	e.Lock()
+	defer e.Unlock()
+
 	if e.Connected() {
 		return linux.SS_CONNECTED
 	}

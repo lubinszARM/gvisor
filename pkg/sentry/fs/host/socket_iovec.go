@@ -17,12 +17,11 @@ package host
 import (
 	"syscall"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/iovec"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
-// maxIovs is the maximum number of iovecs to pass to the host.
-var maxIovs = linux.UIO_MAXIOV
+// LINT.IfChange
 
 // copyToMulti copies as many bytes from src to dst as possible.
 func copyToMulti(dst [][]byte, src []byte) {
@@ -55,26 +54,26 @@ func copyFromMulti(dst []byte, src [][]byte) {
 //
 // If intermediate != nil, iovecs references intermediate rather than bufs and
 // the caller must copy to/from bufs as necessary.
-func buildIovec(bufs [][]byte, maxlen int, truncate bool) (length uintptr, iovecs []syscall.Iovec, intermediate []byte, err error) {
+func buildIovec(bufs [][]byte, maxlen int64, truncate bool) (length int64, iovecs []syscall.Iovec, intermediate []byte, err error) {
 	var iovsRequired int
 	for _, b := range bufs {
-		length += uintptr(len(b))
+		length += int64(len(b))
 		if len(b) > 0 {
 			iovsRequired++
 		}
 	}
 
 	stopLen := length
-	if length > uintptr(maxlen) {
+	if length > maxlen {
 		if truncate {
-			stopLen = uintptr(maxlen)
+			stopLen = maxlen
 			err = syserror.EAGAIN
 		} else {
 			return 0, nil, nil, syserror.EMSGSIZE
 		}
 	}
 
-	if iovsRequired > maxIovs {
+	if iovsRequired > iovec.MaxIovs {
 		// The kernel will reject our call if we pass this many iovs.
 		// Use a single intermediate buffer instead.
 		b := make([]byte, stopLen)
@@ -85,7 +84,7 @@ func buildIovec(bufs [][]byte, maxlen int, truncate bool) (length uintptr, iovec
 		}}, b, err
 	}
 
-	var total uintptr
+	var total int64
 	iovecs = make([]syscall.Iovec, 0, iovsRequired)
 	for i := range bufs {
 		l := len(bufs[i])
@@ -93,9 +92,9 @@ func buildIovec(bufs [][]byte, maxlen int, truncate bool) (length uintptr, iovec
 			continue
 		}
 
-		stop := l
-		if total+uintptr(stop) > stopLen {
-			stop = int(stopLen - total)
+		stop := int64(l)
+		if total+stop > stopLen {
+			stop = stopLen - total
 		}
 
 		iovecs = append(iovecs, syscall.Iovec{
@@ -103,7 +102,7 @@ func buildIovec(bufs [][]byte, maxlen int, truncate bool) (length uintptr, iovec
 			Len:  uint64(stop),
 		})
 
-		total += uintptr(stop)
+		total += stop
 		if total >= stopLen {
 			break
 		}
@@ -111,3 +110,5 @@ func buildIovec(bufs [][]byte, maxlen int, truncate bool) (length uintptr, iovec
 
 	return total, iovecs, nil, err
 }
+
+// LINT.ThenChange(../../fsimpl/host/socket_iovec.go)

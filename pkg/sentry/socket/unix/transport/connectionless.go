@@ -16,7 +16,7 @@ package transport
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -99,7 +99,7 @@ func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context) (Con
 
 // SendMsg writes data and a control message to the specified endpoint.
 // This method does not block if the data cannot be written.
-func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (uintptr, *syserr.Error) {
+func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, *syserr.Error) {
 	if to == nil {
 		return e.baseEndpoint.SendMsg(ctx, data, c, nil)
 	}

@@ -16,9 +16,9 @@ package kernel
 
 import (
 	"fmt"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -87,12 +87,19 @@ type TaskSet struct {
 	// at time of save (but note that this is not necessarily the same thing as
 	// sync.WaitGroup's zero value).
 	runningGoroutines sync.WaitGroup `state:"nosave"`
+
+	// aioGoroutines is the number of goroutines running async I/O
+	// callbacks.
+	//
+	// aioGoroutines is not saved but is required to be zero at the time of
+	// save.
+	aioGoroutines sync.WaitGroup `state:"nosave"`
 }
 
 // newTaskSet returns a new, empty TaskSet.
-func newTaskSet() *TaskSet {
-	ts := &TaskSet{}
-	ts.Root = newPIDNamespace(ts, nil /* parent */, auth.NewRootUserNamespace())
+func newTaskSet(pidns *PIDNamespace) *TaskSet {
+	ts := &TaskSet{Root: pidns}
+	pidns.owner = ts
 	return ts
 }
 
@@ -184,6 +191,12 @@ func newPIDNamespace(ts *TaskSet, parent *PIDNamespace, userns *auth.UserNamespa
 		processGroups: make(map[ProcessGroupID]*ProcessGroup),
 		pgids:         make(map[*ProcessGroup]ProcessGroupID),
 	}
+}
+
+// NewRootPIDNamespace creates the root PID namespace. 'owner' is not available
+// yet when root namespace is created and must be set by caller.
+func NewRootPIDNamespace(userns *auth.UserNamespace) *PIDNamespace {
+	return newPIDNamespace(nil, nil, userns)
 }
 
 // NewChild returns a new, empty PID namespace that is a child of ns. Authority

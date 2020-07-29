@@ -23,13 +23,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// LINT.IfChange
+
 const (
-	// EventMaskRead contains events that can be triggerd on reads.
+	// EventMaskRead contains events that can be triggered on reads.
 	EventMaskRead = waiter.EventIn | waiter.EventHUp | waiter.EventErr
 )
 
@@ -72,6 +74,39 @@ func Read(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	return uintptr(n), nil, handleIOError(t, n != 0, err, kernel.ERESTARTSYS, "read", file)
 }
 
+// Readahead implements readahead(2).
+func Readahead(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	fd := args[0].Int()
+	offset := args[1].Int64()
+	size := args[2].SizeT()
+
+	file := t.GetFile(fd)
+	if file == nil {
+		return 0, nil, syserror.EBADF
+	}
+	defer file.DecRef()
+
+	// Check that the file is readable.
+	if !file.Flags().Read {
+		return 0, nil, syserror.EBADF
+	}
+
+	// Check that the size is valid.
+	if int(size) < 0 {
+		return 0, nil, syserror.EINVAL
+	}
+
+	// Check that the offset is legitimate and does not overflow.
+	if offset < 0 || offset+int64(size) < 0 {
+		return 0, nil, syserror.EINVAL
+	}
+
+	// Return EINVAL; if the underlying file type does not support readahead,
+	// then Linux will return EINVAL to indicate as much. In the future, we
+	// may extend this function to actually support readahead hints.
+	return 0, nil, syserror.EINVAL
+}
+
 // Pread64 implements linux syscall pread64(2).
 func Pread64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
@@ -85,8 +120,8 @@ func Pread64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	}
 	defer file.DecRef()
 
-	// Check that the offset is legitimate.
-	if offset < 0 {
+	// Check that the offset is legitimate and does not overflow.
+	if offset < 0 || offset+int64(size) < 0 {
 		return 0, nil, syserror.EINVAL
 	}
 
@@ -191,7 +226,6 @@ func Preadv(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 }
 
 // Preadv2 implements linux syscall preadv2(2).
-// TODO(b/120162627): Implement RWF_HIPRI functionality.
 func Preadv2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	// While the syscall is
 	// preadv2(int fd, struct iovec* iov, int iov_cnt, off_t offset, int flags)
@@ -228,6 +262,8 @@ func Preadv2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	}
 
 	// Check flags field.
+	// Note: gVisor does not implement the RWF_HIPRI feature, but the flag is
+	// accepted as a valid flag argument for preadv2.
 	if flags&^linux.RWF_VALID != 0 {
 		return 0, nil, syserror.EOPNOTSUPP
 	}
@@ -354,3 +390,5 @@ func preadv(t *kernel.Task, f *fs.File, dst usermem.IOSequence, offset int64) (i
 
 	return total, err
 }
+
+// LINT.ThenChange(vfs2/read_write.go)

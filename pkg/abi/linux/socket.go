@@ -134,6 +134,15 @@ const (
 	SHUT_RDWR = 2
 )
 
+// Packet types from <linux/if_packet.h>
+const (
+	PACKET_HOST      = 0 // To us
+	PACKET_BROADCAST = 1 // To all
+	PACKET_MULTICAST = 2 // To group
+	PACKET_OTHERHOST = 3 // To someone else
+	PACKET_OUTGOING  = 4 // Outgoing of any type
+)
+
 // Socket options from socket.h.
 const (
 	SO_DEBUG                 = 1
@@ -225,6 +234,8 @@ const (
 const SockAddrMax = 128
 
 // InetAddr is struct in_addr, from uapi/linux/in.h.
+//
+// +marshal
 type InetAddr [4]byte
 
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
@@ -256,6 +267,17 @@ type SockAddrInet6 struct {
 	Scope_id uint32
 }
 
+// SockAddrLink is a struct sockaddr_ll, from uapi/linux/if_packet.h.
+type SockAddrLink struct {
+	Family          uint16
+	Protocol        uint16
+	InterfaceIndex  int32
+	ARPHardwareType uint16
+	PacketType      byte
+	HardwareAddrLen byte
+	HardwareAddr    [8]byte
+}
+
 // UnixPathMax is the maximum length of the path in an AF_UNIX socket.
 //
 // From uapi/linux/un.h.
@@ -267,7 +289,24 @@ type SockAddrUnix struct {
 	Path   [UnixPathMax]int8
 }
 
+// SockAddr represents a union of valid socket address types. This is logically
+// equivalent to struct sockaddr. SockAddr ensures that a well-defined set of
+// types can be used as socket addresses.
+type SockAddr interface {
+	// implementsSockAddr exists purely to allow a type to indicate that they
+	// implement this interface. This method is a no-op and shouldn't be called.
+	implementsSockAddr()
+}
+
+func (s *SockAddrInet) implementsSockAddr()    {}
+func (s *SockAddrInet6) implementsSockAddr()   {}
+func (s *SockAddrLink) implementsSockAddr()    {}
+func (s *SockAddrUnix) implementsSockAddr()    {}
+func (s *SockAddrNetlink) implementsSockAddr() {}
+
 // Linger is struct linger, from include/linux/socket.h.
+//
+// +marshal
 type Linger struct {
 	OnOff  int32
 	Linger int32
@@ -278,7 +317,12 @@ const SizeOfLinger = 8
 
 // TCPInfo is a collection of TCP statistics.
 //
-// From uapi/linux/tcp.h.
+// From uapi/linux/tcp.h. Newer versions of Linux continue to add new fields to
+// the end of this struct or within existing unusued space, so its size grows
+// over time. The current iteration is based on linux v4.17. New versions are
+// always backwards compatible.
+//
+// +marshal
 type TCPInfo struct {
 	State       uint8
 	CaState     uint8
@@ -352,7 +396,7 @@ type TCPInfo struct {
 }
 
 // SizeOfTCPInfo is the binary size of a TCPInfo struct.
-const SizeOfTCPInfo = 104
+var SizeOfTCPInfo = int(binary.Size(TCPInfo{}))
 
 // Control message types, from linux/socket.h.
 const (
@@ -376,10 +420,21 @@ var SizeOfControlMessageHeader = int(binary.Size(ControlMessageHeader{}))
 // A ControlMessageCredentials is an SCM_CREDENTIALS socket control message.
 //
 // ControlMessageCredentials represents struct ucred from linux/socket.h.
+//
+// +marshal
 type ControlMessageCredentials struct {
 	PID int32
 	UID uint32
 	GID uint32
+}
+
+// A ControlMessageIPPacketInfo is IP_PKTINFO socket control message.
+//
+// ControlMessageIPPacketInfo represents struct in_pktinfo from linux/in.h.
+type ControlMessageIPPacketInfo struct {
+	NIC             int32
+	LocalAddr       InetAddr
+	DestinationAddr InetAddr
 }
 
 // SizeOfControlMessageCredentials is the binary size of a
@@ -392,6 +447,19 @@ type ControlMessageRights []int32
 // SizeOfControlMessageRight is the size of a single element in
 // ControlMessageRights.
 const SizeOfControlMessageRight = 4
+
+// SizeOfControlMessageInq is the size of a TCP_INQ control message.
+const SizeOfControlMessageInq = 4
+
+// SizeOfControlMessageTOS is the size of an IP_TOS control message.
+const SizeOfControlMessageTOS = 1
+
+// SizeOfControlMessageTClass is the size of an IPV6_TCLASS control message.
+const SizeOfControlMessageTClass = 4
+
+// SizeOfControlMessageIPPacketInfo is the size of an IP_PKTINFO
+// control message.
+const SizeOfControlMessageIPPacketInfo = 12
 
 // SCM_MAX_FD is the maximum number of FDs accepted in a single sendmsg call.
 // From net/scm.h.

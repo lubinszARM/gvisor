@@ -16,20 +16,19 @@ package host
 
 import (
 	"fmt"
-	"sync"
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/socket/control"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -37,10 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// maxSendBufferSize is the maximum host send buffer size allowed for endpoint.
-//
-// N.B. 8MB is the default maximum on Linux (2 * sysctl_wmem_max).
-const maxSendBufferSize = 8 << 20
+// LINT.IfChange
 
 // ConnectedEndpoint is a host FD backed implementation of
 // transport.ConnectedEndpoint and transport.Receiver.
@@ -65,7 +61,7 @@ type ConnectedEndpoint struct {
 	// GetSockOpt and message splitting/rejection in SendMsg, but do not
 	// prevent lots of small messages from filling the real send buffer
 	// size on the host.
-	sndbuf int `state:"nosave"`
+	sndbuf int64 `state:"nosave"`
 
 	// mu protects the fields below.
 	mu sync.RWMutex `state:"nosave"`
@@ -101,13 +97,9 @@ func (c *ConnectedEndpoint) init() *syserr.Error {
 	if err != nil {
 		return syserr.FromError(err)
 	}
-	if sndbuf > maxSendBufferSize {
-		log.Warningf("Socket send buffer too large: %d", sndbuf)
-		return syserr.ErrInvalidEndpointState
-	}
 
 	c.stype = linux.SockType(stype)
-	c.sndbuf = sndbuf
+	c.sndbuf = int64(sndbuf)
 
 	return nil
 }
@@ -202,7 +194,7 @@ func newSocket(ctx context.Context, orgfd int, saveable bool) (*fs.File, error) 
 }
 
 // Send implements transport.ConnectedEndpoint.Send.
-func (c *ConnectedEndpoint) Send(data [][]byte, controlMessages transport.ControlMessages, from tcpip.FullAddress) (uintptr, bool, *syserr.Error) {
+func (c *ConnectedEndpoint) Send(data [][]byte, controlMessages transport.ControlMessages, from tcpip.FullAddress) (int64, bool, *syserr.Error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -279,7 +271,7 @@ func (c *ConnectedEndpoint) EventUpdate() {
 }
 
 // Recv implements transport.Receiver.Recv.
-func (c *ConnectedEndpoint) Recv(data [][]byte, creds bool, numRights uintptr, peek bool) (uintptr, uintptr, transport.ControlMessages, bool, tcpip.FullAddress, bool, *syserr.Error) {
+func (c *ConnectedEndpoint) Recv(data [][]byte, creds bool, numRights int, peek bool) (int64, int64, transport.ControlMessages, bool, tcpip.FullAddress, bool, *syserr.Error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -385,3 +377,8 @@ func (c *ConnectedEndpoint) RecvMaxQueueSize() int64 {
 func (c *ConnectedEndpoint) Release() {
 	c.ref.DecRefWithDestructor(c.close)
 }
+
+// CloseUnread implements transport.ConnectedEndpoint.CloseUnread.
+func (c *ConnectedEndpoint) CloseUnread() {}
+
+// LINT.ThenChange(../../fsimpl/host/socket.go)

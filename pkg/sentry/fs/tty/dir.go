@@ -19,16 +19,16 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -129,6 +129,9 @@ func newDir(ctx context.Context, m *fs.MountSource) *fs.Inode {
 
 // Release implements fs.InodeOperations.Release.
 func (d *dirInodeOperations) Release(ctx context.Context) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.master.DecRef()
 	if len(d.slaves) != 0 {
 		panic(fmt.Sprintf("devpts directory still contains active terminals: %+v", d))

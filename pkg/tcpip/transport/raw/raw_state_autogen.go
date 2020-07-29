@@ -7,92 +7,154 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
-func (x *packet) beforeSave() {}
-func (x *packet) save(m state.Map) {
+func (x *rawPacket) StateTypeName() string {
+	return "pkg/tcpip/transport/raw.rawPacket"
+}
+
+func (x *rawPacket) StateFields() []string {
+	return []string{
+		"rawPacketEntry",
+		"data",
+		"timestampNS",
+		"senderAddr",
+	}
+}
+
+func (x *rawPacket) beforeSave() {}
+
+func (x *rawPacket) StateSave(m state.Sink) {
 	x.beforeSave()
 	var data buffer.VectorisedView = x.saveData()
-	m.SaveValue("data", data)
-	m.Save("packetEntry", &x.packetEntry)
-	m.Save("timestampNS", &x.timestampNS)
-	m.Save("senderAddr", &x.senderAddr)
+	m.SaveValue(1, data)
+	m.Save(0, &x.rawPacketEntry)
+	m.Save(2, &x.timestampNS)
+	m.Save(3, &x.senderAddr)
 }
 
-func (x *packet) afterLoad() {}
-func (x *packet) load(m state.Map) {
-	m.Load("packetEntry", &x.packetEntry)
-	m.Load("timestampNS", &x.timestampNS)
-	m.Load("senderAddr", &x.senderAddr)
-	m.LoadValue("data", new(buffer.VectorisedView), func(y interface{}) { x.loadData(y.(buffer.VectorisedView)) })
+func (x *rawPacket) afterLoad() {}
+
+func (x *rawPacket) StateLoad(m state.Source) {
+	m.Load(0, &x.rawPacketEntry)
+	m.Load(2, &x.timestampNS)
+	m.Load(3, &x.senderAddr)
+	m.LoadValue(1, new(buffer.VectorisedView), func(y interface{}) { x.loadData(y.(buffer.VectorisedView)) })
 }
 
-func (x *endpoint) save(m state.Map) {
+func (x *endpoint) StateTypeName() string {
+	return "pkg/tcpip/transport/raw.endpoint"
+}
+
+func (x *endpoint) StateFields() []string {
+	return []string{
+		"TransportEndpointInfo",
+		"waiterQueue",
+		"associated",
+		"hdrIncluded",
+		"rcvList",
+		"rcvBufSize",
+		"rcvBufSizeMax",
+		"rcvClosed",
+		"sndBufSize",
+		"sndBufSizeMax",
+		"closed",
+		"connected",
+		"bound",
+		"owner",
+	}
+}
+
+func (x *endpoint) StateSave(m state.Sink) {
 	x.beforeSave()
 	var rcvBufSizeMax int = x.saveRcvBufSizeMax()
-	m.SaveValue("rcvBufSizeMax", rcvBufSizeMax)
-	m.Save("netProto", &x.netProto)
-	m.Save("transProto", &x.transProto)
-	m.Save("waiterQueue", &x.waiterQueue)
-	m.Save("associated", &x.associated)
-	m.Save("rcvList", &x.rcvList)
-	m.Save("rcvBufSize", &x.rcvBufSize)
-	m.Save("rcvClosed", &x.rcvClosed)
-	m.Save("sndBufSize", &x.sndBufSize)
-	m.Save("closed", &x.closed)
-	m.Save("connected", &x.connected)
-	m.Save("bound", &x.bound)
-	m.Save("registeredNIC", &x.registeredNIC)
-	m.Save("boundNIC", &x.boundNIC)
-	m.Save("boundAddr", &x.boundAddr)
+	m.SaveValue(6, rcvBufSizeMax)
+	m.Save(0, &x.TransportEndpointInfo)
+	m.Save(1, &x.waiterQueue)
+	m.Save(2, &x.associated)
+	m.Save(3, &x.hdrIncluded)
+	m.Save(4, &x.rcvList)
+	m.Save(5, &x.rcvBufSize)
+	m.Save(7, &x.rcvClosed)
+	m.Save(8, &x.sndBufSize)
+	m.Save(9, &x.sndBufSizeMax)
+	m.Save(10, &x.closed)
+	m.Save(11, &x.connected)
+	m.Save(12, &x.bound)
+	m.Save(13, &x.owner)
 }
 
-func (x *endpoint) load(m state.Map) {
-	m.Load("netProto", &x.netProto)
-	m.Load("transProto", &x.transProto)
-	m.Load("waiterQueue", &x.waiterQueue)
-	m.Load("associated", &x.associated)
-	m.Load("rcvList", &x.rcvList)
-	m.Load("rcvBufSize", &x.rcvBufSize)
-	m.Load("rcvClosed", &x.rcvClosed)
-	m.Load("sndBufSize", &x.sndBufSize)
-	m.Load("closed", &x.closed)
-	m.Load("connected", &x.connected)
-	m.Load("bound", &x.bound)
-	m.Load("registeredNIC", &x.registeredNIC)
-	m.Load("boundNIC", &x.boundNIC)
-	m.Load("boundAddr", &x.boundAddr)
-	m.LoadValue("rcvBufSizeMax", new(int), func(y interface{}) { x.loadRcvBufSizeMax(y.(int)) })
+func (x *endpoint) StateLoad(m state.Source) {
+	m.Load(0, &x.TransportEndpointInfo)
+	m.Load(1, &x.waiterQueue)
+	m.Load(2, &x.associated)
+	m.Load(3, &x.hdrIncluded)
+	m.Load(4, &x.rcvList)
+	m.Load(5, &x.rcvBufSize)
+	m.Load(7, &x.rcvClosed)
+	m.Load(8, &x.sndBufSize)
+	m.Load(9, &x.sndBufSizeMax)
+	m.Load(10, &x.closed)
+	m.Load(11, &x.connected)
+	m.Load(12, &x.bound)
+	m.Load(13, &x.owner)
+	m.LoadValue(6, new(int), func(y interface{}) { x.loadRcvBufSizeMax(y.(int)) })
 	m.AfterLoad(x.afterLoad)
 }
 
-func (x *packetList) beforeSave() {}
-func (x *packetList) save(m state.Map) {
+func (x *rawPacketList) StateTypeName() string {
+	return "pkg/tcpip/transport/raw.rawPacketList"
+}
+
+func (x *rawPacketList) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
+}
+
+func (x *rawPacketList) beforeSave() {}
+
+func (x *rawPacketList) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save("head", &x.head)
-	m.Save("tail", &x.tail)
+	m.Save(0, &x.head)
+	m.Save(1, &x.tail)
 }
 
-func (x *packetList) afterLoad() {}
-func (x *packetList) load(m state.Map) {
-	m.Load("head", &x.head)
-	m.Load("tail", &x.tail)
+func (x *rawPacketList) afterLoad() {}
+
+func (x *rawPacketList) StateLoad(m state.Source) {
+	m.Load(0, &x.head)
+	m.Load(1, &x.tail)
 }
 
-func (x *packetEntry) beforeSave() {}
-func (x *packetEntry) save(m state.Map) {
+func (x *rawPacketEntry) StateTypeName() string {
+	return "pkg/tcpip/transport/raw.rawPacketEntry"
+}
+
+func (x *rawPacketEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (x *rawPacketEntry) beforeSave() {}
+
+func (x *rawPacketEntry) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save("next", &x.next)
-	m.Save("prev", &x.prev)
+	m.Save(0, &x.next)
+	m.Save(1, &x.prev)
 }
 
-func (x *packetEntry) afterLoad() {}
-func (x *packetEntry) load(m state.Map) {
-	m.Load("next", &x.next)
-	m.Load("prev", &x.prev)
+func (x *rawPacketEntry) afterLoad() {}
+
+func (x *rawPacketEntry) StateLoad(m state.Source) {
+	m.Load(0, &x.next)
+	m.Load(1, &x.prev)
 }
 
 func init() {
-	state.Register("raw.packet", (*packet)(nil), state.Fns{Save: (*packet).save, Load: (*packet).load})
-	state.Register("raw.endpoint", (*endpoint)(nil), state.Fns{Save: (*endpoint).save, Load: (*endpoint).load})
-	state.Register("raw.packetList", (*packetList)(nil), state.Fns{Save: (*packetList).save, Load: (*packetList).load})
-	state.Register("raw.packetEntry", (*packetEntry)(nil), state.Fns{Save: (*packetEntry).save, Load: (*packetEntry).load})
+	state.Register((*rawPacket)(nil))
+	state.Register((*endpoint)(nil))
+	state.Register((*rawPacketList)(nil))
+	state.Register((*rawPacketEntry)(nil))
 }

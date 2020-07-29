@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -33,19 +34,19 @@ import (
 func nsCloneFlag(nst specs.LinuxNamespaceType) uintptr {
 	switch nst {
 	case specs.IPCNamespace:
-		return syscall.CLONE_NEWIPC
+		return unix.CLONE_NEWIPC
 	case specs.MountNamespace:
-		return syscall.CLONE_NEWNS
+		return unix.CLONE_NEWNS
 	case specs.NetworkNamespace:
-		return syscall.CLONE_NEWNET
+		return unix.CLONE_NEWNET
 	case specs.PIDNamespace:
-		return syscall.CLONE_NEWPID
+		return unix.CLONE_NEWPID
 	case specs.UTSNamespace:
-		return syscall.CLONE_NEWUTS
+		return unix.CLONE_NEWUTS
 	case specs.UserNamespace:
-		return syscall.CLONE_NEWUSER
+		return unix.CLONE_NEWUSER
 	case specs.CgroupNamespace:
-		panic("cgroup namespace has no associated clone flag")
+		return unix.CLONE_NEWCGROUP
 	default:
 		panic(fmt.Sprintf("unknown namespace %v", nst))
 	}
@@ -252,13 +253,27 @@ func MaybeRunAsRoot() error {
 		},
 		Credential:                 &syscall.Credential{Uid: 0, Gid: 0},
 		GidMappingsEnableSetgroups: false,
+
+		// Make sure child is killed when the parent terminates.
+		Pdeathsig: syscall.SIGKILL,
 	}
 
 	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("re-executing self: %w", err)
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch)
+	go func() {
+		for {
+			// Forward all signals to child process.
+			cmd.Process.Signal(<-ch)
+		}
+	}()
+	if err := cmd.Wait(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			if ws, ok := exit.Sys().(syscall.WaitStatus); ok {
 				os.Exit(ws.ExitStatus())
@@ -266,7 +281,7 @@ func MaybeRunAsRoot() error {
 			log.Warningf("No wait status provided, exiting with -1: %v", err)
 			os.Exit(-1)
 		}
-		return fmt.Errorf("re-executing self: %v", err)
+		return err
 	}
 	// Child completed with success.
 	os.Exit(0)

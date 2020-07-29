@@ -46,13 +46,13 @@ package ptrace
 
 import (
 	"os"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 var (
@@ -60,7 +60,7 @@ var (
 	// maximum user address. This is valid only after a call to stubInit.
 	//
 	// We attempt to link the stub here, and adjust downward as needed.
-	stubStart uintptr = 0x7fffffff0000
+	stubStart uintptr = stubInitAddress
 
 	// stubEnd is the first byte past the end of the stub, as with
 	// stubStart this is valid only after a call to stubInit.
@@ -177,6 +177,9 @@ func (c *context) Interrupt() {
 	c.interrupt.NotifyInterrupt()
 }
 
+// Release implements platform.Context.Release().
+func (c *context) Release() {}
+
 // PTrace represents a collection of ptrace subprocesses.
 type PTrace struct {
 	platform.MMapMinAddr
@@ -246,6 +249,16 @@ func (*constructor) New(*os.File) (platform.Platform, error) {
 
 func (*constructor) OpenDevice() (*os.File, error) {
 	return nil, nil
+}
+
+// Flags implements platform.Constructor.Flags().
+func (*constructor) Requirements() platform.Requirements {
+	// TODO(b/75837838): Also set a new PID namespace so that we limit
+	// access to other host processes.
+	return platform.Requirements{
+		RequiresCapSysPtrace: true,
+		RequiresCurrentPIDNS: true,
+	}
 }
 
 func init() {

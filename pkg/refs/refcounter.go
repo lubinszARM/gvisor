@@ -21,10 +21,10 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
-	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // RefCounter is the interface to be implemented by objects that are reference
@@ -215,8 +215,8 @@ type AtomicRefCount struct {
 type LeakMode uint32
 
 const (
-	// uninitializedLeakChecking indicates that the leak checker has not yet been initialized.
-	uninitializedLeakChecking LeakMode = iota
+	// UninitializedLeakChecking indicates that the leak checker has not yet been initialized.
+	UninitializedLeakChecking LeakMode = iota
 
 	// NoLeakChecking indicates that no effort should be made to check for
 	// leaks.
@@ -318,13 +318,15 @@ func (r *AtomicRefCount) finalize() {
 	switch LeakMode(atomic.LoadUint32(&leakMode)) {
 	case NoLeakChecking:
 		return
-	case uninitializedLeakChecking:
+	case UninitializedLeakChecking:
 		note = "(Leak checker uninitialized): "
 	}
 	if n := r.ReadRefs(); n != 0 {
 		msg := fmt.Sprintf("%sAtomicRefCount %p owned by %q garbage collected with ref count of %d (want 0)", note, r, r.name, n)
 		if len(r.stack) != 0 {
 			msg += ":\nCaller:\n" + formatStack(r.stack)
+		} else {
+			msg += " (enable trace logging to debug)"
 		}
 		log.Warningf(msg)
 	}

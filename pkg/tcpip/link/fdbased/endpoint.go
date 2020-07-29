@@ -44,6 +44,9 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/iovec"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -81,6 +84,19 @@ const (
 	PacketMMap
 )
 
+func (p PacketDispatchMode) String() string {
+	switch p {
+	case Readv:
+		return "Readv"
+	case RecvMMsg:
+		return "RecvMMsg"
+	case PacketMMap:
+		return "PacketMMap"
+	default:
+		return fmt.Sprintf("unknown packet dispatch mode '%d'", p)
+	}
+}
+
 type endpoint struct {
 	// fds is the set of file descriptors each identifying one inbound/outbound
 	// channel. The endpoint will dispatch from all inbound channels as well as
@@ -114,6 +130,9 @@ type endpoint struct {
 	// gsoMaxSize is the maximum GSO packet size. It is zero if GSO is
 	// disabled.
 	gsoMaxSize uint32
+
+	// wg keeps track of running goroutines.
+	wg sync.WaitGroup
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -148,6 +167,9 @@ type Options struct {
 	// disabled.
 	GSOMaxSize uint32
 
+	// SoftwareGSOEnabled indicates whether software GSO is enabled or not.
+	SoftwareGSOEnabled bool
+
 	// PacketDispatchMode specifies the type of inbound dispatcher to be
 	// used for this endpoint.
 	PacketDispatchMode PacketDispatchMode
@@ -161,11 +183,20 @@ type Options struct {
 	RXChecksumOffload bool
 }
 
+// fanoutID is used for AF_PACKET based endpoints to enable PACKET_FANOUT
+// support in the host kernel. This allows us to use multiple FD's to receive
+// from the same underlying NIC. The fanoutID needs to be the same for a given
+// set of FD's that point to the same NIC. Trying to set the PACKET_FANOUT
+// option for an FD with a fanoutID already in use by another FD for a different
+// NIC will return an EINVAL.
+var fanoutID = 1
+
 // New creates a new fd-based endpoint.
 //
 // Makes fd non-blocking, but does not take ownership of fd, which must remain
-// open for the lifetime of the returned endpoint.
-func New(opts *Options) (tcpip.LinkEndpointID, error) {
+// open for the lifetime of the returned endpoint (until after the endpoint has
+// stopped being using and Wait returns).
+func New(opts *Options) (stack.LinkEndpoint, error) {
 	caps := stack.LinkEndpointCapabilities(0)
 	if opts.RXChecksumOffload {
 		caps |= stack.CapabilityRXChecksumOffload
@@ -190,7 +221,7 @@ func New(opts *Options) (tcpip.LinkEndpointID, error) {
 	}
 
 	if len(opts.FDs) == 0 {
-		return 0, fmt.Errorf("opts.FD is empty, at least one FD must be specified")
+		return nil, fmt.Errorf("opts.FD is empty, at least one FD must be specified")
 	}
 
 	e := &endpoint{
@@ -207,27 +238,35 @@ func New(opts *Options) (tcpip.LinkEndpointID, error) {
 	for i := 0; i < len(e.fds); i++ {
 		fd := e.fds[i]
 		if err := syscall.SetNonblock(fd, true); err != nil {
-			return 0, fmt.Errorf("syscall.SetNonblock(%v) failed: %v", fd, err)
+			return nil, fmt.Errorf("syscall.SetNonblock(%v) failed: %v", fd, err)
 		}
 
 		isSocket, err := isSocketFD(fd)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if isSocket {
 			if opts.GSOMaxSize != 0 {
-				e.caps |= stack.CapabilityGSO
+				if opts.SoftwareGSOEnabled {
+					e.caps |= stack.CapabilitySoftwareGSO
+				} else {
+					e.caps |= stack.CapabilityHardwareGSO
+				}
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
 		}
 		inboundDispatcher, err := createInboundDispatcher(e, fd, isSocket)
 		if err != nil {
-			return 0, fmt.Errorf("createInboundDispatcher(...) = %v", err)
+			return nil, fmt.Errorf("createInboundDispatcher(...) = %v", err)
 		}
 		e.inboundDispatchers = append(e.inboundDispatchers, inboundDispatcher)
 	}
 
-	return stack.RegisterLinkEndpoint(e), nil
+	// Increment fanoutID to ensure that we don't re-use the same fanoutID for
+	// the next endpoint.
+	fanoutID++
+
+	return e, nil
 }
 
 func createInboundDispatcher(e *endpoint, fd int, isSocket bool) (linkDispatcher, error) {
@@ -247,7 +286,6 @@ func createInboundDispatcher(e *endpoint, fd int, isSocket bool) (linkDispatcher
 		case *unix.SockaddrLinklayer:
 			// enable PACKET_FANOUT mode is the underlying socket is
 			// of type AF_PACKET.
-			const fanoutID = 1
 			const fanoutType = 0x8000 // PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_DEFRAG
 			fanoutArg := fanoutID | fanoutType<<16
 			if err := syscall.SetsockoptInt(fd, syscall.SOL_PACKET, unix.PACKET_FANOUT, fanoutArg); err != nil {
@@ -290,7 +328,11 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	// saved, they stop sending outgoing packets and all incoming packets
 	// are rejected.
 	for i := range e.inboundDispatchers {
-		go e.dispatchLoop(e.inboundDispatchers[i]) // S/R-SAFE: See above.
+		e.wg.Add(1)
+		go func(i int) { // S/R-SAFE: See above.
+			e.dispatchLoop(e.inboundDispatchers[i])
+			e.wg.Done()
+		}(i)
 	}
 }
 
@@ -320,6 +362,12 @@ func (e *endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.addr
 }
 
+// Wait implements stack.LinkEndpoint.Wait. It waits for the endpoint to stop
+// reading from its FD.
+func (e *endpoint) Wait() {
+	e.wg.Wait()
+}
+
 // virtioNetHdr is declared in linux/virtio_net.h.
 type virtioNetHdr struct {
 	flags      uint8
@@ -338,37 +386,47 @@ const (
 	_VIRTIO_NET_HDR_GSO_TCPV6 = 4
 )
 
-// WritePacket writes outbound packets to the file descriptor. If it is not
-// currently writable, the packet is dropped.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, hdr buffer.Prependable, payload buffer.VectorisedView, protocol tcpip.NetworkProtocolNumber) *tcpip.Error {
+// AddHeader implements stack.LinkEndpoint.AddHeader.
+func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	if e.hdrSize > 0 {
 		// Add ethernet header if needed.
-		eth := header.Ethernet(hdr.Prepend(header.EthernetMinimumSize))
+		eth := header.Ethernet(pkt.Header.Prepend(header.EthernetMinimumSize))
+		pkt.LinkHeader = buffer.View(eth)
 		ethHdr := &header.EthernetFields{
-			DstAddr: r.RemoteLinkAddress,
+			DstAddr: remote,
 			Type:    protocol,
 		}
 
 		// Preserve the src address if it's set in the route.
-		if r.LocalLinkAddress != "" {
-			ethHdr.SrcAddr = r.LocalLinkAddress
+		if local != "" {
+			ethHdr.SrcAddr = local
 		} else {
 			ethHdr.SrcAddr = e.addr
 		}
 		eth.Encode(ethHdr)
 	}
+}
 
-	if e.Capabilities()&stack.CapabilityGSO != 0 {
+// WritePacket writes outbound packets to the file descriptor. If it is not
+// currently writable, the packet is dropped.
+func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+	if e.hdrSize > 0 {
+		e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
+	}
+
+	var builder iovec.Builder
+
+	fd := e.fds[pkt.Hash%uint32(len(e.fds))]
+	if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
 		vnetHdr := virtioNetHdr{}
-		vnetHdrBuf := vnetHdrToByteSlice(&vnetHdr)
 		if gso != nil {
-			vnetHdr.hdrLen = uint16(hdr.UsedLength())
+			vnetHdr.hdrLen = uint16(pkt.Header.UsedLength())
 			if gso.NeedsCsum {
 				vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
 				vnetHdr.csumStart = header.EthernetMinimumSize + gso.L3HdrLen
 				vnetHdr.csumOffset = gso.CsumOffset
 			}
-			if gso.Type != stack.GSONone && uint16(payload.Size()) > gso.MSS {
+			if gso.Type != stack.GSONone && uint16(pkt.Data.Size()) > gso.MSS {
 				switch gso.Type {
 				case stack.GSOTCPv4:
 					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
@@ -381,18 +439,136 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, hdr buffer.Prepen
 			}
 		}
 
-		return rawfile.NonBlockingWrite3(e.fds[0], vnetHdrBuf, hdr.View(), payload.ToView())
+		vnetHdrBuf := binary.Marshal(make([]byte, 0, virtioNetHdrSize), binary.LittleEndian, vnetHdr)
+		builder.Add(vnetHdrBuf)
 	}
 
-	if payload.Size() == 0 {
-		return rawfile.NonBlockingWrite(e.fds[0], hdr.View())
+	builder.Add(pkt.Header.View())
+	for _, v := range pkt.Data.Views() {
+		builder.Add(v)
 	}
 
-	return rawfile.NonBlockingWrite3(e.fds[0], hdr.View(), payload.ToView(), nil)
+	return rawfile.NonBlockingWriteIovec(fd, builder.Build())
 }
 
-// WriteRawPacket writes a raw packet directly to the file descriptor.
-func (e *endpoint) WriteRawPacket(dest tcpip.Address, packet []byte) *tcpip.Error {
+func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tcpip.Error) {
+	// Send a batch of packets through batchFD.
+	mmsgHdrs := make([]rawfile.MMsgHdr, 0, len(batch))
+	for _, pkt := range batch {
+		if e.hdrSize > 0 {
+			e.AddHeader(pkt.EgressRoute.LocalLinkAddress, pkt.EgressRoute.RemoteLinkAddress, pkt.NetworkProtocolNumber, pkt)
+		}
+
+		var vnetHdrBuf []byte
+		if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
+			vnetHdr := virtioNetHdr{}
+			if pkt.GSOOptions != nil {
+				vnetHdr.hdrLen = uint16(pkt.Header.UsedLength())
+				if pkt.GSOOptions.NeedsCsum {
+					vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
+					vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
+					vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
+				}
+				if pkt.GSOOptions.Type != stack.GSONone && uint16(pkt.Data.Size()) > pkt.GSOOptions.MSS {
+					switch pkt.GSOOptions.Type {
+					case stack.GSOTCPv4:
+						vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
+					case stack.GSOTCPv6:
+						vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV6
+					default:
+						panic(fmt.Sprintf("Unknown gso type: %v", pkt.GSOOptions.Type))
+					}
+					vnetHdr.gsoSize = pkt.GSOOptions.MSS
+				}
+			}
+			vnetHdrBuf = binary.Marshal(make([]byte, 0, virtioNetHdrSize), binary.LittleEndian, vnetHdr)
+		}
+
+		var builder iovec.Builder
+		builder.Add(vnetHdrBuf)
+		builder.Add(pkt.Header.View())
+		for _, v := range pkt.Data.Views() {
+			builder.Add(v)
+		}
+		iovecs := builder.Build()
+
+		var mmsgHdr rawfile.MMsgHdr
+		mmsgHdr.Msg.Iov = &iovecs[0]
+		mmsgHdr.Msg.Iovlen = uint64(len(iovecs))
+		mmsgHdrs = append(mmsgHdrs, mmsgHdr)
+	}
+
+	packets := 0
+	for len(mmsgHdrs) > 0 {
+		sent, err := rawfile.NonBlockingSendMMsg(batchFD, mmsgHdrs)
+		if err != nil {
+			return packets, err
+		}
+		packets += sent
+		mmsgHdrs = mmsgHdrs[sent:]
+	}
+
+	return packets, nil
+}
+
+// WritePackets writes outbound packets to the underlying file descriptors. If
+// one is not currently writable, the packet is dropped.
+//
+// Being a batch API, each packet in pkts should have the following
+// fields populated:
+//  - pkt.EgressRoute
+//  - pkt.GSOOptions
+//  - pkt.NetworkProtocolNumber
+func (e *endpoint) WritePackets(_ *stack.Route, _ *stack.GSO, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	// Preallocate to avoid repeated reallocation as we append to batch.
+	// batchSz is 47 because when SWGSO is in use then a single 65KB TCP
+	// segment can get split into 46 segments of 1420 bytes and a single 216
+	// byte segment.
+	const batchSz = 47
+	batch := make([]*stack.PacketBuffer, 0, batchSz)
+	batchFD := -1
+	sentPackets := 0
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+		if len(batch) == 0 {
+			batchFD = e.fds[pkt.Hash%uint32(len(e.fds))]
+		}
+		pktFD := e.fds[pkt.Hash%uint32(len(e.fds))]
+		if sendNow := pktFD != batchFD; !sendNow {
+			batch = append(batch, pkt)
+			continue
+		}
+		n, err := e.sendBatch(batchFD, batch)
+		sentPackets += n
+		if err != nil {
+			return sentPackets, err
+		}
+		batch = batch[:0]
+		batch = append(batch, pkt)
+		batchFD = pktFD
+	}
+
+	if len(batch) != 0 {
+		n, err := e.sendBatch(batchFD, batch)
+		sentPackets += n
+		if err != nil {
+			return sentPackets, err
+		}
+	}
+	return sentPackets, nil
+}
+
+// viewsEqual tests whether v1 and v2 refer to the same backing bytes.
+func viewsEqual(vs1, vs2 []buffer.View) bool {
+	return len(vs1) == len(vs2) && (len(vs1) == 0 || &vs1[0] == &vs2[0])
+}
+
+// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
+func (e *endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
+	return rawfile.NonBlockingWrite(e.fds[0], vv.ToView())
+}
+
+// InjectOutobund implements stack.InjectableEndpoint.InjectOutbound.
+func (e *endpoint) InjectOutbound(dest tcpip.Address, packet []byte) *tcpip.Error {
 	return rawfile.NonBlockingWrite(e.fds[0], packet)
 }
 
@@ -415,6 +591,14 @@ func (e *endpoint) GSOMaxSize() uint32 {
 	return e.gsoMaxSize
 }
 
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
+	if e.hdrSize > 0 {
+		return header.ARPHardwareEther
+	}
+	return header.ARPHardwareNone
+}
+
 // InjectableEndpoint is an injectable fd-based endpoint. The endpoint writes
 // to the FD, but does not read from it. All reads come from injected packets.
 type InjectableEndpoint struct {
@@ -429,20 +613,18 @@ func (e *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.dispatcher = dispatcher
 }
 
-// Inject injects an inbound packet.
-func (e *InjectableEndpoint) Inject(protocol tcpip.NetworkProtocolNumber, vv buffer.VectorisedView) {
-	e.dispatcher.DeliverNetworkPacket(e, "" /* remote */, "" /* local */, protocol, vv)
+// InjectInbound injects an inbound packet.
+func (e *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	e.dispatcher.DeliverNetworkPacket("" /* remote */, "" /* local */, protocol, pkt)
 }
 
 // NewInjectable creates a new fd-based InjectableEndpoint.
-func NewInjectable(fd int, mtu uint32, capabilities stack.LinkEndpointCapabilities) (tcpip.LinkEndpointID, *InjectableEndpoint) {
+func NewInjectable(fd int, mtu uint32, capabilities stack.LinkEndpointCapabilities) *InjectableEndpoint {
 	syscall.SetNonblock(fd, true)
 
-	e := &InjectableEndpoint{endpoint: endpoint{
+	return &InjectableEndpoint{endpoint: endpoint{
 		fds:  []int{fd},
 		mtu:  mtu,
 		caps: capabilities,
 	}}
-
-	return stack.RegisterLinkEndpoint(e), e
 }

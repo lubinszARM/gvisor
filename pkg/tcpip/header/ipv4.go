@@ -21,22 +21,25 @@ import (
 )
 
 const (
-	versIHL  = 0
-	tos      = 1
-	totalLen = 2
-	id       = 4
-	flagsFO  = 6
-	ttl      = 8
-	protocol = 9
-	checksum = 10
-	srcAddr  = 12
-	dstAddr  = 16
+	versIHL = 0
+	tos     = 1
+	// IPv4TotalLenOffset is the offset of the total length field in the
+	// IPv4 header.
+	IPv4TotalLenOffset = 2
+	id                 = 4
+	flagsFO            = 6
+	ttl                = 8
+	protocol           = 9
+	checksum           = 10
+	srcAddr            = 12
+	dstAddr            = 16
 )
 
 // IPv4Fields contains the fields of an IPv4 packet. It is used to describe the
 // fields of a packet that needs to be encoded.
 type IPv4Fields struct {
-	// IHL is the "internet header length" field of an IPv4 packet.
+	// IHL is the "internet header length" field of an IPv4 packet. The value
+	// is in bytes.
 	IHL uint8
 
 	// TOS is the "type of service" field of an IPv4 packet.
@@ -103,6 +106,11 @@ const (
 
 	// IPv4Any is the non-routable IPv4 "any" meta address.
 	IPv4Any tcpip.Address = "\x00\x00\x00\x00"
+
+	// IPv4MinimumProcessableDatagramSize is the minimum size of an IP
+	// packet that every IPv4 capable host must be able to
+	// process/reassemble.
+	IPv4MinimumProcessableDatagramSize = 576
 )
 
 // Flags that may be set in an IPv4 packet.
@@ -110,6 +118,15 @@ const (
 	IPv4FlagMoreFragments = 1 << iota
 	IPv4FlagDontFragment
 )
+
+// IPv4EmptySubnet is the empty IPv4 subnet.
+var IPv4EmptySubnet = func() tcpip.Subnet {
+	subnet, err := tcpip.NewSubnet(IPv4Any, tcpip.AddressMask(IPv4Any))
+	if err != nil {
+		panic(err)
+	}
+	return subnet
+}()
 
 // IPVersion returns the version of IP used in the given packet. It returns -1
 // if the packet is not large enough to contain the version field.
@@ -122,7 +139,7 @@ func IPVersion(b []byte) int {
 }
 
 // HeaderLength returns the value of the "header length" field of the ipv4
-// header.
+// header. The length returned is in bytes.
 func (b IPv4) HeaderLength() uint8 {
 	return (b[versIHL] & 0xf) * 4
 }
@@ -142,6 +159,11 @@ func (b IPv4) Flags() uint8 {
 	return uint8(binary.BigEndian.Uint16(b[flagsFO:]) >> 13)
 }
 
+// More returns whether the more fragments flag is set.
+func (b IPv4) More() bool {
+	return b.Flags()&IPv4FlagMoreFragments != 0
+}
+
 // TTL returns the "TTL" field of the ipv4 header.
 func (b IPv4) TTL() uint8 {
 	return b[ttl]
@@ -154,7 +176,7 @@ func (b IPv4) FragmentOffset() uint16 {
 
 // TotalLength returns the "total length" field of the ipv4 header.
 func (b IPv4) TotalLength() uint16 {
-	return binary.BigEndian.Uint16(b[totalLen:])
+	return binary.BigEndian.Uint16(b[IPv4TotalLenOffset:])
 }
 
 // Checksum returns the checksum field of the ipv4 header.
@@ -200,7 +222,7 @@ func (b IPv4) SetTOS(v uint8, _ uint32) {
 
 // SetTotalLength sets the "total length" field of the ipv4 header.
 func (b IPv4) SetTotalLength(totalLength uint16) {
-	binary.BigEndian.PutUint16(b[totalLen:], totalLength)
+	binary.BigEndian.PutUint16(b[IPv4TotalLenOffset:], totalLength)
 }
 
 // SetChecksum sets the checksum field of the ipv4 header.
@@ -256,7 +278,7 @@ func (b IPv4) Encode(i *IPv4Fields) {
 // packets are produced.
 func (b IPv4) EncodePartial(partialChecksum, totalLength uint16) {
 	b.SetTotalLength(totalLength)
-	checksum := Checksum(b[totalLen:totalLen+2], partialChecksum)
+	checksum := Checksum(b[IPv4TotalLenOffset:IPv4TotalLenOffset+2], partialChecksum)
 	b.SetChecksum(^checksum)
 }
 
@@ -268,7 +290,7 @@ func (b IPv4) IsValid(pktSize int) bool {
 
 	hlen := int(b.HeaderLength())
 	tlen := int(b.TotalLength())
-	if hlen > tlen || tlen > pktSize {
+	if hlen < IPv4MinimumSize || hlen > tlen || tlen > pktSize {
 		return false
 	}
 

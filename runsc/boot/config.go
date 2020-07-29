@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 )
 
@@ -112,6 +113,34 @@ func MakeWatchdogAction(s string) (watchdog.Action, error) {
 	}
 }
 
+// MakeRefsLeakMode converts type from string.
+func MakeRefsLeakMode(s string) (refs.LeakMode, error) {
+	switch strings.ToLower(s) {
+	case "disabled":
+		return refs.NoLeakChecking, nil
+	case "log-names":
+		return refs.LeaksLogWarning, nil
+	case "log-traces":
+		return refs.LeaksLogTraces, nil
+	default:
+		return 0, fmt.Errorf("invalid refs leakmode %q", s)
+	}
+}
+
+func refsLeakModeToString(mode refs.LeakMode) string {
+	switch mode {
+	// If not set, default it to disabled.
+	case refs.UninitializedLeakChecking, refs.NoLeakChecking:
+		return "disabled"
+	case refs.LeaksLogWarning:
+		return "log-names"
+	case refs.LeaksLogTraces:
+		return "log-traces"
+	default:
+		panic(fmt.Sprintf("Invalid leakmode: %d", mode))
+	}
+}
+
 // Config holds configuration that is not part of the runtime spec.
 type Config struct {
 	// RootDir is the runtime root directory.
@@ -129,6 +158,9 @@ type Config struct {
 	// DebugLog is the path to log debug information to, if not empty.
 	DebugLog string
 
+	// PanicLog is the path to log GO's runtime messages, if not empty.
+	PanicLog string
+
 	// DebugLogFormat is the log format for debug.
 	DebugLogFormat string
 
@@ -138,6 +170,9 @@ type Config struct {
 	// Overlay is whether to wrap the root filesystem in an overlay.
 	Overlay bool
 
+	// FSGoferHostUDS enables the gofer to mount a host UDS.
+	FSGoferHostUDS bool
+
 	// Network indicates what type of network to use.
 	Network NetworkType
 
@@ -146,8 +181,21 @@ type Config struct {
 	// capabilities.
 	EnableRaw bool
 
-	// GSO indicates that generic segmentation offload is enabled.
-	GSO bool
+	// HardwareGSO indicates that hardware segmentation offload is enabled.
+	HardwareGSO bool
+
+	// SoftwareGSO indicates that software segmentation offload is enabled.
+	SoftwareGSO bool
+
+	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
+	TXChecksumOffload bool
+
+	// RXChecksumOffload indicates that RX Checksum Offload is enabled.
+	RXChecksumOffload bool
+
+	// QDisc indicates the type of queuening discipline to use by default
+	// for non-loopback interfaces.
+	QDisc QueueingDiscipline
 
 	// LogPackets indicates that all network packets should be logged.
 	LogPackets bool
@@ -182,12 +230,6 @@ type Config struct {
 	// RestoreFile is the path to the saved container image
 	RestoreFile string
 
-	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
-	// tests. It allows runsc to start the sandbox process as the current
-	// user, and without chrooting the sandbox process. This can be
-	// necessary in test environments that have limited capabilities.
-	TestOnlyAllowRunAsCurrentUserWithoutChroot bool
-
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
 	// to the same underlying network device. This allows netstack to better
 	// scale for high throughput use cases.
@@ -198,6 +240,43 @@ type Config struct {
 	// sandbox and Gofer process run as root inside a user namespace with root
 	// mapped to the caller's user.
 	Rootless bool
+
+	// AlsoLogToStderr allows to send log messages to stderr.
+	AlsoLogToStderr bool
+
+	// ReferenceLeakMode sets reference leak check mode
+	ReferenceLeakMode refs.LeakMode
+
+	// OverlayfsStaleRead instructs the sandbox to assume that the root mount
+	// is on a Linux overlayfs mount, which does not necessarily preserve
+	// coherence between read-only and subsequent writable file descriptors
+	// representing the "same" file.
+	OverlayfsStaleRead bool
+
+	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
+	// tests. It allows runsc to start the sandbox process as the current
+	// user, and without chrooting the sandbox process. This can be
+	// necessary in test environments that have limited capabilities.
+	TestOnlyAllowRunAsCurrentUserWithoutChroot bool
+
+	// TestOnlyTestNameEnv should only be used in tests. It looks up for the
+	// test name in the container environment variables and adds it to the debug
+	// log file name. This is done to help identify the log with the test when
+	// multiple tests are run in parallel, since there is no way to pass
+	// parameters to the runtime from docker.
+	TestOnlyTestNameEnv string
+
+	// CPUNumFromQuota sets CPU number count to available CPU quota, using
+	// least integer value greater than or equal to quota.
+	//
+	// E.g. 0.2 CPU quota will result in 1, and 1.9 in 2.
+	CPUNumFromQuota bool
+
+	// Enables VFS2 (not plumbled through yet).
+	VFS2 bool
+
+	// Enables FUSE usage (not plumbled through yet).
+	FUSE bool
 }
 
 // ToFlags returns a slice of flags that correspond to the given Config.
@@ -208,9 +287,11 @@ func (c *Config) ToFlags() []string {
 		"--log=" + c.LogFilename,
 		"--log-format=" + c.LogFormat,
 		"--debug-log=" + c.DebugLog,
+		"--panic-log=" + c.PanicLog,
 		"--debug-log-format=" + c.DebugLogFormat,
 		"--file-access=" + c.FileAccess.String(),
 		"--overlay=" + strconv.FormatBool(c.Overlay),
+		"--fsgofer-host-uds=" + strconv.FormatBool(c.FSGoferHostUDS),
 		"--network=" + c.Network.String(),
 		"--log-packets=" + strconv.FormatBool(c.LogPackets),
 		"--platform=" + c.Platform,
@@ -223,10 +304,33 @@ func (c *Config) ToFlags() []string {
 		"--net-raw=" + strconv.FormatBool(c.EnableRaw),
 		"--num-network-channels=" + strconv.Itoa(c.NumNetworkChannels),
 		"--rootless=" + strconv.FormatBool(c.Rootless),
+		"--alsologtostderr=" + strconv.FormatBool(c.AlsoLogToStderr),
+		"--ref-leak-mode=" + refsLeakModeToString(c.ReferenceLeakMode),
+		"--gso=" + strconv.FormatBool(c.HardwareGSO),
+		"--software-gso=" + strconv.FormatBool(c.SoftwareGSO),
+		"--rx-checksum-offload=" + strconv.FormatBool(c.RXChecksumOffload),
+		"--tx-checksum-offload=" + strconv.FormatBool(c.TXChecksumOffload),
+		"--overlayfs-stale-read=" + strconv.FormatBool(c.OverlayfsStaleRead),
+		"--qdisc=" + c.QDisc.String(),
 	}
+	if c.CPUNumFromQuota {
+		f = append(f, "--cpu-num-from-quota")
+	}
+	// Only include these if set since it is never to be used by users.
 	if c.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-		// Only include if set since it is never to be used by users.
-		f = append(f, "-TESTONLY-unsafe-nonroot=true")
+		f = append(f, "--TESTONLY-unsafe-nonroot=true")
 	}
+	if len(c.TestOnlyTestNameEnv) != 0 {
+		f = append(f, "--TESTONLY-test-name-env="+c.TestOnlyTestNameEnv)
+	}
+
+	if c.VFS2 {
+		f = append(f, "--vfs2=true")
+	}
+
+	if c.FUSE {
+		f = append(f, "--fuse=true")
+	}
+
 	return f
 }
