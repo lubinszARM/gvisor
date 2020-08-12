@@ -38,7 +38,7 @@ func Close(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	err := file.OnClose(t)
 	return 0, nil, slinux.HandleIOErrorVFS2(t, false /* partial */, err, syserror.EINTR, "close", file)
@@ -52,7 +52,7 @@ func Dup(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallCo
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	newFD, err := t.NewFDFromVFS2(0, file, kernel.FDFlags{})
 	if err != nil {
@@ -72,7 +72,7 @@ func Dup2(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 		if file == nil {
 			return 0, nil, syserror.EBADF
 		}
-		file.DecRef()
+		file.DecRef(t)
 		return uintptr(newfd), nil, nil
 	}
 
@@ -101,7 +101,7 @@ func dup3(t *kernel.Task, oldfd, newfd int32, flags uint32) (uintptr, *kernel.Sy
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	err := t.NewFDAtVFS2(newfd, file, kernel.FDFlags{
 		CloseOnExec: flags&linux.O_CLOEXEC != 0,
@@ -121,7 +121,7 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	switch cmd {
 	case linux.F_DUPFD, linux.F_DUPFD_CLOEXEC:
@@ -185,11 +185,11 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 	case linux.F_SETOWN_EX:
 		var owner linux.FOwnerEx
-		n, err := t.CopyIn(args[2].Pointer(), &owner)
+		_, err := t.CopyIn(args[2].Pointer(), &owner)
 		if err != nil {
 			return 0, nil, err
 		}
-		return uintptr(n), nil, setAsyncOwner(t, file, owner.Type, owner.PID)
+		return 0, nil, setAsyncOwner(t, file, owner.Type, owner.PID)
 	case linux.F_GETPIPE_SZ:
 		pipefile, ok := file.Impl().(*pipe.VFSPipeFD)
 		if !ok {
@@ -208,7 +208,7 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	case linux.F_SETLK, linux.F_SETLKW:
 		return 0, nil, posixLock(t, args, file, cmd)
 	default:
-		// TODO(gvisor.dev/issue/2920): Everything else is not yet supported.
+		// Everything else is not yet supported.
 		return 0, nil, syserror.EINVAL
 	}
 }
@@ -332,7 +332,7 @@ func Fadvise64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	// If the FD refers to a pipe or FIFO, return error.
 	if _, isPipe := file.Impl().(*pipe.VFSPipeFD); isPipe {

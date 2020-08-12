@@ -56,14 +56,16 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	// Sanitize registers.
 	regs := switchOpts.Registers
 
-	regs.Pstate &= ^uint64(UserFlagsClear)
+	regs.Pstate &= ^uint64(PsrFlagsClear)
 	regs.Pstate |= UserFlagsSet
 
+	LoadFloatingPoint(switchOpts.FloatingPointState)
 	SetTLS(regs.TPIDR_EL0)
 
 	kernelExitToEl0()
 
 	regs.TPIDR_EL0 = GetTLS()
+	SaveFloatingPoint(switchOpts.FloatingPointState)
 
 	vector = c.vecCode
 

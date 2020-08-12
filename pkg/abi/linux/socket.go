@@ -83,7 +83,6 @@ const (
 	MSG_MORE             = 0x8000
 	MSG_WAITFORONE       = 0x10000
 	MSG_SENDPAGE_NOTLAST = 0x20000
-	MSG_REINJECT         = 0x8000000
 	MSG_ZEROCOPY         = 0x4000000
 	MSG_FASTOPEN         = 0x20000000
 	MSG_CMSG_CLOEXEC     = 0x40000000
@@ -239,11 +238,13 @@ const SockAddrMax = 128
 type InetAddr [4]byte
 
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
+//
+// +marshal
 type SockAddrInet struct {
 	Family uint16
 	Port   uint16
 	Addr   InetAddr
-	Zero   [8]uint8 // pad to sizeof(struct sockaddr).
+	_      [8]uint8 // pad to sizeof(struct sockaddr).
 }
 
 // InetMulticastRequest is struct ip_mreq, from uapi/linux/in.h.

@@ -15,6 +15,8 @@
 package fdimport
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/host"
@@ -48,7 +50,7 @@ func importFS(ctx context.Context, fdTable *kernel.FDTable, console bool, fds []
 				if err != nil {
 					return nil, err
 				}
-				defer appFile.DecRef()
+				defer appFile.DecRef(ctx)
 
 				// Remember this in the TTY file, as we will
 				// use it for the other stdio FDs.
@@ -67,7 +69,7 @@ func importFS(ctx context.Context, fdTable *kernel.FDTable, console bool, fds []
 			if err != nil {
 				return nil, err
 			}
-			defer appFile.DecRef()
+			defer appFile.DecRef(ctx)
 		}
 
 		// Add the file to the FD map.
@@ -84,6 +86,9 @@ func importFS(ctx context.Context, fdTable *kernel.FDTable, console bool, fds []
 
 func importVFS2(ctx context.Context, fdTable *kernel.FDTable, console bool, stdioFDs []int) (*hostvfs2.TTYFileDescription, error) {
 	k := kernel.KernelFromContext(ctx)
+	if k == nil {
+		return nil, fmt.Errorf("cannot find kernel from context")
+	}
 
 	var ttyFile *vfs.FileDescription
 	for appFD, hostFD := range stdioFDs {
@@ -97,7 +102,7 @@ func importVFS2(ctx context.Context, fdTable *kernel.FDTable, console bool, stdi
 				if err != nil {
 					return nil, err
 				}
-				defer appFile.DecRef()
+				defer appFile.DecRef(ctx)
 
 				// Remember this in the TTY file, as we will use it for the other stdio
 				// FDs.
@@ -114,7 +119,7 @@ func importVFS2(ctx context.Context, fdTable *kernel.FDTable, console bool, stdi
 			if err != nil {
 				return nil, err
 			}
-			defer appFile.DecRef()
+			defer appFile.DecRef(ctx)
 		}
 
 		if err := fdTable.NewFDAtVFS2(ctx, int32(appFD), appFile, kernel.FDFlags{}); err != nil {

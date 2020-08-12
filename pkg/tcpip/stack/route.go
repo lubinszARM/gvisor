@@ -48,6 +48,10 @@ type Route struct {
 
 	// Loop controls where WritePacket should send packets.
 	Loop PacketLooping
+
+	// directedBroadcast indicates whether this route is sending a directed
+	// broadcast packet.
+	directedBroadcast bool
 }
 
 // makeRoute initializes a new route. It takes ownership of the provided
@@ -104,6 +108,12 @@ func (r *Route) GSOMaxSize() uint32 {
 		return gso.GSOMaxSize()
 	}
 	return 0
+}
+
+// ResolveWith immediately resolves a route with the specified remote link
+// address.
+func (r *Route) ResolveWith(addr tcpip.LinkAddress) {
+	r.RemoteLinkAddress = addr
 }
 
 // Resolve attempts to resolve the link address if necessary. Returns ErrWouldBlock in
@@ -273,6 +283,26 @@ func (r *Route) MakeLoopedRoute() Route {
 // Stack returns the instance of the Stack that owns this route.
 func (r *Route) Stack() *Stack {
 	return r.ref.stack()
+}
+
+// IsOutboundBroadcast returns true if the route is for an outbound broadcast
+// packet.
+func (r *Route) IsOutboundBroadcast() bool {
+	// Only IPv4 has a notion of broadcast.
+	return r.directedBroadcast || r.RemoteAddress == header.IPv4Broadcast
+}
+
+// IsInboundBroadcast returns true if the route is for an inbound broadcast
+// packet.
+func (r *Route) IsInboundBroadcast() bool {
+	// Only IPv4 has a notion of broadcast.
+	if r.LocalAddress == header.IPv4Broadcast {
+		return true
+	}
+
+	addr := r.ref.addrWithPrefix()
+	subnet := addr.Subnet()
+	return subnet.IsBroadcast(r.LocalAddress)
 }
 
 // ReverseRoute returns new route with given source and destination address.

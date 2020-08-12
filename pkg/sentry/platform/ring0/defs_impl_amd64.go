@@ -1,14 +1,13 @@
 package ring0
 
 import (
+	"fmt"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
-	"reflect"
-
-	"fmt"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"io"
+	"reflect"
 )
 
 // Kernel is a global kernel object.
