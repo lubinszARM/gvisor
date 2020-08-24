@@ -803,7 +803,20 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 	}
 
 	// Issue the bind request to the endpoint.
-	return syserr.TranslateNetstackError(s.Endpoint.Bind(addr))
+	err := s.Endpoint.Bind(addr)
+	if err == tcpip.ErrNoPortAvailable {
+		// Bind always returns EADDRINUSE irrespective of if the specified port was
+		// already bound or if an ephemeral port was requested but none were
+		// available.
+		//
+		// tcpip.ErrNoPortAvailable is mapped to EAGAIN in syserr package because
+		// UDP connect returns EAGAIN on ephemeral port exhaustion.
+		//
+		// TCP connect returns EADDRNOTAVAIL on ephemeral port exhaustion.
+		err = tcpip.ErrPortInUse
+	}
+
+	return syserr.TranslateNetstackError(err)
 }
 
 // Listen implements the linux syscall listen(2) for sockets backed by
@@ -949,6 +962,9 @@ func (s *SocketOperations) GetSockOpt(t *kernel.Task, level, name int, outPtr us
 			if outLen < linux.SizeOfIPTGetinfo {
 				return nil, syserr.ErrInvalidArgument
 			}
+			if s.family != linux.AF_INET {
+				return nil, syserr.ErrInvalidArgument
+			}
 
 			stack := inet.StackFromContext(t)
 			if stack == nil {
@@ -964,12 +980,15 @@ func (s *SocketOperations) GetSockOpt(t *kernel.Task, level, name int, outPtr us
 			if outLen < linux.SizeOfIPTGetEntries {
 				return nil, syserr.ErrInvalidArgument
 			}
+			if s.family != linux.AF_INET {
+				return nil, syserr.ErrInvalidArgument
+			}
 
 			stack := inet.StackFromContext(t)
 			if stack == nil {
 				return nil, syserr.ErrNoDevice
 			}
-			entries, err := netfilter.GetEntries(t, stack.(*Stack).Stack, outPtr, outLen)
+			entries, err := netfilter.GetEntries4(t, stack.(*Stack).Stack, outPtr, outLen)
 			if err != nil {
 				return nil, err
 			}
@@ -1650,10 +1669,13 @@ func (s *SocketOperations) SetSockOpt(t *kernel.Task, level int, name int, optVa
 		return nil
 	}
 
-	if s.skType == linux.SOCK_RAW && level == linux.IPPROTO_IP {
+	if s.skType == linux.SOCK_RAW && level == linux.SOL_IP {
 		switch name {
 		case linux.IPT_SO_SET_REPLACE:
 			if len(optVal) < linux.SizeOfIPTReplace {
+				return syserr.ErrInvalidArgument
+			}
+			if s.family != linux.AF_INET {
 				return syserr.ErrInvalidArgument
 			}
 

@@ -746,11 +746,7 @@ func (e *endpoint) sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedV
 
 func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *stack.GSO) {
 	optLen := len(tf.opts)
-	hdr := &pkt.Header
-	packetSize := pkt.Data.Size()
-	// Initialize the header.
-	tcp := header.TCP(hdr.Prepend(header.TCPMinimumSize + optLen))
-	pkt.TransportHeader = buffer.View(tcp)
+	tcp := header.TCP(pkt.TransportHeader().Push(header.TCPMinimumSize + optLen))
 	tcp.Encode(&header.TCPFields{
 		SrcPort:    tf.id.LocalPort,
 		DstPort:    tf.id.RemotePort,
@@ -762,8 +758,7 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *sta
 	})
 	copy(tcp[header.TCPMinimumSize:], tf.opts)
 
-	length := uint16(hdr.UsedLength() + packetSize)
-	xsum := r.PseudoHeaderChecksum(ProtocolNumber, length)
+	xsum := r.PseudoHeaderChecksum(ProtocolNumber, uint16(pkt.Size()))
 	// Only calculate the checksum if offloading isn't supported.
 	if gso != nil && gso.NeedsCsum {
 		// This is called CHECKSUM_PARTIAL in the Linux kernel. We
@@ -801,17 +796,18 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 			packetSize = size
 		}
 		size -= packetSize
-		var pkt stack.PacketBuffer
-		pkt.Header = buffer.NewPrependable(hdrSize)
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: hdrSize,
+		})
 		pkt.Hash = tf.txHash
 		pkt.Owner = owner
 		pkt.EgressRoute = r
 		pkt.GSOOptions = gso
 		pkt.NetworkProtocolNumber = r.NetworkProtocolNumber()
 		data.ReadToVV(&pkt.Data, packetSize)
-		buildTCPHdr(r, tf, &pkt, gso)
+		buildTCPHdr(r, tf, pkt, gso)
 		tf.seq = tf.seq.Add(seqnum.Size(packetSize))
-		pkts.PushBack(&pkt)
+		pkts.PushBack(pkt)
 	}
 
 	if tf.ttl == 0 {
@@ -837,12 +833,12 @@ func sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso *stac
 		return sendTCPBatch(r, tf, data, gso, owner)
 	}
 
-	pkt := &stack.PacketBuffer{
-		Header: buffer.NewPrependable(header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen),
-		Data:   data,
-		Hash:   tf.txHash,
-		Owner:  owner,
-	}
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen,
+		Data:               data,
+	})
+	pkt.Hash = tf.txHash
+	pkt.Owner = owner
 	buildTCPHdr(r, tf, pkt, gso)
 
 	if tf.ttl == 0 {
@@ -928,7 +924,18 @@ func (e *endpoint) handleWrite() *tcpip.Error {
 
 	first := e.sndQueue.Front()
 	if first != nil {
+		lastSeg := e.snd.writeList.Back()
 		e.snd.writeList.PushBackList(&e.sndQueue)
+		if lastSeg == nil {
+			lastSeg = e.snd.writeList.Front()
+		} else {
+			lastSeg = lastSeg.segEntry.Next()
+		}
+		// Add new segments to rcList, as rcList and writeList should
+		// be consistent.
+		for seg := lastSeg; seg != nil; seg = seg.segEntry.Next() {
+			e.snd.rcList.PushBack(seg)
+		}
 		e.sndBufInQueue = 0
 	}
 
@@ -1706,7 +1713,7 @@ func (e *endpoint) doTimeWait() (twReuse func()) {
 			}
 		case notification:
 			n := e.fetchNotifications()
-			if n&notifyClose != 0 || n&notifyAbort != 0 {
+			if n&notifyAbort != 0 {
 				return nil
 			}
 			if n&notifyDrain != 0 {

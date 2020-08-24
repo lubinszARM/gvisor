@@ -48,10 +48,6 @@ func (InodeNoopRefCount) TryIncRef() bool {
 	return true
 }
 
-// Destroy implements Inode.Destroy.
-func (InodeNoopRefCount) Destroy(context.Context) {
-}
-
 // InodeDirectoryNoNewChildren partially implements the Inode interface.
 // InodeDirectoryNoNewChildren represents a directory inode which does not
 // support creation of new children.
@@ -367,15 +363,12 @@ func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 
 // DecRef implements Inode.DecRef.
 func (o *OrderedChildren) DecRef(ctx context.Context) {
-	o.AtomicRefCount.DecRefWithDestructor(ctx, o.Destroy)
-}
-
-// Destroy cleans up resources referenced by this OrderedChildren.
-func (o *OrderedChildren) Destroy(context.Context) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.order.Reset()
-	o.set = nil
+	o.AtomicRefCount.DecRefWithDestructor(ctx, func(context.Context) {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		o.order.Reset()
+		o.set = nil
+	})
 }
 
 // Populate inserts children into this OrderedChildren, and d's dentry
@@ -562,15 +555,16 @@ type StaticDirectory struct {
 	InodeNoDynamicLookup
 	OrderedChildren
 
-	locks vfs.FileLocks
+	locks  vfs.FileLocks
+	fdOpts GenericDirectoryFDOptions
 }
 
 var _ Inode = (*StaticDirectory)(nil)
 
 // NewStaticDir creates a new static directory and returns its dentry.
-func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry) *Dentry {
+func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry, fdOpts GenericDirectoryFDOptions) *Dentry {
 	inode := &StaticDirectory{}
-	inode.Init(creds, devMajor, devMinor, ino, perm)
+	inode.Init(creds, devMajor, devMinor, ino, perm, fdOpts)
 
 	dentry := &Dentry{}
 	dentry.Init(inode)
@@ -583,16 +577,17 @@ func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64
 }
 
 // Init initializes StaticDirectory.
-func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, fdOpts GenericDirectoryFDOptions) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
+	s.fdOpts = fdOpts
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeDirectory|perm)
 }
 
 // Open implements kernfs.Inode.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts)
+	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts, s.fdOpts)
 	if err != nil {
 		return nil, err
 	}

@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"path"
 	"sort"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -114,7 +116,7 @@ func (mnt *Mount) Options() MountOptions {
 	defer mnt.vfs.mountMu.Unlock()
 	return MountOptions{
 		Flags:    mnt.Flags,
-		ReadOnly: mnt.readOnly(),
+		ReadOnly: mnt.ReadOnly(),
 	}
 }
 
@@ -263,16 +265,20 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 }
 
 // MountAt creates and mounts a Filesystem configured by the given arguments.
-func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentials, source string, target *PathOperation, fsTypeName string, opts *MountOptions) error {
+// The VirtualFilesystem will hold a reference to the Mount until it is unmounted.
+//
+// This method returns the mounted Mount without a reference, for convenience
+// during VFS setup when there is no chance of racing with unmount.
+func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentials, source string, target *PathOperation, fsTypeName string, opts *MountOptions) (*Mount, error) {
 	mnt, err := vfs.MountDisconnected(ctx, creds, source, fsTypeName, opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer mnt.DecRef(ctx)
 	if err := vfs.ConnectMountAt(ctx, creds, mnt, target); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return mnt, nil
 }
 
 // UmountAt removes the Mount at the given path.
@@ -369,8 +375,9 @@ type umountRecursiveOptions struct {
 //
 // umountRecursiveLocked is analogous to Linux's fs/namespace.c:umount_tree().
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
 func (vfs *VirtualFilesystem) umountRecursiveLocked(mnt *Mount, opts *umountRecursiveOptions, vdsToDecRef []VirtualDentry, mountsToDecRef []*Mount) ([]VirtualDentry, []*Mount) {
 	if !mnt.umounted {
 		mnt.umounted = true
@@ -399,9 +406,11 @@ func (vfs *VirtualFilesystem) umountRecursiveLocked(mnt *Mount, opts *umountRecu
 // connectLocked makes vd the mount parent/point for mnt. It consumes
 // references held by vd.
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section. d.mu must be locked. mnt.parent() == nil, i.e. mnt
-// must not already be connected.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
+// * d.mu must be locked.
+// * mnt.parent() == nil, i.e. mnt must not already be connected.
 func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns *MountNamespace) {
 	if checkInvariants {
 		if mnt.parent() != nil {
@@ -429,8 +438,10 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 // disconnectLocked makes vd have no mount parent/point and returns its old
 // mount parent/point with a reference held.
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section. mnt.parent() != nil.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
+// * mnt.parent() != nil.
 func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 	vd := mnt.loadKey()
 	if checkInvariants {
@@ -576,8 +587,9 @@ retryFirst:
 // mnt. It takes a reference on the returned VirtualDentry. If no such mount
 // point exists (i.e. mnt is a root mount), getMountpointAt returns (nil, nil).
 //
-// Preconditions: References are held on mnt and root. vfsroot is not (mnt,
-// mnt.root).
+// Preconditions:
+// * References are held on mnt and root.
+// * vfsroot is not (mnt, mnt.root).
 func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
 	// The first mount is special-cased:
 	//
@@ -651,6 +663,13 @@ retryFirst:
 	return VirtualDentry{mnt, d}
 }
 
+// SetMountReadOnly sets the mount as ReadOnly.
+func (vfs *VirtualFilesystem) SetMountReadOnly(mnt *Mount, ro bool) error {
+	vfs.mountMu.Lock()
+	defer vfs.mountMu.Unlock()
+	return mnt.setReadOnlyLocked(ro)
+}
+
 // CheckBeginWrite increments the counter of in-progress write operations on
 // mnt. If mnt is mounted MS_RDONLY, CheckBeginWrite does nothing and returns
 // EROFS.
@@ -688,7 +707,8 @@ func (mnt *Mount) setReadOnlyLocked(ro bool) error {
 	return nil
 }
 
-func (mnt *Mount) readOnly() bool {
+// ReadOnly returns true if mount is readonly.
+func (mnt *Mount) ReadOnly() bool {
 	return atomic.LoadInt64(&mnt.writers) < 0
 }
 
@@ -756,7 +776,7 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		}
 
 		opts := "rw"
-		if mnt.readOnly() {
+		if mnt.ReadOnly() {
 			opts = "ro"
 		}
 		if mnt.Flags.NoATime {
@@ -844,7 +864,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 
 		// (6) Mount options.
 		opts := "rw"
-		if mnt.readOnly() {
+		if mnt.ReadOnly() {
 			opts = "ro"
 		}
 		if mnt.Flags.NoATime {
@@ -870,6 +890,30 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 	}
 }
 
+// MakeSyntheticMountpoint creates parent directories of target if they do not
+// exist and attempts to create a directory for the mountpoint. If a
+// non-directory file already exists there then we allow it.
+func (vfs *VirtualFilesystem) MakeSyntheticMountpoint(ctx context.Context, target string, root VirtualDentry, creds *auth.Credentials) error {
+	mkdirOpts := &MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
+
+	// Make sure the parent directory of target exists.
+	if err := vfs.MkdirAllAt(ctx, path.Dir(target), root, creds, mkdirOpts); err != nil {
+		return fmt.Errorf("failed to create parent directory of mountpoint %q: %w", target, err)
+	}
+
+	// Attempt to mkdir the final component. If a file (of any type) exists
+	// then we let allow mounting on top of that because we do not require the
+	// target to be an existing directory, unlike Linux mount(2).
+	if err := vfs.MkdirAt(ctx, creds, &PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(target),
+	}, mkdirOpts); err != nil && err != syserror.EEXIST {
+		return fmt.Errorf("failed to create mountpoint %q: %w", target, err)
+	}
+	return nil
+}
+
 // manglePath replaces ' ', '\t', '\n', and '\\' with their octal equivalents.
 // See Linux fs/seq_file.c:mangle_path.
 func manglePath(p string) string {
@@ -883,7 +927,7 @@ func superBlockOpts(mountPath string, mnt *Mount) string {
 	// gVisor doesn't (yet) have a concept of super block options, so we
 	// use the ro/rw bit from the mount flag.
 	opts := "rw"
-	if mnt.readOnly() {
+	if mnt.ReadOnly() {
 		opts = "ro"
 	}
 

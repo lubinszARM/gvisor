@@ -289,7 +289,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	if flags&linux.O_DIRECT != 0 && !fd.opts.AllowDirectIO {
 		return syserror.EINVAL
 	}
-	// TODO(jamieliu): FileDescriptionImpl.SetOAsync()?
+	// TODO(gvisor.dev/issue/1035): FileDescriptionImpl.SetOAsync()?
 	const settableFlags = linux.O_APPEND | linux.O_ASYNC | linux.O_DIRECT | linux.O_NOATIME | linux.O_NONBLOCK
 	fd.flagsMu.Lock()
 	if fd.asyncHandler != nil {
@@ -301,7 +301,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 			fd.asyncHandler.Unregister(fd)
 		}
 	}
-	fd.statusFlags = (oldFlags &^ settableFlags) | (flags & settableFlags)
+	atomic.StoreUint32(&fd.statusFlags, (oldFlags&^settableFlags)|(flags&settableFlags))
 	fd.flagsMu.Unlock()
 	return nil
 }
@@ -371,8 +371,9 @@ type FileDescriptionImpl interface {
 	//
 	// - If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
 	//
-	// Preconditions: The FileDescription was opened for reading.
-	// FileDescriptionOptions.DenyPRead == false.
+	// Preconditions:
+	// * The FileDescription was opened for reading.
+	// * FileDescriptionOptions.DenyPRead == false.
 	PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error)
 
 	// Read is similar to PRead, but does not specify an offset.
@@ -403,8 +404,9 @@ type FileDescriptionImpl interface {
 	// - If opts.Flags specifies unsupported options, PWrite returns
 	// EOPNOTSUPP.
 	//
-	// Preconditions: The FileDescription was opened for writing.
-	// FileDescriptionOptions.DenyPWrite == false.
+	// Preconditions:
+	// * The FileDescription was opened for writing.
+	// * FileDescriptionOptions.DenyPWrite == false.
 	PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error)
 
 	// Write is similar to PWrite, but does not specify an offset, which is
@@ -844,4 +846,32 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsyn
 		}
 	}
 	return fd.asyncHandler
+}
+
+// FileReadWriteSeeker is a helper struct to pass a FileDescription as
+// io.Reader/io.Writer/io.ReadSeeker/etc.
+type FileReadWriteSeeker struct {
+	Fd    *FileDescription
+	Ctx   context.Context
+	ROpts ReadOptions
+	WOpts WriteOptions
+}
+
+// Read implements io.ReadWriteSeeker.Read.
+func (f *FileReadWriteSeeker) Read(p []byte) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	ret, err := f.Fd.Read(f.Ctx, dst, f.ROpts)
+	return int(ret), err
+}
+
+// Seek implements io.ReadWriteSeeker.Seek.
+func (f *FileReadWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return f.Fd.Seek(f.Ctx, offset, int32(whence))
+}
+
+// Write implements io.ReadWriteSeeker.Write.
+func (f *FileReadWriteSeeker) Write(p []byte) (int, error) {
+	buf := usermem.BytesIOSequence(p)
+	ret, err := f.Fd.Write(f.Ctx, buf, f.WOpts)
+	return int(ret), err
 }

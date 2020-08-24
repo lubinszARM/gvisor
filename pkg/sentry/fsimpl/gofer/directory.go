@@ -34,8 +34,11 @@ func (d *dentry) isDir() bool {
 	return d.fileType() == linux.S_IFDIR
 }
 
-// Preconditions: filesystem.renameMu must be locked. d.dirMu must be locked.
-// d.isDir(). child must be a newly-created dentry that has never had a parent.
+// Preconditions:
+// * filesystem.renameMu must be locked.
+// * d.dirMu must be locked.
+// * d.isDir().
+// * child must be a newly-created dentry that has never had a parent.
 func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 	d.IncRef() // reference held by child on its parent
 	child.parent = d
@@ -46,7 +49,9 @@ func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 	d.children[name] = child
 }
 
-// Preconditions: d.dirMu must be locked. d.isDir().
+// Preconditions:
+// * d.dirMu must be locked.
+// * d.isDir().
 func (d *dentry) cacheNegativeLookupLocked(name string) {
 	// Don't cache negative lookups if InteropModeShared is in effect (since
 	// this makes remote lookup unavoidable), or if d.isSynthetic() (in which
@@ -79,10 +84,12 @@ type createSyntheticOpts struct {
 // createSyntheticChildLocked creates a synthetic file with the given name
 // in d.
 //
-// Preconditions: d.dirMu must be locked. d.isDir(). d does not already contain
-// a child with the given name.
+// Preconditions:
+// * d.dirMu must be locked.
+// * d.isDir().
+// * d does not already contain a child with the given name.
 func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
-	d2 := &dentry{
+	child := &dentry{
 		refs:      1, // held by d
 		fs:        d.fs,
 		ino:       d.fs.nextSyntheticIno(),
@@ -97,16 +104,16 @@ func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
 	case linux.S_IFDIR:
 		// Nothing else needs to be done.
 	case linux.S_IFSOCK:
-		d2.endpoint = opts.endpoint
+		child.endpoint = opts.endpoint
 	case linux.S_IFIFO:
-		d2.pipe = opts.pipe
+		child.pipe = opts.pipe
 	default:
 		panic(fmt.Sprintf("failed to create synthetic file of unrecognized type: %v", opts.mode.FileType()))
 	}
-	d2.pf.dentry = d2
-	d2.vfsd.Init(d2)
+	child.pf.dentry = child
+	child.vfsd.Init(child)
 
-	d.cacheNewChildLocked(d2, opts.name)
+	d.cacheNewChildLocked(child, opts.name)
 	d.syntheticChildren++
 }
 
@@ -151,7 +158,9 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	return nil
 }
 
-// Preconditions: d.isDir(). There exists at least one directoryFD representing d.
+// Preconditions:
+// * d.isDir().
+// * There exists at least one directoryFD representing d.
 func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	// NOTE(b/135560623): 9P2000.L's readdir does not specify behavior in the
 	// presence of concurrent mutation of an iterated directory, so

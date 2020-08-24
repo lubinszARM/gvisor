@@ -1102,19 +1102,6 @@ func (s *Stack) removeNICLocked(id tcpip.NICID) *tcpip.Error {
 	return nic.remove()
 }
 
-// NICAddressRanges returns a map of NICIDs to their associated subnets.
-func (s *Stack) NICAddressRanges() map[tcpip.NICID][]tcpip.Subnet {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	nics := map[tcpip.NICID][]tcpip.Subnet{}
-
-	for id, nic := range s.nics {
-		nics[id] = append(nics[id], nic.AddressRanges()...)
-	}
-	return nics
-}
-
 // NICInfo captures the name and addresses assigned to a NIC.
 type NICInfo struct {
 	Name              string
@@ -1230,35 +1217,6 @@ func (s *Stack) AddProtocolAddressWithOptions(id tcpip.NICID, protocolAddress tc
 	return nic.AddAddress(protocolAddress, peb)
 }
 
-// AddAddressRange adds a range of addresses to the specified NIC. The range is
-// given by a subnet address, and all addresses contained in the subnet are
-// used except for the subnet address itself and the subnet's broadcast
-// address.
-func (s *Stack) AddAddressRange(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, subnet tcpip.Subnet) *tcpip.Error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if nic, ok := s.nics[id]; ok {
-		nic.AddAddressRange(protocol, subnet)
-		return nil
-	}
-
-	return tcpip.ErrUnknownNICID
-}
-
-// RemoveAddressRange removes the range of addresses from the specified NIC.
-func (s *Stack) RemoveAddressRange(id tcpip.NICID, subnet tcpip.Subnet) *tcpip.Error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if nic, ok := s.nics[id]; ok {
-		nic.RemoveAddressRange(subnet)
-		return nil
-	}
-
-	return tcpip.ErrUnknownNICID
-}
-
 // RemoveAddress removes an existing network-layer address from the specified
 // NIC.
 func (s *Stack) RemoveAddress(id tcpip.NICID, addr tcpip.Address) *tcpip.Error {
@@ -1321,7 +1279,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 	if id != 0 && !needRoute {
 		if nic, ok := s.nics[id]; ok && nic.enabled() {
 			if ref := s.getRefEP(nic, localAddr, remoteAddr, netProto); ref != nil {
-				return makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref, s.handleLocal && !nic.isLoopback(), multicastLoop && !nic.isLoopback()), nil
+				return makeRoute(netProto, ref.address(), remoteAddr, nic.linkEP.LinkAddress(), ref, s.handleLocal && !nic.isLoopback(), multicastLoop && !nic.isLoopback()), nil
 			}
 		}
 	} else {
@@ -1334,10 +1292,10 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 					if len(remoteAddr) == 0 {
 						// If no remote address was provided, then the route
 						// provided will refer to the link local address.
-						remoteAddr = ref.ep.ID().LocalAddress
+						remoteAddr = ref.address()
 					}
 
-					r := makeRoute(netProto, ref.ep.ID().LocalAddress, remoteAddr, nic.linkEP.LinkAddress(), ref, s.handleLocal && !nic.isLoopback(), multicastLoop && !nic.isLoopback())
+					r := makeRoute(netProto, ref.address(), remoteAddr, nic.linkEP.LinkAddress(), ref, s.handleLocal && !nic.isLoopback(), multicastLoop && !nic.isLoopback())
 					r.directedBroadcast = route.Destination.IsBroadcast(remoteAddr)
 
 					if len(route.Gateway) > 0 {

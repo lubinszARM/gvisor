@@ -285,13 +285,10 @@ type inode struct {
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
 
-	// refs is a reference count. refs is accessed using atomic memory
-	// operations.
-	//
 	// A reference is held on all inodes as long as they are reachable in the
 	// filesystem tree, i.e. nlink is nonzero. This reference is dropped when
 	// nlink reaches 0.
-	refs int64
+	refs inodeRefs
 
 	// xattrs implements extended attributes.
 	//
@@ -327,7 +324,6 @@ func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth
 		panic("file type is required in FileMode")
 	}
 	i.fs = fs
-	i.refs = 1
 	i.mode = uint32(mode)
 	i.uid = uint32(kuid)
 	i.gid = uint32(kgid)
@@ -339,12 +335,15 @@ func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth
 	i.mtime = now
 	// i.nlink initialized by caller
 	i.impl = impl
+	i.refs.EnableLeakCheck()
 }
 
 // incLinksLocked increments i's link count.
 //
-// Preconditions: filesystem.mu must be locked for writing. i.nlink != 0.
-// i.nlink < maxLinks.
+// Preconditions:
+// * filesystem.mu must be locked for writing.
+// * i.nlink != 0.
+// * i.nlink < maxLinks.
 func (i *inode) incLinksLocked() {
 	if i.nlink == 0 {
 		panic("tmpfs.inode.incLinksLocked() called with no existing links")
@@ -358,7 +357,9 @@ func (i *inode) incLinksLocked() {
 // decLinksLocked decrements i's link count. If the link count reaches 0, we
 // remove a reference on i as well.
 //
-// Preconditions: filesystem.mu must be locked for writing. i.nlink != 0.
+// Preconditions:
+// * filesystem.mu must be locked for writing.
+// * i.nlink != 0.
 func (i *inode) decLinksLocked(ctx context.Context) {
 	if i.nlink == 0 {
 		panic("tmpfs.inode.decLinksLocked() called with no existing links")
@@ -369,25 +370,15 @@ func (i *inode) decLinksLocked(ctx context.Context) {
 }
 
 func (i *inode) incRef() {
-	if atomic.AddInt64(&i.refs, 1) <= 1 {
-		panic("tmpfs.inode.incRef() called without holding a reference")
-	}
+	i.refs.IncRef()
 }
 
 func (i *inode) tryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&i.refs)
-		if refs == 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&i.refs, refs, refs+1) {
-			return true
-		}
-	}
+	return i.refs.TryIncRef()
 }
 
 func (i *inode) decRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&i.refs, -1); refs == 0 {
+	i.refs.DecRef(func() {
 		i.watches.HandleDeletion(ctx)
 		if regFile, ok := i.impl.(*regularFile); ok {
 			// Release memory used by regFile to store data. Since regFile is
@@ -395,9 +386,7 @@ func (i *inode) decRef(ctx context.Context) {
 			// metadata.
 			regFile.data.DropAll(regFile.memFile)
 		}
-	} else if refs < 0 {
-		panic("tmpfs.inode.decRef() called without holding a reference")
-	}
+	})
 }
 
 func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
@@ -609,8 +598,9 @@ func (i *inode) touchCMtime() {
 	i.mu.Unlock()
 }
 
-// Preconditions: The caller has called vfs.Mount.CheckBeginWrite() and holds
-// inode.mu.
+// Preconditions:
+// * The caller has called vfs.Mount.CheckBeginWrite().
+// * inode.mu must be locked.
 func (i *inode) touchCMtimeLocked() {
 	now := i.fs.clock.Now().Nanoseconds()
 	atomic.StoreInt64(&i.mtime, now)
