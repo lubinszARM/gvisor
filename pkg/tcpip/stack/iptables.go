@@ -165,7 +165,11 @@ func EmptyNATTable() Table {
 }
 
 // GetTable returns a table by name.
-func (it *IPTables) GetTable(name string) (Table, bool) {
+func (it *IPTables) GetTable(name string, ipv6 bool) (Table, bool) {
+	// TODO(gvisor.dev/issue/3549): Enable IPv6.
+	if ipv6 {
+		return Table{}, false
+	}
 	id, ok := nameToID[name]
 	if !ok {
 		return Table{}, false
@@ -176,7 +180,11 @@ func (it *IPTables) GetTable(name string) (Table, bool) {
 }
 
 // ReplaceTable replaces or inserts table by name.
-func (it *IPTables) ReplaceTable(name string, table Table) *tcpip.Error {
+func (it *IPTables) ReplaceTable(name string, table Table, ipv6 bool) *tcpip.Error {
+	// TODO(gvisor.dev/issue/3549): Enable IPv6.
+	if ipv6 {
+		return tcpip.ErrInvalidOptionValue
+	}
 	id, ok := nameToID[name]
 	if !ok {
 		return tcpip.ErrInvalidOptionValue
@@ -419,5 +427,10 @@ func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx
 // OriginalDst returns the original destination of redirected connections. It
 // returns an error if the connection doesn't exist or isn't redirected.
 func (it *IPTables) OriginalDst(epID TransportEndpointID) (tcpip.Address, uint16, *tcpip.Error) {
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+	if !it.modified {
+		return "", 0, tcpip.ErrNotConnected
+	}
 	return it.connections.originalDst(epID)
 }

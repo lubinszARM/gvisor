@@ -315,7 +315,11 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 	if err != nil {
 		return vfs.VirtualDentry{}, err
 	}
-	return vfs.MakeVirtualDentry(newmnt, vd.Dentry()), nil
+	// Take a reference on the dentry which will be owned by the returned
+	// VirtualDentry.
+	d := vd.Dentry()
+	d.IncRef()
+	return vfs.MakeVirtualDentry(newmnt, d), nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -566,6 +570,16 @@ func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) 
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
 }
 
+func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
+	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
+	kuid := auth.KUID(atomic.LoadUint32(&d.uid))
+	kgid := auth.KGID(atomic.LoadUint32(&d.gid))
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+		return err
+	}
+	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
+}
+
 // statInternalMask is the set of stat fields that is set by
 // dentry.statInternalTo().
 const statInternalMask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO
@@ -616,6 +630,32 @@ func (fd *fileDescription) filesystem() *filesystem {
 
 func (fd *fileDescription) dentry() *dentry {
 	return fd.vfsfd.Dentry().Impl().(*dentry)
+}
+
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.filesystem().listXattr(ctx, fd.dentry(), size)
+}
+
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.filesystem().getXattr(ctx, fd.dentry(), auth.CredentialsFromContext(ctx), &opts)
+}
+
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
+	fs := fd.filesystem()
+	fs.renameMu.RLock()
+	defer fs.renameMu.RUnlock()
+	return fs.setXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
+}
+
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
+	fs := fd.filesystem()
+	fs.renameMu.RLock()
+	defer fs.renameMu.RUnlock()
+	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.

@@ -56,10 +56,16 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	// Skip flushing if writes may be buffered by the client, since (as with
-	// the VFS1 client) we don't flush buffered writes on close anyway.
+	// Skip flushing if there are client-buffered writes, since (as with the
+	// VFS1 client) we don't flush buffered writes on close anyway.
 	d := fd.dentry()
-	if d.fs.opts.interop == InteropModeExclusive {
+	if d.fs.opts.interop != InteropModeExclusive {
+		return nil
+	}
+	d.dataMu.RLock()
+	haveDirtyPages := !d.dirty.IsEmpty()
+	d.dataMu.RUnlock()
+	if haveDirtyPages {
 		return nil
 	}
 	d.handleMu.RLock()
@@ -117,6 +123,10 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, io.EOF
 	}
 
+	var (
+		n       int64
+		readErr error
+	)
 	if fd.vfsfd.StatusFlags()&linux.O_DIRECT != 0 {
 		// Lock d.metadataMu for the rest of the read to prevent d.size from
 		// changing.
@@ -127,20 +137,25 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		if err := d.writeback(ctx, offset, dst.NumBytes()); err != nil {
 			return 0, err
 		}
-	}
-
-	rw := getDentryReadWriter(ctx, d, offset)
-	if fd.vfsfd.StatusFlags()&linux.O_DIRECT != 0 {
+		rw := getDentryReadWriter(ctx, d, offset)
 		// Require the read to go to the remote file.
 		rw.direct = true
+		n, readErr = dst.CopyOutFrom(ctx, rw)
+		putDentryReadWriter(rw)
+		if d.fs.opts.interop != InteropModeShared {
+			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
+			d.touchAtimeLocked(fd.vfsfd.Mount())
+		}
+	} else {
+		rw := getDentryReadWriter(ctx, d, offset)
+		n, readErr = dst.CopyOutFrom(ctx, rw)
+		putDentryReadWriter(rw)
+		if d.fs.opts.interop != InteropModeShared {
+			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
+			d.touchAtime(fd.vfsfd.Mount())
+		}
 	}
-	n, err := dst.CopyOutFrom(ctx, rw)
-	putDentryReadWriter(rw)
-	if d.fs.opts.interop != InteropModeShared {
-		// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
-		d.touchAtime(fd.vfsfd.Mount())
-	}
-	return n, err
+	return n, readErr
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

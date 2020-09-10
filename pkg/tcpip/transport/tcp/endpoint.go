@@ -849,12 +849,12 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		maxSynRetries: DefaultSynRetries,
 	}
 
-	var ss SendBufferSizeOption
+	var ss tcpip.TCPSendBufferSizeRangeOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
 		e.sndBufSize = ss.Default
 	}
 
-	var rs ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 		e.rcvBufSize = rs.Default
 	}
@@ -864,12 +864,12 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		e.cc = cs
 	}
 
-	var mrb tcpip.ModerateReceiveBufferOption
+	var mrb tcpip.TCPModerateReceiveBufferOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &mrb); err == nil {
 		e.rcvAutoParams.disabled = !bool(mrb)
 	}
 
-	var de DelayEnabled
+	var de tcpip.TCPDelayEnabled
 	if err := s.TransportProtocolOption(ProtocolNumber, &de); err == nil && de {
 		e.SetSockOptBool(tcpip.DelayOption, true)
 	}
@@ -1211,7 +1211,7 @@ func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 	e.owner = owner
 }
 
-func (e *endpoint) takeLastError() *tcpip.Error {
+func (e *endpoint) LastError() *tcpip.Error {
 	e.lastErrorMu.Lock()
 	defer e.lastErrorMu.Unlock()
 	err := e.lastError
@@ -1428,7 +1428,7 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 	vec = append([][]byte(nil), vec...)
 
 	var num int64
-	for s := e.rcvList.Front(); s != nil; s = s.segEntry.Next() {
+	for s := e.rcvList.Front(); s != nil; s = s.Next() {
 		views := s.data.Views()
 
 		for i := s.viewToDeliver; i < len(views); i++ {
@@ -1609,7 +1609,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	case tcpip.ReceiveBufferSizeOption:
 		// Make sure the receive buffer size is within the min and max
 		// allowed.
-		var rs ReceiveBufferSizeOption
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 			if v < rs.Min {
 				v = rs.Min
@@ -1659,7 +1659,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	case tcpip.SendBufferSizeOption:
 		// Make sure the send buffer size is within the min and max
 		// allowed.
-		var ss SendBufferSizeOption
+		var ss tcpip.TCPSendBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
 			if v < ss.Min {
 				v = ss.Min
@@ -1699,7 +1699,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 				return tcpip.ErrInvalidOptionValue
 			}
 		}
-		var rs ReceiveBufferSizeOption
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 			if v < rs.Min/2 {
 				v = rs.Min / 2
@@ -1713,10 +1713,10 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 // SetSockOpt sets a socket option.
-func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	switch v := opt.(type) {
-	case tcpip.BindToDeviceOption:
-		id := tcpip.NICID(v)
+	case *tcpip.BindToDeviceOption:
+		id := tcpip.NICID(*v)
 		if id != 0 && !e.stack.HasNIC(id) {
 			return tcpip.ErrUnknownDevice
 		}
@@ -1724,40 +1724,40 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.bindToDevice = id
 		e.UnlockUser()
 
-	case tcpip.KeepaliveIdleOption:
+	case *tcpip.KeepaliveIdleOption:
 		e.keepalive.Lock()
-		e.keepalive.idle = time.Duration(v)
+		e.keepalive.idle = time.Duration(*v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
 
-	case tcpip.KeepaliveIntervalOption:
+	case *tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
-		e.keepalive.interval = time.Duration(v)
+		e.keepalive.interval = time.Duration(*v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
 
-	case tcpip.OutOfBandInlineOption:
+	case *tcpip.OutOfBandInlineOption:
 		// We don't currently support disabling this option.
 
-	case tcpip.TCPUserTimeoutOption:
+	case *tcpip.TCPUserTimeoutOption:
 		e.LockUser()
-		e.userTimeout = time.Duration(v)
+		e.userTimeout = time.Duration(*v)
 		e.UnlockUser()
 
-	case tcpip.CongestionControlOption:
+	case *tcpip.CongestionControlOption:
 		// Query the available cc algorithms in the stack and
 		// validate that the specified algorithm is actually
 		// supported in the stack.
-		var avail tcpip.AvailableCongestionControlOption
+		var avail tcpip.TCPAvailableCongestionControlOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &avail); err != nil {
 			return err
 		}
 		availCC := strings.Split(string(avail), " ")
 		for _, cc := range availCC {
-			if v == tcpip.CongestionControlOption(cc) {
+			if *v == tcpip.CongestionControlOption(cc) {
 				e.LockUser()
 				state := e.EndpointState()
-				e.cc = v
+				e.cc = *v
 				switch state {
 				case StateEstablished:
 					if e.EndpointState() == state {
@@ -1773,29 +1773,38 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		// control algorithm is specified.
 		return tcpip.ErrNoSuchFile
 
-	case tcpip.TCPLingerTimeoutOption:
+	case *tcpip.TCPLingerTimeoutOption:
 		e.LockUser()
-		if v < 0 {
+
+		switch {
+		case *v < 0:
 			// Same as effectively disabling TCPLinger timeout.
-			v = 0
+			*v = -1
+		case *v == 0:
+			// Same as the stack default.
+			var stackLingerTimeout tcpip.TCPLingerTimeoutOption
+			if err := e.stack.TransportProtocolOption(ProtocolNumber, &stackLingerTimeout); err != nil {
+				panic(fmt.Sprintf("e.stack.TransportProtocolOption(%d, %+v) = %v", ProtocolNumber, &stackLingerTimeout, err))
+			}
+			*v = stackLingerTimeout
+		case *v > tcpip.TCPLingerTimeoutOption(MaxTCPLingerTimeout):
+			// Cap it to Stack's default TCP_LINGER2 timeout.
+			*v = tcpip.TCPLingerTimeoutOption(MaxTCPLingerTimeout)
+		default:
 		}
-		// Cap it to MaxTCPLingerTimeout.
-		stkTCPLingerTimeout := tcpip.TCPLingerTimeoutOption(MaxTCPLingerTimeout)
-		if v > stkTCPLingerTimeout {
-			v = stkTCPLingerTimeout
-		}
-		e.tcpLingerTimeout = time.Duration(v)
+
+		e.tcpLingerTimeout = time.Duration(*v)
 		e.UnlockUser()
 
-	case tcpip.TCPDeferAcceptOption:
+	case *tcpip.TCPDeferAcceptOption:
 		e.LockUser()
-		if time.Duration(v) > MaxRTO {
-			v = tcpip.TCPDeferAcceptOption(MaxRTO)
+		if time.Duration(*v) > MaxRTO {
+			*v = tcpip.TCPDeferAcceptOption(MaxRTO)
 		}
-		e.deferAccept = time.Duration(v)
+		e.deferAccept = time.Duration(*v)
 		e.UnlockUser()
 
-	case tcpip.SocketDetachFilterOption:
+	case *tcpip.SocketDetachFilterOption:
 		return nil
 
 	default:
@@ -1956,11 +1965,8 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 	switch o := opt.(type) {
-	case tcpip.ErrorOption:
-		return e.takeLastError()
-
 	case *tcpip.BindToDeviceOption:
 		e.LockUser()
 		*o = tcpip.BindToDeviceOption(e.bindToDevice)
@@ -2013,8 +2019,10 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		e.UnlockUser()
 
 	case *tcpip.OriginalDestinationOption:
+		e.LockUser()
 		ipt := e.stack.IPTables()
 		addr, port, err := ipt.OriginalDst(e.ID)
+		e.UnlockUser()
 		if err != nil {
 			return err
 		}
@@ -2249,7 +2257,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 	if !handshake {
 		e.segmentQueue.mu.Lock()
 		for _, l := range []segmentList{e.segmentQueue.list, e.sndQueue, e.snd.writeList} {
-			for s := l.Front(); s != nil; s = s.segEntry.Next() {
+			for s := l.Front(); s != nil; s = s.Next() {
 				s.id = e.ID
 				s.route = r.Clone()
 				e.sndWaker.Assert()
@@ -2447,7 +2455,9 @@ func (e *endpoint) startAcceptedLoop() {
 
 // Accept returns a new endpoint if a peer has established a connection
 // to an endpoint previously set to listen mode.
-func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+//
+// addr if not-nil will contain the peer address of the returned endpoint.
+func (e *endpoint) Accept(peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	e.LockUser()
 	defer e.UnlockUser()
 
@@ -2468,6 +2478,9 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 		e.acceptCond.Signal()
 	default:
 		return nil, nil, tcpip.ErrWouldBlock
+	}
+	if peerAddr != nil {
+		*peerAddr = n.getRemoteAddress()
 	}
 	return n, n.waiterQueue, nil
 }
@@ -2571,11 +2584,15 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
 		return tcpip.FullAddress{}, tcpip.ErrNotConnected
 	}
 
+	return e.getRemoteAddress(), nil
+}
+
+func (e *endpoint) getRemoteAddress() tcpip.FullAddress {
 	return tcpip.FullAddress{
 		Addr: e.ID.RemoteAddress,
 		Port: e.ID.RemotePort,
 		NIC:  e.boundNICID,
-	}, nil
+	}
 }
 
 func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
@@ -2692,7 +2709,7 @@ func (e *endpoint) receiveBufferSize() int {
 }
 
 func (e *endpoint) maxReceiveBufferSize() int {
-	var rs ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err != nil {
 		// As a fallback return the hardcoded max buffer size.
 		return MaxBufferSize
@@ -2772,7 +2789,7 @@ func timeStampOffset() uint32 {
 // if the SYN options indicate that the SACK option was negotiated and the TCP
 // stack is configured to enable TCP SACK option.
 func (e *endpoint) maybeEnableSACKPermitted(synOpts *header.TCPSynOptions) {
-	var v SACKEnabled
+	var v tcpip.TCPSACKEnabled
 	if err := e.stack.TransportProtocolOption(ProtocolNumber, &v); err != nil {
 		// Stack doesn't support SACK. So just return.
 		return

@@ -15,8 +15,6 @@
 package vfs
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -34,9 +32,7 @@ import (
 //
 // +stateify savable
 type Filesystem struct {
-	// refs is the reference count. refs is accessed using atomic memory
-	// operations.
-	refs int64
+	FilesystemRefs
 
 	// vfs is the VirtualFilesystem that uses this Filesystem. vfs is
 	// immutable.
@@ -52,7 +48,7 @@ type Filesystem struct {
 
 // Init must be called before first use of fs.
 func (fs *Filesystem) Init(vfsObj *VirtualFilesystem, fsType FilesystemType, impl FilesystemImpl) {
-	fs.refs = 1
+	fs.EnableLeakCheck()
 	fs.vfs = vfsObj
 	fs.fsType = fsType
 	fs.impl = impl
@@ -76,39 +72,14 @@ func (fs *Filesystem) Impl() FilesystemImpl {
 	return fs.impl
 }
 
-// IncRef increments fs' reference count.
-func (fs *Filesystem) IncRef() {
-	if atomic.AddInt64(&fs.refs, 1) <= 1 {
-		panic("Filesystem.IncRef() called without holding a reference")
-	}
-}
-
-// TryIncRef increments fs' reference count and returns true. If fs' reference
-// count is zero, TryIncRef does nothing and returns false.
-//
-// TryIncRef does not require that a reference is held on fs.
-func (fs *Filesystem) TryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&fs.refs)
-		if refs <= 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&fs.refs, refs, refs+1) {
-			return true
-		}
-	}
-}
-
 // DecRef decrements fs' reference count.
 func (fs *Filesystem) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&fs.refs, -1); refs == 0 {
+	fs.FilesystemRefs.DecRef(func() {
 		fs.vfs.filesystemsMu.Lock()
 		delete(fs.vfs.filesystems, fs)
 		fs.vfs.filesystemsMu.Unlock()
 		fs.impl.Release(ctx)
-	} else if refs < 0 {
-		panic("Filesystem.decRef() called without holding a reference")
-	}
+	})
 }
 
 // FilesystemImpl contains implementation details for a Filesystem.
@@ -445,26 +416,26 @@ type FilesystemImpl interface {
 	// ResolvingPath.Resolve*(), then !rp.Done().
 	UnlinkAt(ctx context.Context, rp *ResolvingPath) error
 
-	// ListxattrAt returns all extended attribute names for the file at rp.
+	// ListXattrAt returns all extended attribute names for the file at rp.
 	//
 	// Errors:
 	//
 	// - If extended attributes are not supported by the filesystem,
-	// ListxattrAt returns ENOTSUP.
+	// ListXattrAt returns ENOTSUP.
 	//
 	// - If the size of the list (including a NUL terminating byte after every
 	// entry) would exceed size, ERANGE may be returned. Note that
 	// implementations are free to ignore size entirely and return without
 	// error). In all cases, if size is 0, the list should be returned without
 	// error, regardless of size.
-	ListxattrAt(ctx context.Context, rp *ResolvingPath, size uint64) ([]string, error)
+	ListXattrAt(ctx context.Context, rp *ResolvingPath, size uint64) ([]string, error)
 
-	// GetxattrAt returns the value associated with the given extended
+	// GetXattrAt returns the value associated with the given extended
 	// attribute for the file at rp.
 	//
 	// Errors:
 	//
-	// - If extended attributes are not supported by the filesystem, GetxattrAt
+	// - If extended attributes are not supported by the filesystem, GetXattrAt
 	// returns ENOTSUP.
 	//
 	// - If an extended attribute named opts.Name does not exist, ENODATA is
@@ -474,30 +445,30 @@ type FilesystemImpl interface {
 	// returned (note that implementations are free to ignore opts.Size entirely
 	// and return without error). In all cases, if opts.Size is 0, the value
 	// should be returned without error, regardless of size.
-	GetxattrAt(ctx context.Context, rp *ResolvingPath, opts GetxattrOptions) (string, error)
+	GetXattrAt(ctx context.Context, rp *ResolvingPath, opts GetXattrOptions) (string, error)
 
-	// SetxattrAt changes the value associated with the given extended
+	// SetXattrAt changes the value associated with the given extended
 	// attribute for the file at rp.
 	//
 	// Errors:
 	//
-	// - If extended attributes are not supported by the filesystem, SetxattrAt
+	// - If extended attributes are not supported by the filesystem, SetXattrAt
 	// returns ENOTSUP.
 	//
 	// - If XATTR_CREATE is set in opts.Flag and opts.Name already exists,
 	// EEXIST is returned. If XATTR_REPLACE is set and opts.Name does not exist,
 	// ENODATA is returned.
-	SetxattrAt(ctx context.Context, rp *ResolvingPath, opts SetxattrOptions) error
+	SetXattrAt(ctx context.Context, rp *ResolvingPath, opts SetXattrOptions) error
 
-	// RemovexattrAt removes the given extended attribute from the file at rp.
+	// RemoveXattrAt removes the given extended attribute from the file at rp.
 	//
 	// Errors:
 	//
 	// - If extended attributes are not supported by the filesystem,
-	// RemovexattrAt returns ENOTSUP.
+	// RemoveXattrAt returns ENOTSUP.
 	//
 	// - If name does not exist, ENODATA is returned.
-	RemovexattrAt(ctx context.Context, rp *ResolvingPath, name string) error
+	RemoveXattrAt(ctx context.Context, rp *ResolvingPath, name string) error
 
 	// BoundEndpointAt returns the Unix socket endpoint bound at the path rp.
 	//

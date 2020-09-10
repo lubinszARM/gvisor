@@ -27,8 +27,8 @@ func (x *lineDiscipline) StateSave(m state.Sink) {
 	if !state.IsZeroValue(&x.masterWaiter) {
 		state.Failf("masterWaiter is %#v, expected zero", &x.masterWaiter)
 	}
-	if !state.IsZeroValue(&x.slaveWaiter) {
-		state.Failf("slaveWaiter is %#v, expected zero", &x.slaveWaiter)
+	if !state.IsZeroValue(&x.replicaWaiter) {
+		state.Failf("replicaWaiter is %#v, expected zero", &x.replicaWaiter)
 	}
 	m.Save(0, &x.size)
 	m.Save(1, &x.inQueue)
@@ -120,6 +120,29 @@ func (x *queue) StateLoad(m state.Source) {
 	m.Load(4, &x.transformer)
 }
 
+func (x *rootInodeRefs) StateTypeName() string {
+	return "pkg/sentry/fsimpl/devpts.rootInodeRefs"
+}
+
+func (x *rootInodeRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (x *rootInodeRefs) beforeSave() {}
+
+func (x *rootInodeRefs) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.refCount)
+}
+
+func (x *rootInodeRefs) afterLoad() {}
+
+func (x *rootInodeRefs) StateLoad(m state.Source) {
+	m.Load(0, &x.refCount)
+}
+
 func (x *Terminal) StateTypeName() string {
 	return "pkg/sentry/fsimpl/devpts.Terminal"
 }
@@ -129,7 +152,7 @@ func (x *Terminal) StateFields() []string {
 		"n",
 		"ld",
 		"masterKTTY",
-		"slaveKTTY",
+		"replicaKTTY",
 	}
 }
 
@@ -140,7 +163,7 @@ func (x *Terminal) StateSave(m state.Sink) {
 	m.Save(0, &x.n)
 	m.Save(1, &x.ld)
 	m.Save(2, &x.masterKTTY)
-	m.Save(3, &x.slaveKTTY)
+	m.Save(3, &x.replicaKTTY)
 }
 
 func (x *Terminal) afterLoad() {}
@@ -149,7 +172,7 @@ func (x *Terminal) StateLoad(m state.Source) {
 	m.Load(0, &x.n)
 	m.Load(1, &x.ld)
 	m.Load(2, &x.masterKTTY)
-	m.Load(3, &x.slaveKTTY)
+	m.Load(3, &x.replicaKTTY)
 }
 
 func init() {
@@ -157,5 +180,6 @@ func init() {
 	state.Register((*outputQueueTransformer)(nil))
 	state.Register((*inputQueueTransformer)(nil))
 	state.Register((*queue)(nil))
+	state.Register((*rootInodeRefs)(nil))
 	state.Register((*Terminal)(nil))
 }

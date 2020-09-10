@@ -59,7 +59,7 @@ type endpoint struct {
 }
 
 // NewEndpoint creates a new ipv4 endpoint.
-func (p *protocol) NewEndpoint(nicID tcpip.NICID, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint, st *stack.Stack) stack.NetworkEndpoint {
+func (p *protocol) NewEndpoint(nicID tcpip.NICID, _ stack.LinkAddressCache, _ stack.NUDHandler, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint, st *stack.Stack) stack.NetworkEndpoint {
 	return &endpoint{
 		nicID:      nicID,
 		linkEP:     linkEP,
@@ -486,10 +486,10 @@ func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 }
 
 // SetOption implements NetworkProtocol.SetOption.
-func (p *protocol) SetOption(option interface{}) *tcpip.Error {
+func (p *protocol) SetOption(option tcpip.SettableNetworkProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
-	case tcpip.DefaultTTLOption:
-		p.SetDefaultTTL(uint8(v))
+	case *tcpip.DefaultTTLOption:
+		p.SetDefaultTTL(uint8(*v))
 		return nil
 	default:
 		return tcpip.ErrUnknownProtocolOption
@@ -497,7 +497,7 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 }
 
 // Option implements NetworkProtocol.Option.
-func (p *protocol) Option(option interface{}) *tcpip.Error {
+func (p *protocol) Option(option tcpip.GettableNetworkProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.DefaultTTLOption:
 		*v = tcpip.DefaultTTLOption(p.DefaultTTL())

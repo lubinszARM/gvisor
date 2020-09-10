@@ -159,12 +159,12 @@ type TransportProtocol interface {
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
 	// provided option value is invalid.
-	SetOption(option interface{}) *tcpip.Error
+	SetOption(option tcpip.SettableTransportProtocolOption) *tcpip.Error
 
 	// Option allows retrieving protocol specific option values.
 	// Option returns an error if the option is not supported or the
 	// provided option value is invalid.
-	Option(option interface{}) *tcpip.Error
+	Option(option tcpip.GettableTransportProtocolOption) *tcpip.Error
 
 	// Close requests that any worker goroutines owned by the protocol
 	// stop.
@@ -298,17 +298,17 @@ type NetworkProtocol interface {
 	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
-	NewEndpoint(nicID tcpip.NICID, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) NetworkEndpoint
+	NewEndpoint(nicID tcpip.NICID, linkAddrCache LinkAddressCache, nud NUDHandler, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) NetworkEndpoint
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
 	// provided option value is invalid.
-	SetOption(option interface{}) *tcpip.Error
+	SetOption(option tcpip.SettableNetworkProtocolOption) *tcpip.Error
 
 	// Option allows retrieving protocol specific option values.
 	// Option returns an error if the option is not supported or the
 	// provided option value is invalid.
-	Option(option interface{}) *tcpip.Error
+	Option(option tcpip.GettableNetworkProtocolOption) *tcpip.Error
 
 	// Close requests that any worker goroutines owned by the protocol
 	// stop.
@@ -488,7 +488,7 @@ type LinkAddressResolver interface {
 	ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bool)
 
 	// LinkAddressProtocol returns the network protocol of the
-	// addresses this this resolver can resolve.
+	// addresses this resolver can resolve.
 	LinkAddressProtocol() tcpip.NetworkProtocolNumber
 }
 

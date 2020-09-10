@@ -491,7 +491,7 @@ func (h *handshake) resolveRoute() *tcpip.Error {
 				h.ep.mu.Lock()
 			}
 			if n&notifyError != 0 {
-				return h.ep.takeLastError()
+				return h.ep.LastError()
 			}
 		}
 
@@ -522,7 +522,7 @@ func (h *handshake) execute() *tcpip.Error {
 	s.AddWaker(&h.ep.newSegmentWaker, wakerForNewSegment)
 	defer s.Done()
 
-	var sackEnabled SACKEnabled
+	var sackEnabled tcpip.TCPSACKEnabled
 	if err := h.ep.stack.TransportProtocolOption(ProtocolNumber, &sackEnabled); err != nil {
 		// If stack returned an error when checking for SACKEnabled
 		// status then just default to switching off SACK negotiation.
@@ -620,7 +620,7 @@ func (h *handshake) execute() *tcpip.Error {
 				h.ep.mu.Lock()
 			}
 			if n&notifyError != 0 {
-				return h.ep.takeLastError()
+				return h.ep.LastError()
 			}
 
 		case wakerForNewSegment:
@@ -924,18 +924,7 @@ func (e *endpoint) handleWrite() *tcpip.Error {
 
 	first := e.sndQueue.Front()
 	if first != nil {
-		lastSeg := e.snd.writeList.Back()
 		e.snd.writeList.PushBackList(&e.sndQueue)
-		if lastSeg == nil {
-			lastSeg = e.snd.writeList.Front()
-		} else {
-			lastSeg = lastSeg.segEntry.Next()
-		}
-		// Add new segments to rcList, as rcList and writeList should
-		// be consistent.
-		for seg := lastSeg; seg != nil; seg = seg.segEntry.Next() {
-			e.snd.rcList.PushBack(seg)
-		}
 		e.sndBufInQueue = 0
 	}
 

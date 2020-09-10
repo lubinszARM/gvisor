@@ -37,11 +37,13 @@ const (
 //
 // +stateify savable
 type tasksInode struct {
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeAttrs
-	kernfs.OrderedChildren
+	implStatFS
 	kernfs.AlwaysValid
+	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotSymlink
+	kernfs.OrderedChildren
+	tasksInodeRefs
 
 	locks vfs.FileLocks
 
@@ -84,6 +86,7 @@ func (fs *filesystem) newTasksInode(k *kernel.Kernel, pidns *kernel.PIDNamespace
 		cgroupControllers: cgroupControllers,
 	}
 	inode.InodeAttrs.Init(root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	inode.EnableLeakCheck()
 
 	dentry := &kernfs.Dentry{}
 	dentry.Init(inode)
@@ -224,6 +227,11 @@ func (i *tasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs.St
 	}
 
 	return stat, nil
+}
+
+// DecRef implements kernfs.Inode.
+func (i *tasksInode) DecRef(context.Context) {
+	i.tasksInodeRefs.DecRef(i.Destroy)
 }
 
 // staticFileSetStat implements a special static file that allows inode

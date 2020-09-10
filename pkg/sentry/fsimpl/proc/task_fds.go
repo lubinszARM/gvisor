@@ -22,7 +22,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -101,12 +100,14 @@ func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, off
 //
 // +stateify savable
 type fdDirInode struct {
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeAttrs
-	kernfs.OrderedChildren
-	kernfs.AlwaysValid
 	fdDir
+	fdDirInodeRefs
+	implStatFS
+	kernfs.AlwaysValid
+	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotSymlink
+	kernfs.OrderedChildren
 }
 
 var _ kernfs.Inode = (*fdDirInode)(nil)
@@ -120,6 +121,7 @@ func (fs *filesystem) newFDDirInode(task *kernel.Task) *kernfs.Dentry {
 		},
 	}
 	inode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	inode.EnableLeakCheck()
 
 	dentry := &kernfs.Dentry{}
 	dentry.Init(inode)
@@ -175,10 +177,16 @@ func (i *fdDirInode) CheckPermissions(ctx context.Context, creds *auth.Credentia
 	return err
 }
 
+// DecRef implements kernfs.Inode.
+func (i *fdDirInode) DecRef(context.Context) {
+	i.fdDirInodeRefs.DecRef(i.Destroy)
+}
+
 // fdSymlink is an symlink for the /proc/[pid]/fd/[fd] file.
 //
 // +stateify savable
 type fdSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -227,12 +235,14 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 //
 // +stateify savable
 type fdInfoDirInode struct {
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeAttrs
-	kernfs.OrderedChildren
-	kernfs.AlwaysValid
 	fdDir
+	fdInfoDirInodeRefs
+	implStatFS
+	kernfs.AlwaysValid
+	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotSymlink
+	kernfs.OrderedChildren
 }
 
 var _ kernfs.Inode = (*fdInfoDirInode)(nil)
@@ -245,6 +255,7 @@ func (fs *filesystem) newFDInfoDirInode(task *kernel.Task) *kernfs.Dentry {
 		},
 	}
 	inode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	inode.EnableLeakCheck()
 
 	dentry := &kernfs.Dentry{}
 	dentry.Init(inode)
@@ -282,12 +293,16 @@ func (i *fdInfoDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *
 	return fd.VFSFileDescription(), nil
 }
 
+// DecRef implements kernfs.Inode.
+func (i *fdInfoDirInode) DecRef(context.Context) {
+	i.fdInfoDirInodeRefs.DecRef(i.Destroy)
+}
+
 // fdInfoData implements vfs.DynamicBytesSource for /proc/[pid]/fdinfo/[fd].
 //
 // +stateify savable
 type fdInfoData struct {
 	kernfs.DynamicBytesFile
-	refs.AtomicRefCount
 
 	task *kernel.Task
 	fd   int32

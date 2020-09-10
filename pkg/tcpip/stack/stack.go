@@ -248,7 +248,7 @@ type RcvBufAutoTuneParams struct {
 	// was started.
 	MeasureTime time.Time
 
-	// CopiedBytes is the number of bytes copied to userspace since
+	// CopiedBytes is the number of bytes copied to user space since
 	// this measure began.
 	CopiedBytes int
 
@@ -415,10 +415,13 @@ type Stack struct {
 
 	linkAddrCache *linkAddrCache
 
-	mu               sync.RWMutex
-	nics             map[tcpip.NICID]*NIC
-	forwarding       bool
-	cleanupEndpoints map[TransportEndpoint]struct{}
+	mu         sync.RWMutex
+	nics       map[tcpip.NICID]*NIC
+	forwarding bool
+
+	// cleanupEndpointsMu protects cleanupEndpoints.
+	cleanupEndpointsMu sync.Mutex
+	cleanupEndpoints   map[TransportEndpoint]struct{}
 
 	// route is the route table passed in by the user via SetRouteTable(),
 	// it is used by FindRoute() to build a route for a specific
@@ -429,7 +432,7 @@ type Stack struct {
 
 	// If not nil, then any new endpoints will have this probe function
 	// invoked everytime they receive a TCP segment.
-	tcpProbeFunc TCPProbeFunc
+	tcpProbeFunc atomic.Value // TCPProbeFunc
 
 	// clock is used to generate user-visible times.
 	clock tcpip.Clock
@@ -460,6 +463,10 @@ type Stack struct {
 
 	// nudConfigs is the default NUD configurations used by interfaces.
 	nudConfigs NUDConfigurations
+
+	// useNeighborCache indicates whether ARP and NDP packets should be handled
+	// by the NIC's neighborCache instead of linkAddrCache.
+	useNeighborCache bool
 
 	// autoGenIPv6LinkLocal determines whether or not the stack will attempt
 	// to auto-generate an IPv6 link-local address for newly enabled non-loopback
@@ -540,6 +547,13 @@ type Options struct {
 
 	// NUDConfigs is the default NUD configurations used by interfaces.
 	NUDConfigs NUDConfigurations
+
+	// UseNeighborCache indicates whether ARP and NDP packets should be handled
+	// by the Neighbor Unreachability Detection (NUD) state machine. This flag
+	// also enables the APIs for inspecting and modifying the neighbor table via
+	// NUDDispatcher and the following Stack methods: Neighbors, RemoveNeighbor,
+	// and ClearNeighbors.
+	UseNeighborCache bool
 
 	// AutoGenIPv6LinkLocal determines whether or not the stack will attempt to
 	// auto-generate an IPv6 link-local address for newly enabled non-loopback
@@ -715,6 +729,7 @@ func New(opts Options) *Stack {
 		seed:                 generateRandUint32(),
 		ndpConfigs:           opts.NDPConfigs,
 		nudConfigs:           opts.NUDConfigs,
+		useNeighborCache:     opts.UseNeighborCache,
 		autoGenIPv6LinkLocal: opts.AutoGenIPv6LinkLocal,
 		uniqueIDGenerator:    opts.UniqueID,
 		ndpDisp:              opts.NDPDisp,
@@ -773,7 +788,7 @@ func (s *Stack) UniqueID() uint64 {
 // options. This method returns an error if the protocol is not supported or
 // option is not supported by the protocol implementation or the provided value
 // is incorrect.
-func (s *Stack) SetNetworkProtocolOption(network tcpip.NetworkProtocolNumber, option interface{}) *tcpip.Error {
+func (s *Stack) SetNetworkProtocolOption(network tcpip.NetworkProtocolNumber, option tcpip.SettableNetworkProtocolOption) *tcpip.Error {
 	netProto, ok := s.networkProtocols[network]
 	if !ok {
 		return tcpip.ErrUnknownProtocol
@@ -790,7 +805,7 @@ func (s *Stack) SetNetworkProtocolOption(network tcpip.NetworkProtocolNumber, op
 // if err != nil {
 //   ...
 // }
-func (s *Stack) NetworkProtocolOption(network tcpip.NetworkProtocolNumber, option interface{}) *tcpip.Error {
+func (s *Stack) NetworkProtocolOption(network tcpip.NetworkProtocolNumber, option tcpip.GettableNetworkProtocolOption) *tcpip.Error {
 	netProto, ok := s.networkProtocols[network]
 	if !ok {
 		return tcpip.ErrUnknownProtocol
@@ -802,7 +817,7 @@ func (s *Stack) NetworkProtocolOption(network tcpip.NetworkProtocolNumber, optio
 // options. This method returns an error if the protocol is not supported or
 // option is not supported by the protocol implementation or the provided value
 // is incorrect.
-func (s *Stack) SetTransportProtocolOption(transport tcpip.TransportProtocolNumber, option interface{}) *tcpip.Error {
+func (s *Stack) SetTransportProtocolOption(transport tcpip.TransportProtocolNumber, option tcpip.SettableTransportProtocolOption) *tcpip.Error {
 	transProtoState, ok := s.transportProtocols[transport]
 	if !ok {
 		return tcpip.ErrUnknownProtocol
@@ -817,7 +832,7 @@ func (s *Stack) SetTransportProtocolOption(transport tcpip.TransportProtocolNumb
 // if err := s.TransportProtocolOption(tcpip.TCPProtocolNumber, &v); err != nil {
 //   ...
 // }
-func (s *Stack) TransportProtocolOption(transport tcpip.TransportProtocolNumber, option interface{}) *tcpip.Error {
+func (s *Stack) TransportProtocolOption(transport tcpip.TransportProtocolNumber, option tcpip.GettableTransportProtocolOption) *tcpip.Error {
 	transProtoState, ok := s.transportProtocols[transport]
 	if !ok {
 		return tcpip.ErrUnknownProtocol
@@ -1209,8 +1224,8 @@ func (s *Stack) AddProtocolAddressWithOptions(id tcpip.NICID, protocolAddress tc
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	nic := s.nics[id]
-	if nic == nil {
+	nic, ok := s.nics[id]
+	if !ok {
 		return tcpip.ErrUnknownNICID
 	}
 
@@ -1335,8 +1350,8 @@ func (s *Stack) CheckLocalAddress(nicID tcpip.NICID, protocol tcpip.NetworkProto
 
 	// If a NIC is specified, we try to find the address there only.
 	if nicID != 0 {
-		nic := s.nics[nicID]
-		if nic == nil {
+		nic, ok := s.nics[nicID]
+		if !ok {
 			return 0
 		}
 
@@ -1367,8 +1382,8 @@ func (s *Stack) SetPromiscuousMode(nicID tcpip.NICID, enable bool) *tcpip.Error 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	nic := s.nics[nicID]
-	if nic == nil {
+	nic, ok := s.nics[nicID]
+	if !ok {
 		return tcpip.ErrUnknownNICID
 	}
 
@@ -1383,8 +1398,8 @@ func (s *Stack) SetSpoofing(nicID tcpip.NICID, enable bool) *tcpip.Error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	nic := s.nics[nicID]
-	if nic == nil {
+	nic, ok := s.nics[nicID]
+	if !ok {
 		return tcpip.ErrUnknownNICID
 	}
 
@@ -1416,8 +1431,33 @@ func (s *Stack) GetLinkAddress(nicID tcpip.NICID, addr, localAddr tcpip.Address,
 	return s.linkAddrCache.get(fullAddr, linkRes, localAddr, nic.linkEP, waker)
 }
 
-// RemoveWaker implements LinkAddressCache.RemoveWaker.
+// Neighbors returns all IP to MAC address associations.
+func (s *Stack) Neighbors(nicID tcpip.NICID) ([]NeighborEntry, *tcpip.Error) {
+	s.mu.RLock()
+	nic, ok := s.nics[nicID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return nil, tcpip.ErrUnknownNICID
+	}
+
+	return nic.neighbors()
+}
+
+// RemoveWaker removes a waker that has been added when link resolution for
+// addr was requested.
 func (s *Stack) RemoveWaker(nicID tcpip.NICID, addr tcpip.Address, waker *sleep.Waker) {
+	if s.useNeighborCache {
+		s.mu.RLock()
+		nic, ok := s.nics[nicID]
+		s.mu.RUnlock()
+
+		if ok {
+			nic.removeWaker(addr, waker)
+		}
+		return
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1425,6 +1465,47 @@ func (s *Stack) RemoveWaker(nicID tcpip.NICID, addr tcpip.Address, waker *sleep.
 		fullAddr := tcpip.FullAddress{NIC: nicID, Addr: addr}
 		s.linkAddrCache.removeWaker(fullAddr, waker)
 	}
+}
+
+// AddStaticNeighbor statically associates an IP address to a MAC address.
+func (s *Stack) AddStaticNeighbor(nicID tcpip.NICID, addr tcpip.Address, linkAddr tcpip.LinkAddress) *tcpip.Error {
+	s.mu.RLock()
+	nic, ok := s.nics[nicID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.addStaticNeighbor(addr, linkAddr)
+}
+
+// RemoveNeighbor removes an IP to MAC address association previously created
+// either automically or by AddStaticNeighbor. Returns ErrBadAddress if there
+// is no association with the provided address.
+func (s *Stack) RemoveNeighbor(nicID tcpip.NICID, addr tcpip.Address) *tcpip.Error {
+	s.mu.RLock()
+	nic, ok := s.nics[nicID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.removeNeighbor(addr)
+}
+
+// ClearNeighbors removes all IP to MAC address associations.
+func (s *Stack) ClearNeighbors(nicID tcpip.NICID) *tcpip.Error {
+	s.mu.RLock()
+	nic, ok := s.nics[nicID]
+	s.mu.RUnlock()
+
+	if !ok {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.clearNeighbors()
 }
 
 // RegisterTransportEndpoint registers the given endpoint with the stack
@@ -1450,10 +1531,9 @@ func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip
 // StartTransportEndpointCleanup removes the endpoint with the given id from
 // the stack transport dispatcher. It also transitions it to the cleanup stage.
 func (s *Stack) StartTransportEndpointCleanup(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, flags ports.Flags, bindToDevice tcpip.NICID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.cleanupEndpointsMu.Lock()
 	s.cleanupEndpoints[ep] = struct{}{}
+	s.cleanupEndpointsMu.Unlock()
 
 	s.demux.unregisterEndpoint(netProtos, protocol, id, ep, flags, bindToDevice)
 }
@@ -1461,9 +1541,9 @@ func (s *Stack) StartTransportEndpointCleanup(nicID tcpip.NICID, netProtos []tcp
 // CompleteTransportEndpointCleanup removes the endpoint from the cleanup
 // stage.
 func (s *Stack) CompleteTransportEndpointCleanup(ep TransportEndpoint) {
-	s.mu.Lock()
+	s.cleanupEndpointsMu.Lock()
 	delete(s.cleanupEndpoints, ep)
-	s.mu.Unlock()
+	s.cleanupEndpointsMu.Unlock()
 }
 
 // FindTransportEndpoint finds an endpoint that most closely matches the provided
@@ -1506,23 +1586,23 @@ func (s *Stack) RegisteredEndpoints() []TransportEndpoint {
 
 // CleanupEndpoints returns endpoints currently in the cleanup state.
 func (s *Stack) CleanupEndpoints() []TransportEndpoint {
-	s.mu.Lock()
+	s.cleanupEndpointsMu.Lock()
 	es := make([]TransportEndpoint, 0, len(s.cleanupEndpoints))
 	for e := range s.cleanupEndpoints {
 		es = append(es, e)
 	}
-	s.mu.Unlock()
+	s.cleanupEndpointsMu.Unlock()
 	return es
 }
 
 // RestoreCleanupEndpoints adds endpoints to cleanup tracking. This is useful
 // for restoring a stack after a save.
 func (s *Stack) RestoreCleanupEndpoints(es []TransportEndpoint) {
-	s.mu.Lock()
+	s.cleanupEndpointsMu.Lock()
 	for _, e := range es {
 		s.cleanupEndpoints[e] = struct{}{}
 	}
-	s.mu.Unlock()
+	s.cleanupEndpointsMu.Unlock()
 }
 
 // Close closes all currently registered transport endpoints.
@@ -1717,18 +1797,17 @@ func (s *Stack) TransportProtocolInstance(num tcpip.TransportProtocolNumber) Tra
 // guarantee provided on which probe will be invoked. Ideally this should only
 // be called once per stack.
 func (s *Stack) AddTCPProbe(probe TCPProbeFunc) {
-	s.mu.Lock()
-	s.tcpProbeFunc = probe
-	s.mu.Unlock()
+	s.tcpProbeFunc.Store(probe)
 }
 
 // GetTCPProbe returns the TCPProbeFunc if installed with AddTCPProbe, nil
 // otherwise.
 func (s *Stack) GetTCPProbe() TCPProbeFunc {
-	s.mu.Lock()
-	p := s.tcpProbeFunc
-	s.mu.Unlock()
-	return p
+	p := s.tcpProbeFunc.Load()
+	if p == nil {
+		return nil
+	}
+	return p.(TCPProbeFunc)
 }
 
 // RemoveTCPProbe removes an installed TCP probe.
@@ -1737,9 +1816,8 @@ func (s *Stack) GetTCPProbe() TCPProbeFunc {
 // have a probe attached. Endpoints already created will continue to invoke
 // TCP probe.
 func (s *Stack) RemoveTCPProbe() {
-	s.mu.Lock()
-	s.tcpProbeFunc = nil
-	s.mu.Unlock()
+	// This must be TCPProbeFunc(nil) because atomic.Value.Store(nil) panics.
+	s.tcpProbeFunc.Store(TCPProbeFunc(nil))
 }
 
 // JoinGroup joins the given multicast group on the given NIC.
@@ -1961,7 +2039,7 @@ func (s *Stack) FindNetworkEndpoint(netProto tcpip.NetworkProtocolNumber, addres
 	return nil, tcpip.ErrBadAddress
 }
 
-// FindNICNameFromID returns the name of the nic for the given NICID.
+// FindNICNameFromID returns the name of the NIC for the given NICID.
 func (s *Stack) FindNICNameFromID(id tcpip.NICID) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -201,6 +201,25 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 }
 
+// immutable
+var globalStatfs = linux.Statfs{
+	Type:         linux.TMPFS_MAGIC,
+	BlockSize:    usermem.PageSize,
+	FragmentSize: usermem.PageSize,
+	NameLength:   linux.NAME_MAX,
+
+	// tmpfs currently does not support configurable size limits. In Linux,
+	// such a tmpfs mount will return f_blocks == f_bfree == f_bavail == 0 from
+	// statfs(2). However, many applications treat this as having a size limit
+	// of 0. To work around this, claim to have a very large but non-zero size,
+	// chosen to ensure that BlockSize * Blocks does not overflow int64 (which
+	// applications may also handle incorrectly).
+	// TODO(b/29637826): allow configuring a tmpfs size and enforce it.
+	Blocks:          math.MaxInt64 / usermem.PageSize,
+	BlocksFree:      math.MaxInt64 / usermem.PageSize,
+	BlocksAvailable: math.MaxInt64 / usermem.PageSize,
+}
+
 // dentry implements vfs.DentryImpl.
 type dentry struct {
 	vfsd vfs.Dentry
@@ -607,54 +626,44 @@ func (i *inode) touchCMtimeLocked() {
 	atomic.StoreInt64(&i.ctime, now)
 }
 
-func (i *inode) listxattr(size uint64) ([]string, error) {
-	return i.xattrs.Listxattr(size)
+func (i *inode) listXattr(size uint64) ([]string, error) {
+	return i.xattrs.ListXattr(size)
 }
 
-func (i *inode) getxattr(creds *auth.Credentials, opts *vfs.GetxattrOptions) (string, error) {
-	if err := i.checkPermissions(creds, vfs.MayRead); err != nil {
+func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
+	if err := i.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
 		return "", err
 	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return "", syserror.EOPNOTSUPP
-	}
-	if !i.userXattrSupported() {
-		return "", syserror.ENODATA
-	}
-	return i.xattrs.Getxattr(opts)
+	return i.xattrs.GetXattr(opts)
 }
 
-func (i *inode) setxattr(creds *auth.Credentials, opts *vfs.SetxattrOptions) error {
-	if err := i.checkPermissions(creds, vfs.MayWrite); err != nil {
+func (i *inode) setXattr(creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
+	if err := i.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !i.userXattrSupported() {
-		return syserror.EPERM
-	}
-	return i.xattrs.Setxattr(opts)
+	return i.xattrs.SetXattr(opts)
 }
 
-func (i *inode) removexattr(creds *auth.Credentials, name string) error {
-	if err := i.checkPermissions(creds, vfs.MayWrite); err != nil {
+func (i *inode) removeXattr(creds *auth.Credentials, name string) error {
+	if err := i.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !i.userXattrSupported() {
-		return syserror.EPERM
-	}
-	return i.xattrs.Removexattr(name)
+	return i.xattrs.RemoveXattr(name)
 }
 
-// Extended attributes in the user.* namespace are only supported for regular
-// files and directories.
-func (i *inode) userXattrSupported() bool {
-	filetype := linux.S_IFMT & atomic.LoadUint32(&i.mode)
-	return filetype == linux.S_IFREG || filetype == linux.S_IFDIR
+func (i *inode) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
+	// We currently only support extended attributes in the user.* and
+	// trusted.* namespaces. See b/148380782.
+	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) && !strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
+		return syserror.EOPNOTSUPP
+	}
+	mode := linux.FileMode(atomic.LoadUint32(&i.mode))
+	kuid := auth.KUID(atomic.LoadUint32(&i.uid))
+	kgid := auth.KGID(atomic.LoadUint32(&i.gid))
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+		return err
+	}
+	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
 }
 
 // fileDescription is embedded by tmpfs implementations of
@@ -698,20 +707,25 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 	return nil
 }
 
-// Listxattr implements vfs.FileDescriptionImpl.Listxattr.
-func (fd *fileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.inode().listxattr(size)
+// StatFS implements vfs.FileDescriptionImpl.StatFS.
+func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
+	return globalStatfs, nil
 }
 
-// Getxattr implements vfs.FileDescriptionImpl.Getxattr.
-func (fd *fileDescription) Getxattr(ctx context.Context, opts vfs.GetxattrOptions) (string, error) {
-	return fd.inode().getxattr(auth.CredentialsFromContext(ctx), &opts)
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.inode().listXattr(size)
 }
 
-// Setxattr implements vfs.FileDescriptionImpl.Setxattr.
-func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOptions) error {
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.inode().getXattr(auth.CredentialsFromContext(ctx), &opts)
+}
+
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	d := fd.dentry()
-	if err := d.inode.setxattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
+	if err := d.inode.setXattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
 		return err
 	}
 
@@ -720,10 +734,10 @@ func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOption
 	return nil
 }
 
-// Removexattr implements vfs.FileDescriptionImpl.Removexattr.
-func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	d := fd.dentry()
-	if err := d.inode.removexattr(auth.CredentialsFromContext(ctx), name); err != nil {
+	if err := d.inode.removeXattr(auth.CredentialsFromContext(ctx), name); err != nil {
 		return err
 	}
 

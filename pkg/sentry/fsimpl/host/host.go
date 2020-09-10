@@ -186,6 +186,7 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 
 // inode implements kernfs.Inode.
 type inode struct {
+	kernfs.InodeNoStatFS
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 
@@ -495,7 +496,7 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 		if i.isTTY {
 			fd := &TTYFileDescription{
 				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultSlaveTermios,
+				termios:         linux.DefaultReplicaTermios,
 			}
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd

@@ -18,6 +18,7 @@ import (
 	"io"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
@@ -131,23 +132,24 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		case inIsPipe && outIsPipe:
 			n, err = pipe.Splice(t, outPipeFD, inPipeFD, count)
 		case inIsPipe:
+			n, err = inPipeFD.SpliceToNonPipe(t, outFile, outOffset, count)
 			if outOffset != -1 {
-				n, err = outFile.PWrite(t, inPipeFD.IOSequence(count), outOffset, vfs.WriteOptions{})
 				outOffset += n
-			} else {
-				n, err = outFile.Write(t, inPipeFD.IOSequence(count), vfs.WriteOptions{})
 			}
 		case outIsPipe:
+			n, err = outPipeFD.SpliceFromNonPipe(t, inFile, inOffset, count)
 			if inOffset != -1 {
-				n, err = inFile.PRead(t, outPipeFD.IOSequence(count), inOffset, vfs.ReadOptions{})
 				inOffset += n
-			} else {
-				n, err = inFile.Read(t, outPipeFD.IOSequence(count), vfs.ReadOptions{})
 			}
 		default:
-			panic("not possible")
+			panic("at least one end of splice must be a pipe")
 		}
 
+		if n == 0 && err == io.EOF {
+			// We reached the end of the file. Eat the error and exit the loop.
+			err = nil
+			break
+		}
 		if n != 0 || err != syserror.ErrWouldBlock || nonBlock {
 			break
 		}
@@ -341,16 +343,14 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	if outIsPipe {
 		for n < count {
 			var spliceN int64
-			if offset != -1 {
-				spliceN, err = inFile.PRead(t, outPipeFD.IOSequence(count), offset, vfs.ReadOptions{})
-				offset += spliceN
-			} else {
-				spliceN, err = inFile.Read(t, outPipeFD.IOSequence(count), vfs.ReadOptions{})
-			}
+			spliceN, err = outPipeFD.SpliceFromNonPipe(t, inFile, offset, count)
 			if spliceN == 0 && err == io.EOF {
 				// We reached the end of the file. Eat the error and exit the loop.
 				err = nil
 				break
+			}
+			if offset != -1 {
+				offset += spliceN
 			}
 			n += spliceN
 			if err == syserror.ErrWouldBlock && !nonBlock {
@@ -371,19 +371,18 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 			} else {
 				readN, err = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 			}
-			if readN == 0 && err == io.EOF {
-				// We reached the end of the file. Eat the error and exit the loop.
-				err = nil
+			if readN == 0 && err != nil {
+				if err == io.EOF {
+					// We reached the end of the file. Eat the error before exiting the loop.
+					err = nil
+				}
 				break
 			}
 			n += readN
-			if err != nil {
-				break
-			}
 
 			// Write all of the bytes that we read. This may need
 			// multiple write calls to complete.
-			wbuf := buf[:n]
+			wbuf := buf[:readN]
 			for len(wbuf) > 0 {
 				var writeN int64
 				writeN, err = outFile.Write(t, usermem.BytesIOSequence(wbuf), vfs.WriteOptions{})
@@ -392,12 +391,21 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 					err = dw.waitForOut(t)
 				}
 				if err != nil {
-					// We didn't complete the write. Only
-					// report the bytes that were actually
-					// written, and rewind the offset.
+					// We didn't complete the write. Only report the bytes that were actually
+					// written, and rewind offsets as needed.
 					notWritten := int64(len(wbuf))
 					n -= notWritten
-					if offset != -1 {
+					if offset == -1 {
+						// We modified the offset of the input file itself during the read
+						// operation. Rewind it.
+						if _, seekErr := inFile.Seek(t, -notWritten, linux.SEEK_CUR); seekErr != nil {
+							// Log the error but don't return it, since the write has already
+							// completed successfully.
+							log.Warningf("failed to roll back input file offset: %v", seekErr)
+						}
+					} else {
+						// The sendfile call was provided an offset parameter that should be
+						// adjusted to reflect the number of bytes sent. Rewind it.
 						offset -= notWritten
 					}
 					break

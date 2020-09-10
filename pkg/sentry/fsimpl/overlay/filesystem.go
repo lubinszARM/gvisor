@@ -15,6 +15,7 @@
 package overlay
 
 import (
+	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -27,10 +28,15 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
+// _OVL_XATTR_PREFIX is an extended attribute key prefix to identify overlayfs
+// attributes.
+// Linux: fs/overlayfs/overlayfs.h:OVL_XATTR_PREFIX
+const _OVL_XATTR_PREFIX = linux.XATTR_TRUSTED_PREFIX + "overlay."
+
 // _OVL_XATTR_OPAQUE is an extended attribute key whose value is set to "y" for
 // opaque directories.
 // Linux: fs/overlayfs/overlayfs.h:OVL_XATTR_OPAQUE
-const _OVL_XATTR_OPAQUE = "trusted.overlay.opaque"
+const _OVL_XATTR_OPAQUE = _OVL_XATTR_PREFIX + "opaque"
 
 func isWhiteout(stat *linux.Statx) bool {
 	return stat.Mode&linux.S_IFMT == linux.S_IFCHR && stat.RdevMajor == 0 && stat.RdevMinor == 0
@@ -205,6 +211,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			lookupErr = err
 			return false
 		}
+		defer childVD.DecRef(ctx)
 
 		mask := uint32(linux.STATX_TYPE)
 		if !existsOnAnyLayer {
@@ -243,6 +250,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		}
 
 		// Update child to include this layer.
+		childVD.IncRef()
 		if isUpper {
 			child.upperVD = childVD
 			child.copiedUp = 1
@@ -267,10 +275,10 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 
 		// Directories are merged with directories from lower layers if they
 		// are not explicitly opaque.
-		opaqueVal, err := vfsObj.GetxattrAt(ctx, fs.creds, &vfs.PathOperation{
+		opaqueVal, err := vfsObj.GetXattrAt(ctx, fs.creds, &vfs.PathOperation{
 			Root:  childVD,
 			Start: childVD,
-		}, &vfs.GetxattrOptions{
+		}, &vfs.GetXattrOptions{
 			Name: _OVL_XATTR_OPAQUE,
 			Size: 1,
 		})
@@ -665,7 +673,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			// There may be directories on lower layers (previously hidden by
 			// the whiteout) that the new directory should not be merged with.
 			// Mark it opaque to prevent merging.
-			if err := vfsObj.SetxattrAt(ctx, fs.creds, &pop, &vfs.SetxattrOptions{
+			if err := vfsObj.SetXattrAt(ctx, fs.creds, &pop, &vfs.SetXattrOptions{
 				Name:  _OVL_XATTR_OPAQUE,
 				Value: "y",
 			}); err != nil {
@@ -743,6 +751,9 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 
 	start := rp.Start().Impl().(*dentry)
 	if rp.Done() {
+		if mayCreate && rp.MustBeDir() {
+			return nil, syserror.EISDIR
+		}
 		if mustCreate {
 			return nil, syserror.EEXIST
 		}
@@ -766,6 +777,10 @@ afterTrailingSymlink:
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
+	// Reject attempts to open directories with O_CREAT.
+	if mayCreate && rp.MustBeDir() {
+		return nil, syserror.EISDIR
+	}
 	// Determine whether or not we need to create a file.
 	parent.dirMu.Lock()
 	child, err := fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
@@ -774,12 +789,11 @@ afterTrailingSymlink:
 		parent.dirMu.Unlock()
 		return fd, err
 	}
+	parent.dirMu.Unlock()
 	if err != nil {
-		parent.dirMu.Unlock()
 		return nil, err
 	}
 	// Open existing child or follow symlink.
-	parent.dirMu.Unlock()
 	if mustCreate {
 		return nil, syserror.EEXIST
 	}
@@ -793,6 +807,9 @@ afterTrailingSymlink:
 		}
 		start = parent
 		goto afterTrailingSymlink
+	}
+	if rp.MustBeDir() && !child.isDir() {
+		return nil, syserror.ENOTDIR
 	}
 	if mayWrite {
 		if err := child.copyUpLocked(ctx); err != nil {
@@ -1338,54 +1355,146 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	return nil
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// isOverlayXattr returns whether the given extended attribute configures the
+// overlay.
+func isOverlayXattr(name string) bool {
+	return strings.HasPrefix(name, _OVL_XATTR_PREFIX)
+}
+
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return nil, err
 	}
-	// TODO(gvisor.dev/issue/1199): Linux overlayfs actually allows listxattr,
-	// but not any other xattr syscalls. For now we just reject all of them.
-	return nil, syserror.ENOTSUP
+
+	return fs.listXattr(ctx, d, size)
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+func (fs *filesystem) listXattr(ctx context.Context, d *dentry, size uint64) ([]string, error) {
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	top := d.topLayer()
+	names, err := vfsObj.ListXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, size)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out all overlay attributes.
+	n := 0
+	for _, name := range names {
+		if !isOverlayXattr(name) {
+			names[n] = name
+			n++
+		}
+	}
+	return names[:n], err
+}
+
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return "", err
 	}
-	return "", syserror.ENOTSUP
+
+	return fs.getXattr(ctx, d, rp.Credentials(), &opts)
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+func (fs *filesystem) getXattr(ctx context.Context, d *dentry, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
+		return "", err
+	}
+
+	// Return EOPNOTSUPP when fetching an overlay attribute.
+	// See fs/overlayfs/super.c:ovl_own_xattr_get().
+	if isOverlayXattr(opts.Name) {
+		return "", syserror.EOPNOTSUPP
+	}
+
+	// Analogous to fs/overlayfs/super.c:ovl_other_xattr_get().
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	top := d.topLayer()
+	return vfsObj.GetXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, opts)
+}
+
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return err
 	}
-	return syserror.ENOTSUP
+
+	return fs.setXattrLocked(ctx, d, rp.Mount(), rp.Credentials(), &opts)
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// Precondition: fs.renameMu must be locked.
+func (fs *filesystem) setXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mount, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
+		return err
+	}
+
+	// Return EOPNOTSUPP when setting an overlay attribute.
+	// See fs/overlayfs/super.c:ovl_own_xattr_set().
+	if isOverlayXattr(opts.Name) {
+		return syserror.EOPNOTSUPP
+	}
+
+	// Analogous to fs/overlayfs/super.c:ovl_other_xattr_set().
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
+	if err := d.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	return vfsObj.SetXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, opts)
+}
+
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return err
 	}
-	return syserror.ENOTSUP
+
+	return fs.removeXattrLocked(ctx, d, rp.Mount(), rp.Credentials(), name)
+}
+
+// Precondition: fs.renameMu must be locked.
+func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mount, creds *auth.Credentials, name string) error {
+	if err := d.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
+		return err
+	}
+
+	// Like SetXattrAt, return EOPNOTSUPP when removing an overlay attribute.
+	// Linux passes the remove request to xattr_handler->set.
+	// See fs/xattr.c:vfs_removexattr().
+	if isOverlayXattr(name) {
+		return syserror.EOPNOTSUPP
+	}
+
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
+	if err := d.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	return vfsObj.RemoveXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, name)
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.

@@ -36,14 +36,37 @@ var emptyIPv4Filter = stack.IPHeaderFilter{
 	SrcMask: "\x00\x00\x00\x00",
 }
 
-func getEntries4(table stack.Table, info *linux.IPTGetinfo) linux.KernelIPTGetEntries {
+// convertNetstackToBinary4 converts the iptables as stored in netstack to the
+// format expected by the iptables tool. Linux stores each table as a binary
+// blob that can only be traversed by parsing a little data, reading some
+// offsets, jumping to those offsets, parsing again, etc.
+func convertNetstackToBinary4(stk *stack.Stack, tablename linux.TableName) (linux.KernelIPTGetEntries, linux.IPTGetinfo, error) {
+	// The table name has to fit in the struct.
+	if linux.XT_TABLE_MAXNAMELEN < len(tablename) {
+		return linux.KernelIPTGetEntries{}, linux.IPTGetinfo{}, fmt.Errorf("table name %q too long", tablename)
+	}
+
+	table, ok := stk.IPTables().GetTable(tablename.String(), false)
+	if !ok {
+		return linux.KernelIPTGetEntries{}, linux.IPTGetinfo{}, fmt.Errorf("couldn't find table %q", tablename)
+	}
+
+	// Setup the info struct.
+	entries, info := getEntries4(table, tablename)
+	return entries, info, nil
+}
+
+func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTGetEntries, linux.IPTGetinfo) {
+	var info linux.IPTGetinfo
 	var entries linux.KernelIPTGetEntries
+	copy(info.Name[:], tablename[:])
 	copy(entries.Name[:], info.Name[:])
+	info.ValidHooks = table.ValidHooks()
 
 	for ruleIdx, rule := range table.Rules {
 		nflog("convert to binary: current offset: %d", entries.Size)
 
-		setHooksAndUnderflow(info, table, entries.Size, ruleIdx)
+		setHooksAndUnderflow(&info, table, entries.Size, ruleIdx)
 		// Each rule corresponds to an entry.
 		entry := linux.KernelIPTEntry{
 			Entry: linux.IPTEntry{
@@ -100,7 +123,7 @@ func getEntries4(table stack.Table, info *linux.IPTGetinfo) linux.KernelIPTGetEn
 
 	info.Size = entries.Size
 	nflog("convert to binary: finished with an marshalled size of %d", info.Size)
-	return entries
+	return entries, info
 }
 
 func modifyEntries4(stk *stack.Stack, optVal []byte, replace *linux.IPTReplace, table *stack.Table) (map[uint32]int, *syserr.Error) {
@@ -205,7 +228,9 @@ func filterFromIPTIP(iptip linux.IPTIP) (stack.IPHeaderFilter, error) {
 	ifnameMask := string(iptip.OutputInterfaceMask[:n])
 
 	return stack.IPHeaderFilter{
-		Protocol:              tcpip.TransportProtocolNumber(iptip.Protocol),
+		Protocol: tcpip.TransportProtocolNumber(iptip.Protocol),
+		// A Protocol value of 0 indicates all protocols match.
+		CheckProtocol:         iptip.Protocol != 0,
 		Dst:                   tcpip.Address(iptip.Dst[:]),
 		DstMask:               tcpip.Address(iptip.DstMask[:]),
 		DstInvert:             iptip.InverseFlags&linux.IPT_INV_DSTIP != 0,

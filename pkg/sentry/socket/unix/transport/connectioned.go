@@ -142,9 +142,9 @@ func NewPair(ctx context.Context, stype linux.SockType, uid UniqueIDProvider) (E
 	}
 
 	q1 := &queue{ReaderQueue: a.Queue, WriterQueue: b.Queue, limit: initialLimit}
-	q1.EnableLeakCheck("transport.queue")
+	q1.EnableLeakCheck()
 	q2 := &queue{ReaderQueue: b.Queue, WriterQueue: a.Queue, limit: initialLimit}
-	q2.EnableLeakCheck("transport.queue")
+	q2.EnableLeakCheck()
 
 	if stype == linux.SOCK_STREAM {
 		a.receiver = &streamQueueReceiver{queueReceiver: queueReceiver{q1}}
@@ -300,14 +300,14 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	}
 
 	readQueue := &queue{ReaderQueue: ce.WaiterQueue(), WriterQueue: ne.Queue, limit: initialLimit}
-	readQueue.EnableLeakCheck("transport.queue")
+	readQueue.EnableLeakCheck()
 	ne.connected = &connectedEndpoint{
 		endpoint:   ce,
 		writeQueue: readQueue,
 	}
 
 	writeQueue := &queue{ReaderQueue: ne.Queue, WriterQueue: ce.WaiterQueue(), limit: initialLimit}
-	writeQueue.EnableLeakCheck("transport.queue")
+	writeQueue.EnableLeakCheck()
 	if e.stype == linux.SOCK_STREAM {
 		ne.receiver = &streamQueueReceiver{queueReceiver: queueReceiver{readQueue: writeQueue}}
 	} else {
@@ -391,7 +391,7 @@ func (e *connectionedEndpoint) Listen(backlog int) *syserr.Error {
 }
 
 // Accept accepts a new connection.
-func (e *connectionedEndpoint) Accept() (Endpoint, *syserr.Error) {
+func (e *connectionedEndpoint) Accept(peerAddr *tcpip.FullAddress) (Endpoint, *syserr.Error) {
 	e.Lock()
 	defer e.Unlock()
 
@@ -401,6 +401,18 @@ func (e *connectionedEndpoint) Accept() (Endpoint, *syserr.Error) {
 
 	select {
 	case ne := <-e.acceptedChan:
+		if peerAddr != nil {
+			ne.Lock()
+			c := ne.connected
+			ne.Unlock()
+			if c != nil {
+				addr, err := c.GetLocalAddress()
+				if err != nil {
+					return nil, syserr.TranslateNetstackError(err)
+				}
+				*peerAddr = addr
+			}
+		}
 		return ne, nil
 
 	default:

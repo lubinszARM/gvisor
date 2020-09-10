@@ -360,7 +360,10 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 	defer rp.Mount().EndWrite()
 	childVFSD, err := parentInode.NewDir(ctx, pc, opts)
 	if err != nil {
-		return err
+		if !opts.ForSyntheticMountpoint || err == syserror.EEXIST {
+			return err
+		}
+		childVFSD = newSyntheticDirectory(rp.Credentials(), opts.Mode)
 	}
 	parentVFSD.Impl().(*Dentry).InsertChild(pc, childVFSD.Impl().(*Dentry))
 	return nil
@@ -721,14 +724,13 @@ func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt.
 func (fs *Filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
 	fs.mu.RLock()
-	_, _, err := fs.walkExistingLocked(ctx, rp)
+	_, inode, err := fs.walkExistingLocked(ctx, rp)
 	fs.mu.RUnlock()
 	fs.processDeferredDecRefs(ctx)
 	if err != nil {
 		return linux.Statfs{}, err
 	}
-	// TODO(gvisor.dev/issue/1193): actually implement statfs.
-	return linux.Statfs{}, syserror.ENOSYS
+	return inode.StatFS(ctx, fs.VFSFilesystem())
 }
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
@@ -811,8 +813,8 @@ func (fs *Filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 	return nil, syserror.ECONNREFUSED
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *Filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *Filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	fs.mu.RLock()
 	_, _, err := fs.walkExistingLocked(ctx, rp)
 	fs.mu.RUnlock()
@@ -824,8 +826,8 @@ func (fs *Filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 	return nil, syserror.ENOTSUP
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *Filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *Filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	fs.mu.RLock()
 	_, _, err := fs.walkExistingLocked(ctx, rp)
 	fs.mu.RUnlock()
@@ -837,8 +839,8 @@ func (fs *Filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	return "", syserror.ENOTSUP
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *Filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *Filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	fs.mu.RLock()
 	_, _, err := fs.walkExistingLocked(ctx, rp)
 	fs.mu.RUnlock()
@@ -850,8 +852,8 @@ func (fs *Filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	return syserror.ENOTSUP
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *Filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *Filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	fs.mu.RLock()
 	_, _, err := fs.walkExistingLocked(ctx, rp)
 	fs.mu.RUnlock()
