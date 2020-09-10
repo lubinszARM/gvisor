@@ -16,6 +16,10 @@
 
 package ring0
 
+func storeAppASID(asid uintptr)
+
+func FlushTlbAll()
+
 // CPACREL1 returns the value of the CPACR_EL1 register.
 func CPACREL1() (value uintptr)
 

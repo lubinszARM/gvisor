@@ -15,6 +15,13 @@
 #include "funcdata.h"
 #include "textflag.h"
 
+TEXT ·FlushTlbAll(SB),NOSPLIT,$0
+	DSB $10
+	WORD $0xd508831f
+	DSB $11
+	ISB $15
+	RET
+
 TEXT ·GetTLS(SB),NOSPLIT,$0-8
 	MRS TPIDR_EL0, R1
 	MOVD R1, ret+0(FP)
