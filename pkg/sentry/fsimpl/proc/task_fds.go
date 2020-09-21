@@ -62,7 +62,7 @@ type fdDir struct {
 	produceSymlink bool
 }
 
-// IterDirents implements kernfs.inodeDynamicLookup.
+// IterDirents implements kernfs.inodeDynamicLookup.IterDirents.
 func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	var fds []int32
 	i.task.WithMuLocked(func(t *kernel.Task) {
@@ -86,14 +86,19 @@ func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, off
 			Name:    strconv.FormatUint(uint64(fd), 10),
 			Type:    typ,
 			Ino:     i.fs.NextIno(),
-			NextOff: offset + 1,
+			NextOff: int64(fd) + 3,
 		}
 		if err := cb.Handle(dirent); err != nil {
-			return offset, err
+			// Getdents should iterate correctly despite mutation
+			// of fds, so we return the next fd to serialize plus
+			// 2 (which accounts for the "." and ".." tracked by
+			// kernfs) as the offset.
+			return int64(fd) + 2, err
 		}
-		offset++
 	}
-	return offset, nil
+	// We serialized them all.  Next offset should be higher than last
+	// serialized fd.
+	return int64(fds[len(fds)-1]) + 3, nil
 }
 
 // fdDirInode represents the inode for /proc/[pid]/fd directory.
@@ -130,7 +135,7 @@ func (fs *filesystem) newFDDirInode(task *kernel.Task) *kernfs.Dentry {
 	return dentry
 }
 
-// Lookup implements kernfs.inodeDynamicLookup.
+// Lookup implements kernfs.inodeDynamicLookup.Lookup.
 func (i *fdDirInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, error) {
 	fdInt, err := strconv.ParseInt(name, 10, 32)
 	if err != nil {
@@ -144,7 +149,7 @@ func (i *fdDirInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, erro
 	return taskDentry.VFSDentry(), nil
 }
 
-// Open implements kernfs.Inode.
+// Open implements kernfs.Inode.Open.
 func (i *fdDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
@@ -155,7 +160,7 @@ func (i *fdDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.
 	return fd.VFSFileDescription(), nil
 }
 
-// CheckPermissions implements kernfs.Inode.
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
 //
 // This is to match Linux, which uses a special permission handler to guarantee
 // that a process can still access /proc/self/fd after it has executed
@@ -177,7 +182,7 @@ func (i *fdDirInode) CheckPermissions(ctx context.Context, creds *auth.Credentia
 	return err
 }
 
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *fdDirInode) DecRef(context.Context) {
 	i.fdDirInodeRefs.DecRef(i.Destroy)
 }
@@ -209,7 +214,7 @@ func (fs *filesystem) newFDSymlink(task *kernel.Task, fd int32, ino uint64) *ker
 	return d
 }
 
-func (s *fdSymlink) Readlink(ctx context.Context) (string, error) {
+func (s *fdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
 	file, _ := getTaskFD(s.task, s.fd)
 	if file == nil {
 		return "", syserror.ENOENT
@@ -264,7 +269,7 @@ func (fs *filesystem) newFDInfoDirInode(task *kernel.Task) *kernfs.Dentry {
 	return dentry
 }
 
-// Lookup implements kernfs.inodeDynamicLookup.
+// Lookup implements kernfs.inodeDynamicLookup.Lookup.
 func (i *fdInfoDirInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, error) {
 	fdInt, err := strconv.ParseInt(name, 10, 32)
 	if err != nil {
@@ -282,7 +287,7 @@ func (i *fdInfoDirInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, 
 	return dentry.VFSDentry(), nil
 }
 
-// Open implements kernfs.Inode.
+// Open implements kernfs.Inode.Open.
 func (i *fdInfoDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
@@ -293,7 +298,7 @@ func (i *fdInfoDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *
 	return fd.VFSFileDescription(), nil
 }
 
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *fdInfoDirInode) DecRef(context.Context) {
 	i.fdInfoDirInodeRefs.DecRef(i.Destroy)
 }

@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
 	"gvisor.dev/gvisor/pkg/tcpip/network/fragmentation"
 	"gvisor.dev/gvisor/pkg/tcpip/network/hash"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -235,14 +236,17 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	ipt := e.stack.IPTables()
 	if ok := ipt.Check(stack.Output, pkt, gso, r, "", nicName); !ok {
 		// iptables is telling us to drop the packet.
+		r.Stats().IP.IPTablesOutputDropped.Increment()
 		return nil
 	}
 
-	// If the packet is manipulated as per NAT Ouput rules, handle packet
-	// based on destination address and do not send the packet to link layer.
-	// TODO(gvisor.dev/issue/170): We should do this for every packet, rather than
-	// only NATted packets, but removing this check short circuits broadcasts
-	// before they are sent out to other hosts.
+	// If the packet is manipulated as per NAT Output rules, handle packet
+	// based on destination address and do not send the packet to link
+	// layer.
+	//
+	// TODO(gvisor.dev/issue/170): We should do this for every
+	// packet, rather than only NATted packets, but removing this check
+	// short circuits broadcasts before they are sent out to other hosts.
 	if pkt.NatDone {
 		netHeader := header.IPv4(pkt.NetworkHeader().View())
 		ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
@@ -297,8 +301,9 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
 		return n, err
 	}
+	r.Stats().IP.IPTablesOutputDropped.IncrementBy(uint64(len(dropped)))
 
-	// Slow Path as we are dropping some packets in the batch degrade to
+	// Slow path as we are dropping some packets in the batch degrade to
 	// emitting one packet at a time.
 	n := 0
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
@@ -318,12 +323,15 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		}
 		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 			r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
-			return n, err
+			// Dropped packets aren't errors, so include them in
+			// the return value.
+			return n + len(dropped), err
 		}
 		n++
 	}
 	r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
-	return n, nil
+	// Dropped packets aren't errors, so include them in the return value.
+	return n + len(dropped), nil
 }
 
 // WriteHeaderIncludedPacket writes a packet already containing a network
@@ -392,6 +400,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 	ipt := e.stack.IPTables()
 	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
+		r.Stats().IP.IPTablesInputDropped.Increment()
 		return
 	}
 
@@ -404,11 +413,15 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			return
 		}
 		// The packet is a fragment, let's try to reassemble it.
-		last := h.FragmentOffset() + uint16(pkt.Data.Size()) - 1
-		// Drop the packet if the fragmentOffset is incorrect. i.e the
-		// combination of fragmentOffset and pkt.Data.size() causes a
-		// wrap around resulting in last being less than the offset.
-		if last < h.FragmentOffset() {
+		start := h.FragmentOffset()
+		// Drop the fragment if the size of the reassembled payload would exceed the
+		// maximum payload size.
+		//
+		// Note that this addition doesn't overflow even on 32bit architecture
+		// because pkt.Data.Size() should not exceed 65535 (the max IP datagram
+		// size). Otherwise the packet would've been rejected as invalid before
+		// reaching here.
+		if int(start)+pkt.Data.Size() > header.IPv4MaximumPayloadSize {
 			r.Stats().IP.MalformedPacketsReceived.Increment()
 			r.Stats().IP.MalformedFragmentsReceived.Increment()
 			return
@@ -425,8 +438,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				ID:          uint32(h.ID()),
 				Protocol:    proto,
 			},
-			h.FragmentOffset(),
-			last,
+			start,
+			start+uint16(pkt.Data.Size())-1,
 			h.More(),
 			proto,
 			pkt.Data,
@@ -523,37 +536,14 @@ func (*protocol) Close() {}
 // Wait implements stack.TransportProtocol.Wait.
 func (*protocol) Wait() {}
 
-// Parse implements stack.TransportProtocol.Parse.
+// Parse implements stack.NetworkProtocol.Parse.
 func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
-	hdr, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
-	if !ok {
+	if ok := parse.IPv4(pkt); !ok {
 		return 0, false, false
 	}
-	ipHdr := header.IPv4(hdr)
 
-	// Header may have options, determine the true header length.
-	headerLen := int(ipHdr.HeaderLength())
-	if headerLen < header.IPv4MinimumSize {
-		// TODO(gvisor.dev/issue/2404): Per RFC 791, IHL needs to be at least 5 in
-		// order for the packet to be valid. Figure out if we want to reject this
-		// case.
-		headerLen = header.IPv4MinimumSize
-	}
-	hdr, ok = pkt.NetworkHeader().Consume(headerLen)
-	if !ok {
-		return 0, false, false
-	}
-	ipHdr = header.IPv4(hdr)
-
-	// If this is a fragment, don't bother parsing the transport header.
-	parseTransportHeader := true
-	if ipHdr.More() || ipHdr.FragmentOffset() != 0 {
-		parseTransportHeader = false
-	}
-
-	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
-	pkt.Data.CapLength(int(ipHdr.TotalLength()) - len(hdr))
-	return ipHdr.TransportProtocol(), parseTransportHeader, true
+	ipHdr := header.IPv4(pkt.NetworkHeader().View())
+	return ipHdr.TransportProtocol(), !ipHdr.More() && ipHdr.FragmentOffset() == 0, true
 }
 
 // calculateMTU calculates the network-layer payload MTU based on the link-layer

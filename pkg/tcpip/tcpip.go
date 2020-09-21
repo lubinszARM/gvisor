@@ -1194,6 +1194,19 @@ const (
 	TCPTimeWaitReuseLoopbackOnly
 )
 
+// LingerOption is used by SetSockOpt/GetSockOpt to set/get the
+// duration for which a socket lingers before returning from Close.
+//
+// +stateify savable
+type LingerOption struct {
+	Enabled bool
+	Timeout time.Duration
+}
+
+func (*LingerOption) isGettableSocketOption() {}
+
+func (*LingerOption) isSettableSocketOption() {}
+
 // IPPacketInfo is the message structure for IP_PKTINFO.
 //
 // +stateify savable
@@ -1461,6 +1474,18 @@ type IPStats struct {
 	// MalformedFragmentsReceived is the total number of IP Fragments that were
 	// dropped due to the fragment failing validation checks.
 	MalformedFragmentsReceived *StatCounter
+
+	// IPTablesPreroutingDropped is the total number of IP packets dropped
+	// in the Prerouting chain.
+	IPTablesPreroutingDropped *StatCounter
+
+	// IPTablesInputDropped is the total number of IP packets dropped in
+	// the Input chain.
+	IPTablesInputDropped *StatCounter
+
+	// IPTablesOutputDropped is the total number of IP packets dropped in
+	// the Output chain.
+	IPTablesOutputDropped *StatCounter
 }
 
 // TCPStats collects TCP-specific stats.

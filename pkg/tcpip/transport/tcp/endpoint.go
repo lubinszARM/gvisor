@@ -654,6 +654,9 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
+
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 }
 
 // UniqueID implements stack.TransportEndpoint.UniqueID.
@@ -1007,6 +1010,26 @@ func (e *endpoint) Close() {
 		return
 	}
 
+	if e.linger.Enabled && e.linger.Timeout == 0 {
+		s := e.EndpointState()
+		isResetState := s == StateEstablished || s == StateCloseWait || s == StateFinWait1 || s == StateFinWait2 || s == StateSynRecv
+		if isResetState {
+			// Close the endpoint without doing full shutdown and
+			// send a RST.
+			e.resetConnectionLocked(tcpip.ErrConnectionAborted)
+			e.closeNoShutdownLocked()
+
+			// Wake up worker to close the endpoint.
+			switch s {
+			case StateSynRecv:
+				e.notifyProtocolGoroutine(notifyClose)
+			default:
+				e.notifyProtocolGoroutine(notifyTickleWorker)
+			}
+			return
+		}
+	}
+
 	// Issue a shutdown so that the peer knows we won't send any more data
 	// if we're connected, or stop accepting if we're listening.
 	e.shutdownLocked(tcpip.ShutdownWrite | tcpip.ShutdownRead)
@@ -1294,14 +1317,17 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 // indicating the reason why it's not writable.
 // Caller must hold e.mu and e.sndBufMu
 func (e *endpoint) isEndpointWritableLocked() (int, *tcpip.Error) {
-	// The endpoint cannot be written to if it's not connected.
-	if !e.EndpointState().connected() {
-		switch e.EndpointState() {
-		case StateError:
-			return 0, e.HardError
-		default:
-			return 0, tcpip.ErrClosedForSend
-		}
+	switch s := e.EndpointState(); {
+	case s == StateError:
+		return 0, e.HardError
+	case !s.connecting() && !s.connected():
+		return 0, tcpip.ErrClosedForSend
+	case s.connecting():
+		// As per RFC793, page 56, a send request arriving when in connecting
+		// state, can be queued to be completed after the state becomes
+		// connected. Return an error code for the caller of endpoint Write to
+		// try again, until the connection handshake is complete.
+		return 0, tcpip.ErrWouldBlock
 	}
 
 	// Check if the connection has already been closed for sends.
@@ -1807,6 +1833,11 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	case *tcpip.SocketDetachFilterOption:
 		return nil
 
+	case *tcpip.LingerOption:
+		e.LockUser()
+		e.linger = *v
+		e.UnlockUser()
+
 	default:
 		return nil
 	}
@@ -2030,6 +2061,11 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 			Addr: addr,
 			Port: port,
 		}
+
+	case *tcpip.LingerOption:
+		e.LockUser()
+		*o = e.linger
+		e.UnlockUser()
 
 	default:
 		return tcpip.ErrUnknownProtocolOption

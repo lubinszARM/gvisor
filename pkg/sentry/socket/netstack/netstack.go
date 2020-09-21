@@ -40,6 +40,8 @@ import (
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -62,8 +64,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
-	"gvisor.dev/gvisor/tools/go_marshal/marshal"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 func mustCreateMetric(name, description string) *tcpip.StatCounter {
@@ -158,6 +158,9 @@ var Metrics = tcpip.Stats{
 		OutgoingPacketErrors:                mustCreateMetric("/netstack/ip/outgoing_packet_errors", "Total number of IP packets which failed to write to a link-layer endpoint."),
 		MalformedPacketsReceived:            mustCreateMetric("/netstack/ip/malformed_packets_received", "Total number of IP packets which failed IP header validation checks."),
 		MalformedFragmentsReceived:          mustCreateMetric("/netstack/ip/malformed_fragments_received", "Total number of IP fragments which failed IP fragment validation checks."),
+		IPTablesPreroutingDropped:           mustCreateMetric("/netstack/ip/iptables/prerouting_dropped", "Total number of IP packets dropped in the Prerouting chain."),
+		IPTablesInputDropped:                mustCreateMetric("/netstack/ip/iptables/input_dropped", "Total number of IP packets dropped in the Input chain."),
+		IPTablesOutputDropped:               mustCreateMetric("/netstack/ip/iptables/output_dropped", "Total number of IP packets dropped in the Output chain."),
 	},
 	TCP: tcpip.TCPStats{
 		ActiveConnectionOpenings:           mustCreateMetric("/netstack/tcp/active_connection_openings", "Number of connections opened successfully via Connect."),
@@ -482,8 +485,35 @@ func (s *socketOpsCommon) fetchReadView() *syserr.Error {
 }
 
 // Release implements fs.FileOperations.Release.
-func (s *socketOpsCommon) Release(context.Context) {
+func (s *socketOpsCommon) Release(ctx context.Context) {
+	e, ch := waiter.NewChannelEntry(nil)
+	s.EventRegister(&e, waiter.EventHUp|waiter.EventErr)
+	defer s.EventUnregister(&e)
+
 	s.Endpoint.Close()
+
+	// SO_LINGER option is valid only for TCP. For other socket types
+	// return after endpoint close.
+	if family, skType, _ := s.Type(); skType != linux.SOCK_STREAM || (family != linux.AF_INET && family != linux.AF_INET6) {
+		return
+	}
+
+	var v tcpip.LingerOption
+	if err := s.Endpoint.GetSockOpt(&v); err != nil {
+		return
+	}
+
+	// The case for zero timeout is handled in tcp endpoint close function.
+	// Close is blocked until either:
+	// 1. The endpoint state is not in any of the states: FIN-WAIT1,
+	// CLOSING and LAST_ACK.
+	// 2. Timeout is reached.
+	if v.Enabled && v.Timeout != 0 {
+		t := kernel.TaskFromContext(ctx)
+		start := t.Kernel().MonotonicClock().Now()
+		deadline := start.Add(v.Timeout)
+		t.BlockWithDeadline(ch, true, deadline)
+	}
 }
 
 // Read implements fs.FileOperations.Read.
@@ -1155,7 +1185,16 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		linger := linux.Linger{}
+		var v tcpip.LingerOption
+		var linger linux.Linger
+		if err := ep.GetSockOpt(&v); err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+
+		if v.Enabled {
+			linger.OnOff = 1
+		}
+		linger.Linger = int32(v.Timeout.Seconds())
 		return &linger, nil
 
 	case linux.SO_SNDTIMEO:
@@ -1732,10 +1771,16 @@ func SetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, level int
 	case linux.SOL_IP:
 		return setSockOptIP(t, s, ep, name, optVal)
 
+	case linux.SOL_PACKET:
+		// gVisor doesn't support any SOL_PACKET options just return not
+		// supported. Returning nil here will result in tcpdump thinking AF_PACKET
+		// features are supported and proceed to use them and break.
+		t.Kernel().EmitUnimplementedEvent(t)
+		return syserr.ErrProtocolNotAvailable
+
 	case linux.SOL_UDP,
 		linux.SOL_ICMPV6,
-		linux.SOL_RAW,
-		linux.SOL_PACKET:
+		linux.SOL_RAW:
 
 		t.Kernel().EmitUnimplementedEvent(t)
 	}
@@ -1884,7 +1929,10 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 			socket.SetSockOptEmitUnimplementedEvent(t, name)
 		}
 
-		return nil
+		return syserr.TranslateNetstackError(
+			ep.SetSockOpt(&tcpip.LingerOption{
+				Enabled: v.OnOff != 0,
+				Timeout: time.Second * time.Duration(v.Linger)}))
 
 	case linux.SO_DETACH_FILTER:
 		// optval is ignored.

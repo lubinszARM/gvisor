@@ -140,7 +140,7 @@ func (fs *Filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		}
 		// Reference on childVFSD dropped by a corresponding Valid.
 		child = childVFSD.Impl().(*Dentry)
-		parent.insertChildLocked(name, child)
+		parent.InsertChildLocked(name, child)
 	}
 	return child, nil
 }
@@ -548,7 +548,7 @@ func (fs *Filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 	if !d.Impl().(*Dentry).isSymlink() {
 		return "", syserror.EINVAL
 	}
-	return inode.Readlink(ctx)
+	return inode.Readlink(ctx, rp.Mount())
 }
 
 // RenameAt implements vfs.FilesystemImpl.RenameAt.
@@ -657,6 +657,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 func (fs *Filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+
 	vfsd, inode, err := fs.walkExistingLocked(ctx, rp)
 	fs.processDeferredDecRefsLocked(ctx)
 	if err != nil {
@@ -686,7 +687,8 @@ func (fs *Filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err := virtfs.PrepareDeleteDentry(mntns, vfsd); err != nil {
 		return err
 	}
-	if err := parentDentry.inode.RmDir(ctx, rp.Component(), vfsd); err != nil {
+
+	if err := parentDentry.inode.RmDir(ctx, d.name, vfsd); err != nil {
 		virtfs.AbortDeleteDentry(vfsd)
 		return err
 	}
@@ -765,6 +767,7 @@ func (fs *Filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+
 	vfsd, _, err := fs.walkExistingLocked(ctx, rp)
 	fs.processDeferredDecRefsLocked(ctx)
 	if err != nil {
@@ -790,7 +793,7 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err := virtfs.PrepareDeleteDentry(mntns, vfsd); err != nil {
 		return err
 	}
-	if err := parentDentry.inode.Unlink(ctx, rp.Component(), vfsd); err != nil {
+	if err := parentDentry.inode.Unlink(ctx, d.name, vfsd); err != nil {
 		virtfs.AbortDeleteDentry(vfsd)
 		return err
 	}
@@ -798,7 +801,7 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	return nil
 }
 
-// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+// BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *Filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	fs.mu.RLock()
 	_, inode, err := fs.walkExistingLocked(ctx, rp)

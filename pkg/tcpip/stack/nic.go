@@ -337,7 +337,7 @@ func (n *NIC) enable() *tcpip.Error {
 	// does. That is, routers do not learn from RAs (e.g. on-link prefixes
 	// and default routers). Therefore, soliciting RAs from other routers on
 	// a link is unnecessary for routers.
-	if !n.stack.forwarding {
+	if !n.stack.Forwarding(header.IPv6ProtocolNumber) {
 		n.mu.ndp.startSolicitingRouters()
 	}
 
@@ -665,33 +665,15 @@ func (n *NIC) getRefOrCreateTemp(protocol tcpip.NetworkProtocolNumber, address t
 		}
 	}
 
-	// Check if address is a broadcast address for the endpoint's network.
-	//
-	// Only IPv4 has a notion of broadcast addresses.
 	if protocol == header.IPv4ProtocolNumber {
-		if ref := n.getRefForBroadcastRLocked(address); ref != nil {
+		if ref := n.getIPv4RefForBroadcastOrLoopbackRLocked(address); ref != nil {
 			n.mu.RUnlock()
 			return ref
 		}
 	}
-
-	// A usable reference was not found, create a temporary one if requested by
-	// the caller or if the IPv4 address is found in the NIC's subnets and the NIC
-	// is a loopback interface.
-	createTempEP := spoofingOrPromiscuous
-	if !createTempEP && n.isLoopback() && protocol == header.IPv4ProtocolNumber {
-		for _, r := range n.mu.endpoints {
-			addr := r.addrWithPrefix()
-			subnet := addr.Subnet()
-			if subnet.Contains(address) {
-				createTempEP = true
-				break
-			}
-		}
-	}
 	n.mu.RUnlock()
 
-	if !createTempEP {
+	if !spoofingOrPromiscuous {
 		return nil
 	}
 
@@ -704,20 +686,21 @@ func (n *NIC) getRefOrCreateTemp(protocol tcpip.NetworkProtocolNumber, address t
 	return ref
 }
 
-// getRefForBroadcastLocked returns an endpoint where address is the IPv4
-// broadcast address for the endpoint's network.
+// getRefForBroadcastOrLoopbackRLocked returns an endpoint whose address is the
+// broadcast address for the endpoint's network or an address in the endpoint's
+// subnet if the NIC is a loopback interface. This matches linux behaviour.
 //
-// n.mu MUST be read locked.
-func (n *NIC) getRefForBroadcastRLocked(address tcpip.Address) *referencedNetworkEndpoint {
+// n.mu MUST be read or write locked.
+func (n *NIC) getIPv4RefForBroadcastOrLoopbackRLocked(address tcpip.Address) *referencedNetworkEndpoint {
 	for _, ref := range n.mu.endpoints {
-		// Only IPv4 has a notion of broadcast addresses.
+		// Only IPv4 has a notion of broadcast addresses or considers the loopback
+		// interface bound to an address's whole subnet (on linux).
 		if ref.protocol != header.IPv4ProtocolNumber {
 			continue
 		}
 
-		addr := ref.addrWithPrefix()
-		subnet := addr.Subnet()
-		if subnet.IsBroadcast(address) && ref.tryIncRef() {
+		subnet := ref.addrWithPrefix().Subnet()
+		if (subnet.IsBroadcast(address) || (n.isLoopback() && subnet.Contains(address))) && ref.isValidForOutgoingRLocked() && ref.tryIncRef() {
 			return ref
 		}
 	}
@@ -745,11 +728,8 @@ func (n *NIC) getRefOrCreateTempLocked(protocol tcpip.NetworkProtocolNumber, add
 		n.removeEndpointLocked(ref)
 	}
 
-	// Check if address is a broadcast address for an endpoint's network.
-	//
-	// Only IPv4 has a notion of broadcast addresses.
 	if protocol == header.IPv4ProtocolNumber {
-		if ref := n.getRefForBroadcastRLocked(address); ref != nil {
+		if ref := n.getIPv4RefForBroadcastOrLoopbackRLocked(address); ref != nil {
 			return ref
 		}
 	}
@@ -1302,14 +1282,14 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		return
 	}
 
-	// TODO(gvisor.dev/issue/170): Not supporting iptables for IPv6 yet.
 	// Loopback traffic skips the prerouting chain.
-	if protocol == header.IPv4ProtocolNumber && !n.isLoopback() {
+	if !n.isLoopback() {
 		// iptables filtering.
 		ipt := n.stack.IPTables()
 		address := n.primaryAddress(protocol)
 		if ok := ipt.Check(Prerouting, pkt, nil, nil, address.Address, ""); !ok {
 			// iptables is telling us to drop the packet.
+			n.stack.stats.IP.IPTablesPreroutingDropped.Increment()
 			return
 		}
 	}
@@ -1323,7 +1303,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	// packet and forward it to the NIC.
 	//
 	// TODO: Should we be forwarding the packet even if promiscuous?
-	if n.stack.Forwarding() {
+	if n.stack.Forwarding(protocol) {
 		r, err := n.stack.FindRoute(0, "", dst, protocol, false /* multicastLoop */)
 		if err != nil {
 			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
@@ -1350,6 +1330,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		// n doesn't have a destination endpoint.
 		// Send the packet out of n.
 		// TODO(b/128629022): move this logic to route.WritePacket.
+		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease the TTL field for ipv4/ipv6.
 		if ch, err := r.Resolve(nil); err != nil {
 			if err == tcpip.ErrWouldBlock {
 				n.stack.forwarder.enqueue(ch, n, &r, protocol, pkt)

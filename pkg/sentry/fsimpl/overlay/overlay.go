@@ -22,6 +22,10 @@
 //   filesystem.renameMu
 //     dentry.dirMu
 //       dentry.copyMu
+//         *** "memmap.Mappable locks" below this point
+//         dentry.mapsMu
+//           *** "memmap.Mappable locks taken by Translate" below this point
+//           dentry.dataMu
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -37,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -106,16 +111,16 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fsoptsRaw := opts.InternalData
 	fsopts, haveFSOpts := fsoptsRaw.(FilesystemOptions)
 	if fsoptsRaw != nil && !haveFSOpts {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: GetFilesystemOptions.InternalData has type %T, wanted overlay.FilesystemOptions or nil", fsoptsRaw)
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: GetFilesystemOptions.InternalData has type %T, wanted overlay.FilesystemOptions or nil", fsoptsRaw)
 		return nil, nil, syserror.EINVAL
 	}
 	if haveFSOpts {
 		if len(fsopts.LowerRoots) == 0 {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: LowerRoots must be non-empty")
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: LowerRoots must be non-empty")
 			return nil, nil, syserror.EINVAL
 		}
 		if len(fsopts.LowerRoots) < 2 && !fsopts.UpperRoot.Ok() {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: at least two LowerRoots are required when UpperRoot is unspecified")
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two LowerRoots are required when UpperRoot is unspecified")
 			return nil, nil, syserror.EINVAL
 		}
 		// We don't enforce a maximum number of lower layers when not
@@ -132,7 +137,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			delete(mopts, "workdir")
 			upperPath := fspath.Parse(upperPathname)
 			if !upperPath.Absolute {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
 				return nil, nil, syserror.EINVAL
 			}
 			upperRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
@@ -144,13 +149,13 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				CheckSearchable: true,
 			})
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
 				return nil, nil, err
 			}
 			defer upperRoot.DecRef(ctx)
 			privateUpperRoot, err := clonePrivateMount(vfsObj, upperRoot, false /* forceReadOnly */)
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of upperdir %q: %v", upperPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of upperdir %q: %v", upperPathname, err)
 				return nil, nil, err
 			}
 			defer privateUpperRoot.DecRef(ctx)
@@ -158,24 +163,24 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 		lowerPathnamesStr, ok := mopts["lowerdir"]
 		if !ok {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: missing required option lowerdir")
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: missing required option lowerdir")
 			return nil, nil, syserror.EINVAL
 		}
 		delete(mopts, "lowerdir")
 		lowerPathnames := strings.Split(lowerPathnamesStr, ":")
 		const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
 		if len(lowerPathnames) < 2 && !fsopts.UpperRoot.Ok() {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: at least two lowerdirs are required when upperdir is unspecified")
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two lowerdirs are required when upperdir is unspecified")
 			return nil, nil, syserror.EINVAL
 		}
 		if len(lowerPathnames) > maxLowerLayers {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: %d lowerdirs specified, maximum %d", len(lowerPathnames), maxLowerLayers)
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: %d lowerdirs specified, maximum %d", len(lowerPathnames), maxLowerLayers)
 			return nil, nil, syserror.EINVAL
 		}
 		for _, lowerPathname := range lowerPathnames {
 			lowerPath := fspath.Parse(lowerPathname)
 			if !lowerPath.Absolute {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
 				return nil, nil, syserror.EINVAL
 			}
 			lowerRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
@@ -187,13 +192,13 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				CheckSearchable: true,
 			})
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to resolve lowerdir %q: %v", lowerPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve lowerdir %q: %v", lowerPathname, err)
 				return nil, nil, err
 			}
 			defer lowerRoot.DecRef(ctx)
 			privateLowerRoot, err := clonePrivateMount(vfsObj, lowerRoot, true /* forceReadOnly */)
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of lowerdir %q: %v", lowerPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of lowerdir %q: %v", lowerPathname, err)
 				return nil, nil, err
 			}
 			defer privateLowerRoot.DecRef(ctx)
@@ -201,7 +206,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 	}
 	if len(mopts) != 0 {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: unused options: %v", mopts)
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: unused options: %v", mopts)
 		return nil, nil, syserror.EINVAL
 	}
 
@@ -274,7 +279,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, syserror.EREMOTE
 	}
 	if isWhiteout(&rootStat) {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: filesystem root is a whiteout")
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: filesystem root is a whiteout")
 		root.destroyLocked(ctx)
 		fs.vfsfs.DecRef(ctx)
 		return nil, nil, syserror.EINVAL
@@ -418,6 +423,35 @@ type dentry struct {
 	devMajor uint32
 	devMinor uint32
 	ino      uint64
+
+	// If this dentry represents a regular file, then:
+	//
+	// - mapsMu is used to synchronize between copy-up and memmap.Mappable
+	// methods on dentry preceding mm.MemoryManager.activeMu in the lock order.
+	//
+	// - dataMu is used to synchronize between copy-up and
+	// dentry.(memmap.Mappable).Translate.
+	//
+	// - lowerMappings tracks memory mappings of the file. lowerMappings is
+	// used to invalidate mappings of the lower layer when the file is copied
+	// up to ensure that they remain coherent with subsequent writes to the
+	// file. (Note that, as of this writing, Linux overlayfs does not do this;
+	// this feature is a gVisor extension.) lowerMappings is protected by
+	// mapsMu.
+	//
+	// - If this dentry is copied-up, then wrappedMappable is the Mappable
+	// obtained from a call to the current top layer's
+	// FileDescription.ConfigureMMap(). Once wrappedMappable becomes non-nil
+	// (from a call to nonDirectoryFD.ensureMappable()), it cannot become nil.
+	// wrappedMappable is protected by mapsMu and dataMu.
+	//
+	// - isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
+	// accessed using atomic memory operations.
+	mapsMu          sync.Mutex
+	lowerMappings   memmap.MappingSet
+	dataMu          sync.RWMutex
+	wrappedMappable memmap.Mappable
+	isMappable      uint32
 
 	locks vfs.FileLocks
 }

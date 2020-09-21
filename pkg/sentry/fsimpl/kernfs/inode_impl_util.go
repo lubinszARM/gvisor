@@ -172,7 +172,7 @@ func (InodeNoDynamicLookup) Valid(ctx context.Context) bool {
 type InodeNotSymlink struct{}
 
 // Readlink implements Inode.Readlink.
-func (InodeNotSymlink) Readlink(context.Context) (string, error) {
+func (InodeNotSymlink) Readlink(context.Context, *vfs.Mount) (string, error) {
 	return "", syserror.EINVAL
 }
 
@@ -256,11 +256,28 @@ func (a *InodeAttrs) Stat(context.Context, *vfs.Filesystem, vfs.StatOptions) (li
 
 // SetStat implements Inode.SetStat.
 func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
+	return a.SetInodeStat(ctx, fs, creds, opts)
+}
+
+// SetInodeStat sets the corresponding attributes from opts to InodeAttrs.
+// This function can be used by other kernfs-based filesystem implementation to
+// sets the unexported attributes into kernfs.InodeAttrs.
+func (a *InodeAttrs) SetInodeStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	if opts.Stat.Mask == 0 {
 		return nil
 	}
-	if opts.Stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID) != 0 {
+
+	// Note that not all fields are modifiable. For example, the file type and
+	// inode numbers are immutable after node creation. Setting the size is often
+	// allowed by kernfs files but does not do anything. If some other behavior is
+	// needed, the embedder should consider extending SetStat.
+	//
+	// TODO(gvisor.dev/issue/1193): Implement other stat fields like timestamps.
+	if opts.Stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_SIZE) != 0 {
 		return syserror.EPERM
+	}
+	if opts.Stat.Mask&linux.STATX_SIZE != 0 && a.Mode().IsDir() {
+		return syserror.EISDIR
 	}
 	if err := vfs.CheckSetStat(ctx, creds, &opts, a.Mode(), auth.KUID(atomic.LoadUint32(&a.uid)), auth.KGID(atomic.LoadUint32(&a.gid))); err != nil {
 		return err
@@ -283,13 +300,6 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	if stat.Mask&linux.STATX_GID != 0 {
 		atomic.StoreUint32(&a.gid, stat.GID)
 	}
-
-	// Note that not all fields are modifiable. For example, the file type and
-	// inode numbers are immutable after node creation.
-
-	// TODO(gvisor.dev/issue/1193): Implement other stat fields like timestamps.
-	// Also, STATX_SIZE will need some special handling, because read-only static
-	// files should return EIO for truncate operations.
 
 	return nil
 }
@@ -584,7 +594,7 @@ func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint3
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeDirectory|perm)
 }
 
-// Open implements kernfs.Inode.
+// Open implements kernfs.Inode.Open.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts, s.fdOpts)
 	if err != nil {
@@ -598,7 +608,7 @@ func (*StaticDirectory) SetStat(context.Context, *vfs.Filesystem, *auth.Credenti
 	return syserror.EPERM
 }
 
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (s *StaticDirectory) DecRef(context.Context) {
 	s.StaticDirectoryRefs.DecRef(s.Destroy)
 }
@@ -606,7 +616,7 @@ func (s *StaticDirectory) DecRef(context.Context) {
 // AlwaysValid partially implements kernfs.inodeDynamicLookup.
 type AlwaysValid struct{}
 
-// Valid implements kernfs.inodeDynamicLookup.
+// Valid implements kernfs.inodeDynamicLookup.Valid.
 func (*AlwaysValid) Valid(context.Context) bool {
 	return true
 }
