@@ -5,10 +5,9 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"io"
 	"reflect"
-
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Kernel is a global kernel object.
