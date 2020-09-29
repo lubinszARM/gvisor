@@ -31,6 +31,8 @@ import (
 )
 
 // masterInode is the inode for the master end of the Terminal.
+//
+// +stateify savable
 type masterInode struct {
 	implStatFS
 	kernfs.InodeAttrs
@@ -50,20 +52,18 @@ type masterInode struct {
 var _ kernfs.Inode = (*masterInode)(nil)
 
 // Open implements kernfs.Inode.Open.
-func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	t, err := mi.root.allocateTerminal(rp.Credentials())
 	if err != nil {
 		return nil, err
 	}
 
-	mi.IncRef()
 	fd := &masterFileDescription{
 		inode: mi,
 		t:     t,
 	}
 	fd.LockFD.Init(&mi.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
-		mi.DecRef(ctx)
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -89,6 +89,7 @@ func (mi *masterInode) SetStat(ctx context.Context, vfsfs *vfs.Filesystem, creds
 	return mi.InodeAttrs.SetStat(ctx, vfsfs, creds, opts)
 }
 
+// +stateify savable
 type masterFileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -103,7 +104,6 @@ var _ vfs.FileDescriptionImpl = (*masterFileDescription)(nil)
 // Release implements vfs.FileDescriptionImpl.Release.
 func (mfd *masterFileDescription) Release(ctx context.Context) {
 	mfd.inode.root.masterClose(mfd.t)
-	mfd.inode.DecRef(ctx)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.

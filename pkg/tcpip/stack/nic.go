@@ -1242,9 +1242,9 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		local = n.linkEP.LinkAddress()
 	}
 
-	// Are any packet sockets listening for this network protocol?
+	// Are any packet type sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
-	// Add any other packet sockets that maybe listening for all protocols.
+	// Add any other packet type sockets that may be listening for all protocols.
 	packetEPs = append(packetEPs, n.mu.packetEPs[header.EthernetProtocolAll]...)
 	n.mu.RUnlock()
 	for _, ep := range packetEPs {
@@ -1265,6 +1265,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		return
 	}
 	if hasTransportHdr {
+		pkt.TransportProtocolNumber = transProtoNum
 		// Parse the transport header if present.
 		if state, ok := n.stack.transportProtocols[transProtoNum]; ok {
 			state.proto.Parse(pkt)
@@ -1397,11 +1398,13 @@ func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt 
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) {
+func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
+		// TODO(gvisor.dev/issue/4365): Let the caller know that the transport
+		// protocol is unrecognized.
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
-		return
+		return TransportPacketHandled
 	}
 
 	transProto := state.proto
@@ -1422,41 +1425,47 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 			// we parse it using the minimum size.
 			if _, ok := pkt.TransportHeader().Consume(transProto.MinimumPacketSize()); !ok {
 				n.stack.stats.MalformedRcvdPackets.Increment()
-				return
+				// We consider a malformed transport packet handled because there is
+				// nothing the caller can do.
+				return TransportPacketHandled
 			}
-		} else {
-			// This is either a bad packet or was re-assembled from fragments.
-			transProto.Parse(pkt)
+		} else if !transProto.Parse(pkt) {
+			n.stack.stats.MalformedRcvdPackets.Increment()
+			return TransportPacketHandled
 		}
-	}
-
-	if pkt.TransportHeader().View().Size() < transProto.MinimumPacketSize() {
-		n.stack.stats.MalformedRcvdPackets.Increment()
-		return
 	}
 
 	srcPort, dstPort, err := transProto.ParsePorts(pkt.TransportHeader().View())
 	if err != nil {
 		n.stack.stats.MalformedRcvdPackets.Increment()
-		return
+		return TransportPacketHandled
 	}
 
 	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
 	if n.stack.demux.deliverPacket(r, protocol, pkt, id) {
-		return
+		return TransportPacketHandled
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
 		if state.defaultHandler(r, id, pkt) {
-			return
+			return TransportPacketHandled
 		}
 	}
 
-	// We could not find an appropriate destination for this packet, so
-	// deliver it to the global handler.
-	if !transProto.HandleUnknownDestinationPacket(r, id, pkt) {
+	// We could not find an appropriate destination for this packet so
+	// give the protocol specific error handler a chance to handle it.
+	// If it doesn't handle it then we should do so.
+	switch res := transProto.HandleUnknownDestinationPacket(r, id, pkt); res {
+	case UnknownDestinationPacketMalformed:
 		n.stack.stats.MalformedRcvdPackets.Increment()
+		return TransportPacketHandled
+	case UnknownDestinationPacketUnhandled:
+		return TransportPacketDestinationPortUnreachable
+	case UnknownDestinationPacketHandled:
+		return TransportPacketHandled
+	default:
+		panic(fmt.Sprintf("unrecognized result from HandleUnknownDestinationPacket = %d", res))
 	}
 }
 

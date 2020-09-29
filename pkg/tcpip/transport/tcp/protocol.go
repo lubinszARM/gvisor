@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package tcp contains the implementation of the TCP transport protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing tcp.NewProtocol() as one of the
-// transport protocols when calling stack.New(). Then endpoints can be created
-// by passing tcp.ProtocolNumber as the transport protocol number when calling
-// Stack.NewEndpoint().
+// Package tcp contains the implementation of the TCP transport protocol.
 package tcp
 
 import (
@@ -201,21 +196,20 @@ func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id st
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+
+func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	s := newSegment(r, id, pkt)
 	defer s.decRef()
 
 	if !s.parse() || !s.csumValid {
-		return false
+		return stack.UnknownDestinationPacketMalformed
 	}
 
-	// There's nothing to do if this is already a reset packet.
-	if s.flagIsSet(header.TCPFlagRst) {
-		return true
+	if !s.flagIsSet(header.TCPFlagRst) {
+		replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
 	}
 
-	replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
-	return true
+	return stack.UnknownDestinationPacketHandled
 }
 
 // replyWithReset replies to the given segment with a reset segment.
@@ -511,7 +505,7 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol returns a TCP transport protocol.
-func NewProtocol() stack.TransportProtocol {
+func NewProtocol(*stack.Stack) stack.TransportProtocol {
 	p := protocol{
 		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
 			Min:     MinBufferSize,

@@ -41,8 +41,11 @@ const Name = "fuse"
 const maxActiveRequestsDefault = 10000
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
+// +stateify savable
 type filesystemOptions struct {
 	// userID specifies the numeric uid of the mount owner.
 	// This option should not be specified by the filesystem owner.
@@ -73,6 +76,8 @@ type filesystemOptions struct {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 	devMinor uint32
@@ -240,6 +245,8 @@ func (fs *filesystem) Release(ctx context.Context) {
 }
 
 // inode implements kernfs.Inode.
+//
+// +stateify savable
 type inode struct {
 	inodeRefs
 	kernfs.InodeAttrs
@@ -280,6 +287,7 @@ func (fs *filesystem) newRootInode(creds *auth.Credentials, mode linux.FileMode)
 	i := &inode{fs: fs}
 	i.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, 1, linux.ModeDirectory|0755)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	i.EnableLeakCheck()
 	i.dentry.Init(i)
 	i.nodeID = 1
 
@@ -299,7 +307,7 @@ func (fs *filesystem) newInode(nodeID uint64, attr linux.FUSEAttr) *kernfs.Dentr
 }
 
 // Open implements kernfs.Inode.Open.
-func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	isDir := i.InodeAttrs.Mode().IsDir()
 	// return error if specified to open directory but inode is not a directory.
 	if !isDir && opts.Mode.IsDir() {
@@ -395,7 +403,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentr
 		i.attributeTime = 0
 	}
 
-	if err := fd.vfsfd.Init(fdImpl, opts.Flags, rp.Mount(), vfsd, fdOptions); err != nil {
+	if err := fd.vfsfd.Init(fdImpl, opts.Flags, rp.Mount(), d.VFSDentry(), fdOptions); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -418,7 +426,7 @@ func (*inode) Valid(ctx context.Context) bool {
 }
 
 // NewFile implements kernfs.Inode.NewFile.
-func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (*vfs.Dentry, error) {
+func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (*kernfs.Dentry, error) {
 	kernelTask := kernel.TaskFromContext(ctx)
 	if kernelTask == nil {
 		log.Warningf("fusefs.Inode.NewFile: couldn't get kernel task from context", i.nodeID)
@@ -432,15 +440,11 @@ func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) 
 		},
 		Name: name,
 	}
-	d, err := i.newEntry(ctx, name, linux.S_IFREG, linux.FUSE_CREATE, &in)
-	if err != nil {
-		return nil, err
-	}
-	return d.VFSDentry(), nil
+	return i.newEntry(ctx, name, linux.S_IFREG, linux.FUSE_CREATE, &in)
 }
 
 // NewNode implements kernfs.Inode.NewNode.
-func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions) (*vfs.Dentry, error) {
+func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions) (*kernfs.Dentry, error) {
 	in := linux.FUSEMknodIn{
 		MknodMeta: linux.FUSEMknodMeta{
 			Mode:  uint32(opts.Mode),
@@ -449,28 +453,20 @@ func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions)
 		},
 		Name: name,
 	}
-	d, err := i.newEntry(ctx, name, opts.Mode.FileType(), linux.FUSE_MKNOD, &in)
-	if err != nil {
-		return nil, err
-	}
-	return d.VFSDentry(), nil
+	return i.newEntry(ctx, name, opts.Mode.FileType(), linux.FUSE_MKNOD, &in)
 }
 
 // NewSymlink implements kernfs.Inode.NewSymlink.
-func (i *inode) NewSymlink(ctx context.Context, name, target string) (*vfs.Dentry, error) {
+func (i *inode) NewSymlink(ctx context.Context, name, target string) (*kernfs.Dentry, error) {
 	in := linux.FUSESymLinkIn{
 		Name:   name,
 		Target: target,
 	}
-	d, err := i.newEntry(ctx, name, linux.S_IFLNK, linux.FUSE_SYMLINK, &in)
-	if err != nil {
-		return nil, err
-	}
-	return d.VFSDentry(), nil
+	return i.newEntry(ctx, name, linux.S_IFLNK, linux.FUSE_SYMLINK, &in)
 }
 
 // Unlink implements kernfs.Inode.Unlink.
-func (i *inode) Unlink(ctx context.Context, name string, child *vfs.Dentry) error {
+func (i *inode) Unlink(ctx context.Context, name string, child *kernfs.Dentry) error {
 	kernelTask := kernel.TaskFromContext(ctx)
 	if kernelTask == nil {
 		log.Warningf("fusefs.Inode.newEntry: couldn't get kernel task from context", i.nodeID)
@@ -493,7 +489,7 @@ func (i *inode) Unlink(ctx context.Context, name string, child *vfs.Dentry) erro
 }
 
 // NewDir implements kernfs.Inode.NewDir.
-func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (*vfs.Dentry, error) {
+func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (*kernfs.Dentry, error) {
 	in := linux.FUSEMkdirIn{
 		MkdirMeta: linux.FUSEMkdirMeta{
 			Mode:  uint32(opts.Mode),
@@ -501,15 +497,11 @@ func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) 
 		},
 		Name: name,
 	}
-	d, err := i.newEntry(ctx, name, linux.S_IFDIR, linux.FUSE_MKDIR, &in)
-	if err != nil {
-		return nil, err
-	}
-	return d.VFSDentry(), nil
+	return i.newEntry(ctx, name, linux.S_IFDIR, linux.FUSE_MKDIR, &in)
 }
 
 // RmDir implements kernfs.Inode.RmDir.
-func (i *inode) RmDir(ctx context.Context, name string, child *vfs.Dentry) error {
+func (i *inode) RmDir(ctx context.Context, name string, child *kernfs.Dentry) error {
 	fusefs := i.fs
 	task, creds := kernel.TaskFromContext(ctx), auth.CredentialsFromContext(ctx)
 
@@ -527,12 +519,7 @@ func (i *inode) RmDir(ctx context.Context, name string, child *vfs.Dentry) error
 		return err
 	}
 
-	// TODO(Before merging): When creating new nodes, should we add nodes to the ordered children?
-	// If so we'll probably need to call this. We will also need to add them with the writable flag when
-	// appropriate.
-	// return i.OrderedChildren.RmDir(ctx, name, child)
-
-	return nil
+	return i.dentry.RemoveChildLocked(name, child)
 }
 
 // newEntry calls FUSE server for entry creation and allocates corresponding entry according to response.
@@ -562,11 +549,6 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 		return nil, syserror.EIO
 	}
 	child := i.fs.newInode(out.NodeID, out.Attr)
-	if opcode == linux.FUSE_LOOKUP {
-		i.dentry.InsertChildLocked(name, child)
-	} else {
-		i.dentry.InsertChild(name, child)
-	}
 	return child, nil
 }
 

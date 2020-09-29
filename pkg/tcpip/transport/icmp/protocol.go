@@ -13,12 +13,7 @@
 // limitations under the License.
 
 // Package icmp contains the implementation of the ICMP and IPv6-ICMP transport
-// protocols for use in ping. To use it in the networking stack, this package
-// must be added to the project, and activated on the stack by passing
-// icmp.NewProtocol4() and/or icmp.NewProtocol6() as one of the transport
-// protocols when calling stack.New(). Then endpoints can be created by passing
-// icmp.ProtocolNumber or icmp.ProtocolNumber6 as the transport protocol number
-// when calling Stack.NewEndpoint().
+// protocols for use in ping.
 package icmp
 
 import (
@@ -104,8 +99,8 @@ func (p *protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error)
 
 // HandleUnknownDestinationPacket handles packets targeted at this protocol but
 // that don't match any existing endpoint.
-func (*protocol) HandleUnknownDestinationPacket(*stack.Route, stack.TransportEndpointID, *stack.PacketBuffer) bool {
-	return true
+func (*protocol) HandleUnknownDestinationPacket(*stack.Route, stack.TransportEndpointID, *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+	return stack.UnknownDestinationPacketHandled
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
@@ -135,11 +130,11 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol4 returns an ICMPv4 transport protocol.
-func NewProtocol4() stack.TransportProtocol {
+func NewProtocol4(*stack.Stack) stack.TransportProtocol {
 	return &protocol{ProtocolNumber4}
 }
 
 // NewProtocol6 returns an ICMPv6 transport protocol.
-func NewProtocol6() stack.TransportProtocol {
+func NewProtocol6(*stack.Stack) stack.TransportProtocol {
 	return &protocol{ProtocolNumber6}
 }

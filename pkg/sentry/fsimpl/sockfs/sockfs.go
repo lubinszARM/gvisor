@@ -28,6 +28,8 @@ import (
 )
 
 // filesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type filesystemType struct{}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -44,6 +46,7 @@ func (filesystemType) Name() string {
 	return "sockfs"
 }
 
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -80,6 +83,8 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // inode implements kernfs.Inode.
+//
+// +stateify savable
 type inode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
@@ -88,7 +93,7 @@ type inode struct {
 }
 
 // Open implements kernfs.Inode.Open.
-func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	return nil, syserror.ENXIO
 }
 

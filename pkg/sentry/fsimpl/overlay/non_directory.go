@@ -39,6 +39,7 @@ func (d *dentry) readlink(ctx context.Context) (string, error) {
 	})
 }
 
+// +stateify savable
 type nonDirectoryFD struct {
 	fileDescription
 
@@ -47,7 +48,7 @@ type nonDirectoryFD struct {
 	// fileDescription.dentry().upperVD. cachedFlags is the last known value of
 	// cachedFD.StatusFlags(). copiedUp, cachedFD, and cachedFlags are
 	// protected by mu.
-	mu          sync.Mutex
+	mu          sync.Mutex `state:"nosave"`
 	copiedUp    bool
 	cachedFD    *vfs.FileDescription
 	cachedFlags uint32
@@ -183,6 +184,9 @@ func (fd *nonDirectoryFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) 
 		return err
 	}
 	d.updateAfterSetStatLocked(&opts)
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
+	}
 	return nil
 }
 

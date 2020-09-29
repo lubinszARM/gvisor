@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package ipv4 contains the implementation of the ipv4 network protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing ipv4.NewProtocol() as one of the network
-// protocols when calling stack.New(). Then endpoints can be created by passing
-// ipv4.ProtocolNumber as the network protocol number when calling
-// Stack.NewEndpoint().
+// Package ipv4 contains the implementation of the ipv4 network protocol.
 package ipv4
 
 import (
+	"fmt"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -455,11 +451,27 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 	}
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
+		// TODO(gvisor.dev/issues/3810): when we sort out ICMP and transport
+		// headers, the setting of the transport number here should be
+		// unnecessary and removed.
+		pkt.TransportProtocolNumber = p
 		e.handleICMP(r, pkt)
 		return
 	}
 	r.Stats().IP.PacketsDelivered.Increment()
-	e.dispatcher.DeliverTransportPacket(r, p, pkt)
+
+	switch res := e.dispatcher.DeliverTransportPacket(r, p, pkt); res {
+	case stack.TransportPacketHandled:
+	case stack.TransportPacketDestinationPortUnreachable:
+		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination
+		//   Unreachable messages with code:
+		//     3 (Port Unreachable), when the designated transport protocol
+		//     (e.g., UDP) is unable to demultiplex the datagram but has no
+		//     protocol mechanism to inform the sender.
+		_ = returnError(r, &icmpReasonPortUnreachable{}, pkt)
+	default:
+		panic(fmt.Sprintf("unrecognized result from DeliverTransportPacket = %d", res))
+	}
 }
 
 // Close cleans up resources associated with the endpoint.
@@ -567,7 +579,7 @@ func hashRoute(r *stack.Route, protocol tcpip.TransportProtocolNumber, hashIV ui
 }
 
 // NewProtocol returns an IPv4 network protocol.
-func NewProtocol() stack.NetworkProtocol {
+func NewProtocol(*stack.Stack) stack.NetworkProtocol {
 	ids := make([]uint32, buckets)
 
 	// Randomly initialize hashIV and the ids.

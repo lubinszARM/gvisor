@@ -51,6 +51,8 @@ import (
 const Name = "overlay"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -60,6 +62,8 @@ func (FilesystemType) Name() string {
 
 // FilesystemOptions may be passed as vfs.GetFilesystemOptions.InternalData to
 // FilesystemType.GetFilesystem.
+//
+// +stateify savable
 type FilesystemOptions struct {
 	// Callers passing FilesystemOptions to
 	// overlay.FilesystemType.GetFilesystem() are responsible for ensuring that
@@ -76,6 +80,8 @@ type FilesystemOptions struct {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
@@ -98,7 +104,7 @@ type filesystem struct {
 	// renameMu synchronizes renaming with non-renaming operations in order to
 	// ensure consistent lock ordering between dentry.dirMu in different
 	// dentries.
-	renameMu sync.RWMutex
+	renameMu sync.RWMutex `state:"nosave"`
 
 	// lastDirIno is the last inode number assigned to a directory. lastDirIno
 	// is accessed using atomic memory operations.
@@ -367,6 +373,8 @@ func (fs *filesystem) newDirIno() uint64 {
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -399,7 +407,7 @@ type dentry struct {
 	// and dirents (if not nil) is a cache of dirents as returned by
 	// directoryFDs representing this directory. children is protected by
 	// dirMu.
-	dirMu    sync.Mutex
+	dirMu    sync.Mutex `state:"nosave"`
 	children map[string]*dentry
 	dirents  []vfs.Dirent
 
@@ -409,7 +417,7 @@ type dentry struct {
 	// If !upperVD.Ok(), it can transition to a valid vfs.VirtualDentry (i.e.
 	// be copied up) with copyMu locked for writing; otherwise, it is
 	// immutable. lowerVDs is always immutable.
-	copyMu   sync.RWMutex
+	copyMu   sync.RWMutex `state:"nosave"`
 	upperVD  vfs.VirtualDentry
 	lowerVDs []vfs.VirtualDentry
 
@@ -454,6 +462,13 @@ type dentry struct {
 	isMappable      uint32
 
 	locks vfs.FileLocks
+
+	// watches is the set of inotify watches on the file repesented by this dentry.
+	//
+	// Note that hard links to the same file will not share the same set of
+	// watches, due to the fact that we do not have inode structures in this
+	// overlay implementation.
+	watches vfs.Watches
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -513,6 +528,14 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 	if atomic.LoadInt64(&d.refs) != 0 {
 		return
 	}
+
+	// Make sure that we do not lose watches on dentries that have not been
+	// deleted. Note that overlayfs never calls VFS.InvalidateDentry(), so
+	// d.vfsd.IsDead() indicates that d was deleted.
+	if !d.vfsd.IsDead() && d.watches.Size() > 0 {
+		return
+	}
+
 	// Refs is still zero; destroy it.
 	d.destroyLocked(ctx)
 	return
@@ -541,6 +564,8 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		lowerVD.DecRef(ctx)
 	}
 
+	d.watches.HandleDeletion(ctx)
+
 	if d.parent != nil {
 		d.parent.dirMu.Lock()
 		if !d.vfsd.IsDead() {
@@ -559,19 +584,36 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
 func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie uint32, et vfs.EventType) {
-	// TODO(gvisor.dev/issue/1479): Implement inotify.
+	if d.isDir() {
+		events |= linux.IN_ISDIR
+	}
+
+	// overlayfs never calls VFS.InvalidateDentry(), so d.vfsd.IsDead() indicates
+	// that d was deleted.
+	deleted := d.vfsd.IsDead()
+
+	d.fs.renameMu.RLock()
+	// The ordering below is important, Linux always notifies the parent first.
+	if d.parent != nil {
+		d.parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
+	}
+	d.watches.Notify(ctx, "", events, cookie, et, deleted)
+	d.fs.renameMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
-	// TODO(gvisor.dev/issue/1479): Implement inotify.
-	return nil
+	return &d.watches
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
-func (d *dentry) OnZeroWatches(context.Context) {}
+func (d *dentry) OnZeroWatches(ctx context.Context) {
+	if atomic.LoadInt64(&d.refs) == 0 {
+		d.fs.renameMu.Lock()
+		d.checkDropLocked(ctx)
+		d.fs.renameMu.Unlock()
+	}
+}
 
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
 // any call to yield returns false, iterLayer stops iteration.
@@ -652,6 +694,8 @@ func (d *dentry) updateAfterSetStatLocked(opts *vfs.SetStatOptions) {
 
 // fileDescription is embedded by overlay implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -679,17 +723,33 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	fs := fd.filesystem()
+	d := fd.dentry()
+
 	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
-	return fs.setXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
+	err := fs.setXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
+	fs.renameMu.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	fs := fd.filesystem()
+	d := fd.dentry()
+
 	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
-	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
+	err := fs.removeXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
+	fs.renameMu.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.

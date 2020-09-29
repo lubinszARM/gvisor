@@ -144,10 +144,7 @@ type TCPReceiverState struct {
 
 	// PendingBufUsed is the number of bytes pending in the receive
 	// queue.
-	PendingBufUsed seqnum.Size
-
-	// PendingBufSize is the size of the socket receive buffer.
-	PendingBufSize seqnum.Size
+	PendingBufUsed int
 }
 
 // TCPSenderState holds a copy of the internal state of the sender for
@@ -520,13 +517,25 @@ type UniqueID interface {
 	UniqueID() uint64
 }
 
+// NetworkProtocolFactory instantiates a network protocol.
+//
+// NetworkProtocolFactory must not attempt to modify the stack, it may only
+// query the stack.
+type NetworkProtocolFactory func(*Stack) NetworkProtocol
+
+// TransportProtocolFactory instantiates a transport protocol.
+//
+// TransportProtocolFactory must not attempt to modify the stack, it may only
+// query the stack.
+type TransportProtocolFactory func(*Stack) TransportProtocol
+
 // Options contains optional Stack configuration.
 type Options struct {
 	// NetworkProtocols lists the network protocols to enable.
-	NetworkProtocols []NetworkProtocol
+	NetworkProtocols []NetworkProtocolFactory
 
 	// TransportProtocols lists the transport protocols to enable.
-	TransportProtocols []TransportProtocol
+	TransportProtocols []TransportProtocolFactory
 
 	// Clock is an optional clock source used for timestampping packets.
 	//
@@ -758,7 +767,8 @@ func New(opts Options) *Stack {
 	s.forwarding.protocols = make(map[tcpip.NetworkProtocolNumber]bool)
 
 	// Add specified network protocols.
-	for _, netProto := range opts.NetworkProtocols {
+	for _, netProtoFactory := range opts.NetworkProtocols {
+		netProto := netProtoFactory(s)
 		s.networkProtocols[netProto.Number()] = netProto
 		if r, ok := netProto.(LinkAddressResolver); ok {
 			s.linkAddrResolvers[r.LinkAddressProtocol()] = r
@@ -766,7 +776,8 @@ func New(opts Options) *Stack {
 	}
 
 	// Add specified transport protocols.
-	for _, transProto := range opts.TransportProtocols {
+	for _, transProtoFactory := range opts.TransportProtocols {
+		transProto := transProtoFactory(s)
 		s.transportProtocols[transProto.Number()] = &transportProtocolState{
 			proto: transProto,
 		}

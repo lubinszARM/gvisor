@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// +stateify savable
 type filesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -43,6 +44,7 @@ func (filesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFile
 	panic("pipefs.filesystemType.GetFilesystem should never be called")
 }
 
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -76,6 +78,8 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // inode implements kernfs.Inode.
+//
+// +stateify savable
 type inode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
@@ -144,8 +148,8 @@ func (i *inode) SetStat(ctx context.Context, vfsfs *vfs.Filesystem, creds *auth.
 }
 
 // Open implements kernfs.Inode.Open.
-func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	return i.pipe.Open(ctx, rp.Mount(), vfsd, opts.Flags, &i.locks)
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	return i.pipe.Open(ctx, rp.Mount(), d.VFSDentry(), opts.Flags, &i.locks)
 }
 
 // StatFS implements kernfs.Inode.StatFS.

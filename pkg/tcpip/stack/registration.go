@@ -125,6 +125,26 @@ type PacketEndpoint interface {
 	HandlePacket(nicID tcpip.NICID, addr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 }
 
+// UnknownDestinationPacketDisposition enumerates the possible return vaues from
+// HandleUnknownDestinationPacket().
+type UnknownDestinationPacketDisposition int
+
+const (
+	// UnknownDestinationPacketMalformed denotes that the packet was malformed
+	// and no further processing should be attempted other than updating
+	// statistics.
+	UnknownDestinationPacketMalformed UnknownDestinationPacketDisposition = iota
+
+	// UnknownDestinationPacketUnhandled tells the caller that the packet was
+	// well formed but that the issue was not handled and the stack should take
+	// the default action.
+	UnknownDestinationPacketUnhandled
+
+	// UnknownDestinationPacketHandled tells the caller that it should do
+	// no further processing.
+	UnknownDestinationPacketHandled
+)
+
 // TransportProtocol is the interface that needs to be implemented by transport
 // protocols (e.g., tcp, udp) that want to be part of the networking stack.
 type TransportProtocol interface {
@@ -147,14 +167,12 @@ type TransportProtocol interface {
 	ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error)
 
 	// HandleUnknownDestinationPacket handles packets targeted at this
-	// protocol but that don't match any existing endpoint. For example,
-	// it is targeted at a port that have no listeners.
+	// protocol that don't match any existing endpoint. For example,
+	// it is targeted at a port that has no listeners.
 	//
-	// The return value indicates whether the packet was well-formed (for
-	// stats purposes only).
-	//
-	// HandleUnknownDestinationPacket takes ownership of pkt.
-	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) bool
+	// HandleUnknownDestinationPacket takes ownership of pkt if it handles
+	// the issue.
+	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) UnknownDestinationPacketDisposition
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
@@ -179,6 +197,21 @@ type TransportProtocol interface {
 	Parse(pkt *PacketBuffer) (ok bool)
 }
 
+// TransportPacketDisposition is the result from attempting to deliver a packet
+// to the transport layer.
+type TransportPacketDisposition int
+
+const (
+	// TransportPacketHandled indicates that a transport packet was handled by the
+	// transport layer and callers need not take any further action.
+	TransportPacketHandled TransportPacketDisposition = iota
+
+	// TransportPacketDestinationPortUnreachable indicates that there weren't any
+	// listeners interested in the packet and the transport protocol has no means
+	// to notify the sender.
+	TransportPacketDestinationPortUnreachable
+)
+
 // TransportDispatcher contains the methods used by the network stack to deliver
 // packets to the appropriate transport endpoint after it has been handled by
 // the network layer.
@@ -189,7 +222,7 @@ type TransportDispatcher interface {
 	// pkt.NetworkHeader must be set before calling DeliverTransportPacket.
 	//
 	// DeliverTransportPacket takes ownership of pkt.
-	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer)
+	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition
 
 	// DeliverTransportControlPacket delivers control packets to the
 	// appropriate transport protocol endpoint.
