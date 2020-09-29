@@ -50,7 +50,7 @@ type Hooks interface {
 	// This must be go:nosplit, as this will be on the interrupt stack.
 	// Closures are permitted, as the pointer to the closure frame is not
 	// passed on the stack.
-	KernelException(Vector)
+	KernelException()
 }
 
 // CPU is the per-CPU struct.

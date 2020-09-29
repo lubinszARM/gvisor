@@ -104,12 +104,12 @@ func (c *vCPU) KernelSyscall() {
 // +checkescape:all
 //
 //go:nosplit
-func (c *vCPU) KernelException(vector ring0.Vector) {
-	regs := c.Registers()
-	if vector == ring0.Vector(bounce) {
-		regs.Pc = 0
-	}
-
+func (c *vCPU) KernelException() {
+	//regs := c.Registers()
+	/*	if vector == ring0.Vector(bounce) {
+			regs.Pc = 0
+		}
+	*/
 	vfpEnable := ring0.CPACREL1()
 	if vfpEnable != 0 {
 		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))

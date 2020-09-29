@@ -38,6 +38,7 @@ begin:
 	MOVD	vcpu+0(FP), R8
 	MOVD	$VCPU_CPU(R8), R9
 	ORR	$0xffff000000000000, R9, R9
+	MRS TPIDR_EL0, R18_PLATFORM
 	// Trigger sigill.
 	// In ring0.Start(), the value of R8 will be stored into tpidr_el1.
 	// When the context was loaded into vcpu successfully,
@@ -73,6 +74,7 @@ TEXT ·sighandler(SB),NOSPLIT,$0
 	MOVD	R2, 8(RSP)
 	BL	·bluepillHandler(SB)   // Call the handler.
 
+	MSR R18_PLATFORM, TPIDR_EL0
 	RET
 
 fallback:

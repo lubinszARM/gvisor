@@ -47,8 +47,9 @@
 #define SCTLR_C         1 << 2
 #define SCTLR_I         1 << 12
 #define SCTLR_UCT       1 << 15
+#define SCTLR_UCI       1 << 26
 
-#define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT)
+#define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT | SCTLR_UCI)
 
 // cntkctl_el1: counter-timer kernel control register el1.
 #define CNTKCTL_EL0PCTEN 	1 << 0
@@ -306,7 +307,6 @@
 	MOVD CPU_APP_ASID(from), R1; \
 	BFI $48, R1, $16, R0; \
 	MSR R0, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
-	ISB $15; \
 	MOVD CPU_TTBR0_APP(from), RSV_REG; \
 	MSR RSV_REG, TTBR0_EL1;
 
@@ -316,7 +316,6 @@
 	MOVD $1, R1; \
 	BFI $48, R1, $16, R0; \
 	MSR R0, TTBR1_EL1; \
-	ISB $15; \
 	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
 	MSR RSV_REG, TTBR0_EL1;
 
@@ -342,6 +341,8 @@
 	ADD $16, RSP, RSP; \
 	MOVD RSV_REG, PTRACE_R18(R20); \
 	MOVD RSV_REG_APP, PTRACE_R9(R20); \
+	MRS TPIDR_EL0, R3; \
+	MOVD R3, PTRACE_TLS(R20); \
 	WORD $0xd5384003; \      //  MRS SPSR_EL1, R3
 	MOVD R3, PTRACE_PSTATE(R20); \
 	MRS ELR_EL1, R3; \
@@ -354,13 +355,15 @@
 	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
 	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \	// Save sentry context.
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG); \
+	MRS TPIDR_EL0, R4; \
+	MOVD R4, CPU_REGISTERS+PTRACE_TLS(RSV_REG); \
 	WORD $0xd5384004; \    //    MRS SPSR_EL1, R4
 	MOVD R4, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG); \
 	MRS ELR_EL1, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_PC(RSV_REG); \
 	MOVD RSP, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG); \
-	LOAD_KERNEL_STACK(RSV_REG);  // Load the temporary stack.
+	LOAD_KERNEL_STACK(RSV_REG); // Load the temporary stack.
 
 // storeAppASID writes the application's asid value.
 TEXT ·storeAppASID(SB),NOSPLIT,$0-8
@@ -376,15 +379,17 @@ TEXT ·Halt(SB),NOSPLIT,$0
 	CMP RSV_REG, R9
 	BNE mmio_exit
 	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
+MRS TPIDR_EL0, R9
+MOVD R9, CPU_REGISTERS+PTRACE_TLS(RSV_REG)
 
 	// Flush dcache.
-	WORD $0xd5087e52   // DC CISW
+//	WORD $0xd5087e52   // DC CISW
 mmio_exit:
 	// Disable fpsimd.
 	WORD $0xd5381041 // MRS CPACR_EL1, R1
 	MOVD R1, CPU_LAZY_VFP(RSV_REG)
-	VFP_DISABLE
-
+//	VFP_DISABLE
+//MRS TPIDR_EL0, RSV_REG
 	// Trigger MMIO_EXIT/_KVM_HYPERCALL_VMEXIT.
 	//
 	// To keep it simple, I used the address of exception table as the
@@ -397,7 +402,7 @@ mmio_exit:
 	MOVD R0, 0x0(R9)
 
 	// Flush dcahce.
-	WORD $0xd5087e52  // DC CISW
+//	WORD $0xd5087e52  // DC CISW
 
 	RET
 
@@ -413,6 +418,14 @@ TEXT ·HaltEl1SvcAndResume(SB),NOSPLIT,$0
 	MOVD R3, 8(RSP)             // First argument (vCPU).
 	CALL ·kernelSyscall(SB)     // Call the trampoline.
 	B ·kernelExitToEl1(SB)      // Resume.
+
+// HaltEl1SvcAndResume calls Hooks.KernelSyscall and resume.
+TEXT ·HaltEl1DAAndResume(SB),NOSPLIT,$0
+        WORD $0xd538d092            // MRS TPIDR_EL1, R18
+        MOVD CPU_SELF(RSV_REG), R3  // Load vCPU.
+        MOVD R3, 8(RSP)             // First argument (vCPU).
+        CALL ·kernelException(SB)     // Call the trampoline.
+        B ·kernelExitToEl1(SB)      // Resume.
 
 // Shutdown stops the guest.
 TEXT ·Shutdown(SB),NOSPLIT,$0
@@ -435,7 +448,8 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	MRS TPIDR_EL1, RSV_REG
 	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS)
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG)
-
+	MRS TPIDR_EL0, R3
+	MOVD R3, CPU_REGISTERS+PTRACE_TLS(RSV_REG)
 	WORD $0xd5384003    //    MRS SPSR_EL1, R3
 	MOVD R3, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG)
 	MOVD R30, CPU_REGISTERS+PTRACE_PC(RSV_REG)
@@ -461,10 +475,19 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	MOVD PTRACE_PSTATE(RSV_REG_APP), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
 
+	// need use kernel space address to excute below code, since
+	// after SWITCH_TO_APP_PAGETABLE the ASID is changed to app's
+	// ASID.
+	WORD $0x10000061		// ADR R1, do_exit_to_el0
+	ORR $0xffff000000000000, R1, R1
+	JMP (R1)
+do_exit_to_el0:
 	// RSV_REG & RSV_REG_APP will be loaded at the end.
 	REGISTERS_LOAD(RSV_REG_APP, 0)
 
 	// switch to user pagetable.
+	MOVD PTRACE_TLS(RSV_REG_APP), RSV_REG
+	MSR RSV_REG, TPIDR_EL0
 	MOVD PTRACE_R18(RSV_REG_APP), RSV_REG
 	MOVD PTRACE_R9(RSV_REG_APP), RSV_REG_APP
 
@@ -485,6 +508,8 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 // kernelExitToEl1 is the entrypoint for sentry in guest_el1.
 // Prepare the vcpu environment for sentry.
 TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
+	MSR RSV_REG, TPIDR_EL0
+
 	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
 	MOVD CPU_REGISTERS+PTRACE_PSTATE(RSV_REG), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
@@ -499,6 +524,9 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 	MRS TPIDR_EL1, RSV_REG
 
 	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
+	MOVD CPU_REGISTERS+PTRACE_TLS(RSV_REG), RSV_REG_APP
+	MSR RSV_REG_APP, TPIDR_EL0
+
 	MOVD CPU_REGISTERS+PTRACE_R9(RSV_REG), RSV_REG_APP
 
 	ERET()
@@ -563,7 +591,7 @@ TEXT ·El1_sync(SB),NOSPLIT,$0
 
 el1_da:
 el1_ia:
-	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+/*	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
 	WORD $0xd538601a     //MRS   FAR_EL1, R26
 
 	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
@@ -574,11 +602,31 @@ el1_ia:
 	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
 
 	B ·HaltAndResume(SB)
+*/
 
+
+	        MOVD $0, CPU_ERROR_CODE(RSV_REG)
+        MOVD $0, CPU_ERROR_TYPE(RSV_REG)
+        B ·HaltEl1DAAndResume(SB)
+
+/*
+el1_ia:
+        WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+        WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+	MOVD $0x3000, R9
+	WFI
+*/
 el1_sp_pc:
+        MOVD $0x301, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el1_undef:
+        MOVD $0x302, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el1_svc:
@@ -587,6 +635,9 @@ el1_svc:
 	B ·HaltEl1SvcAndResume(SB)
 
 el1_dbg:
+        MOVD $0x303, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el1_fpsimd_acc:
@@ -594,6 +645,9 @@ el1_fpsimd_acc:
 	B ·kernelExitToEl1(SB)  // Resume.
 
 el1_invalid:
+        MOVD $0x304, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 // El1_irq is the handler for El1_irq.
@@ -606,6 +660,9 @@ TEXT ·El1_fiq(SB),NOSPLIT,$0
 
 // El1_error is the handler for El1_error.
 TEXT ·El1_error(SB),NOSPLIT,$0
+        MOVD $0x500, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 // El0_sync is the handler for El0_sync.
@@ -665,29 +722,66 @@ el0_ia:
 	MOVD R3, CPU_ERROR_CODE(RSV_REG)
 
 	B ·kernelExitToEl1(SB)
+/*
+el0_ia:
+        WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+        WORD $0xd538601a     //MRS   FAR_EL1, R26
+
+        MOVD R26, CPU_FAULT_ADDR(RSV_REG)
+
+        MOVD $0, CPU_ERROR_TYPE(RSV_REG)
+
+        MOVD $El0Sync_undef, R3
+        MOVD R3, CPU_VECTOR_CODE(RSV_REG)
+
+        B ·kernelExitToEl1(SB)
+*/
+//        MOVD $0x400, R9
+//        WFI
 
 el0_fpsimd_acc:
+        MOVD $0x401, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el0_sve_acc:
+        MOVD $0x402, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el0_fpsimd_exc:
+        MOVD $0x403, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el0_sp_pc:
+        MOVD $0x404, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el0_undef:
+//        MOVD $0x405, R9
+//        WFI
+
 	MOVD $El0Sync_undef, R3
 	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
 
 	B ·kernelExitToEl1(SB)
 
 el0_dbg:
+        MOVD $0x406, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 el0_invalid:
+        MOVD $0x407, R9
+        WFI
+
 	B ·Shutdown(SB)
 
 TEXT ·El0_irq(SB),NOSPLIT,$0

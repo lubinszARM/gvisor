@@ -73,7 +73,12 @@ func (c *vCPU) initArchState() error {
 	// cpacr_el1
 	reg.id = _KVM_ARM64_REGS_CPACR_EL1
 	// It is off by default, and it is turned on only when in use.
-	data = 0 // Disable fpsimd.
+	//	data = 0 // Disable fpsimd.
+	//	#define FPEN_NOTRAP     0x3
+	//#define FPEN_SHIFT      20
+
+	//#define FPEN_ENABLE (FPEN_NOTRAP << FPEN_SHIFT)
+	data = 0x3 << 20
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}

@@ -43,7 +43,7 @@ func (defaultHooks) KernelSyscall() {
 // +checkescape:all
 //
 //go:nosplit
-func (defaultHooks) KernelException(Vector) {
+func (defaultHooks) KernelException() {
 	Halt()
 }
 
@@ -61,8 +61,8 @@ func kernelSyscall(c *CPU) {
 // +checkescape:hard,stack
 //
 //go:nosplit
-func kernelException(c *CPU, vector Vector) {
-	c.hooks.KernelException(vector)
+func kernelException(c *CPU) {
+	c.hooks.KernelException()
 }
 
 // Init initializes a new CPU.

@@ -169,10 +169,11 @@ func computePhysicalRegions(excludedRegions []region) (physicalRegions []physica
 	addValidRegion(lastExcludedEnd, ring0.MaximumUserAddress-lastExcludedEnd)
 
 	// Dump our all physical regions.
-	for _, r := range physicalRegions {
+/*	for _, r := range physicalRegions {
 		log.Infof("physicalRegion: virtual [%x,%x) => physical [%x,%x)",
 			r.virtual, r.virtual+r.length, r.physical, r.physical+r.length)
 	}
+*/
 	return physicalRegions
 }
 

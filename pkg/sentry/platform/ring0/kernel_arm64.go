@@ -24,6 +24,9 @@ func HaltAndResume()
 //go:nosplit
 func HaltEl1SvcAndResume()
 
+//go:nosplit
+func HaltEl1DAAndResume()
+
 // init initializes architecture-specific state.
 func (k *Kernel) init(opts KernelOpts) {
 	// Save the root page tables.
@@ -55,7 +58,8 @@ func IsCanonical(addr uint64) bool {
 func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	storeAppASID(uintptr(switchOpts.UserASID))
 	if switchOpts.Flush {
-		FlushTlbAll()
+	//	FlushTlbAll()
+		FlushTlbByASID(uintptr(switchOpts.UserASID))
 	}
 
 	regs := switchOpts.Registers
@@ -64,11 +68,15 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	regs.Pstate |= UserFlagsSet
 
 	LoadFloatingPoint(switchOpts.FloatingPointState)
-	SetTLS(regs.TPIDR_EL0)
+
+	//	oldTls := GetTLS()
+	//	SetTLS(regs.TPIDR_EL0)
 
 	kernelExitToEl0()
 
-	regs.TPIDR_EL0 = GetTLS()
+	//	regs.TPIDR_EL0 = GetTLS()
+	//	SetTLS(oldTls)
+
 	SaveFloatingPoint(switchOpts.FloatingPointState)
 
 	vector = c.vecCode
