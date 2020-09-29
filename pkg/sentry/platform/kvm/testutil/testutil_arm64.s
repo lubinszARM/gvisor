@@ -56,9 +56,14 @@ TEXT ·FloatingPointWorks(SB),NOSPLIT,$0-8
 	// such as in <runtime.deductSweepCredit>.
 	FMOVD $(9.9), F0
 	MOVD $SYS_GETPID, R8 // getpid
+	MOVD $0x9876, R1
+	MSR R1, TPIDR_EL0
 	SVC
 	FMOVD $(9.9), F1
 	FCMPD F0, F1
+	BNE isNaN
+	MRS TPIDR_EL0, R2
+	CMP R1, R2
 	BNE isNaN
 	MOVD $1, R0
 	MOVD R0, ret+0(FP)

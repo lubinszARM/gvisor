@@ -31,6 +31,12 @@
 #define SIGINFO_SIGNO 0x0
 #define CONTEXT_PC  0x1B8
 #define CONTEXT_R0 0xB8
+#define CONTEXT_R18 0x140
+
+TEXT ·SetTLS(SB),NOSPLIT,$0-8
+        MOVD addr+0(FP), R1
+        MSR R1, TPIDR_EL0
+        RET
 
 // See bluepill.go.
 TEXT ·bluepill(SB),NOSPLIT,$0
@@ -38,6 +44,10 @@ begin:
 	MOVD	vcpu+0(FP), R8
 	MOVD	$VCPU_CPU(R8), R9
 	ORR	$0xffff000000000000, R9, R9
+	MRS TPIDR_EL0, R18_PLATFORM
+//	MOVD $0x1234, R18_PLATFORM
+//	MSR R6, TPIDR_EL0
+//	MRS TPIDR_EL0, R6
 	// Trigger sigill.
 	// In ring0.Start(), the value of R8 will be stored into tpidr_el1.
 	// When the context was loaded into vcpu successfully,
@@ -72,6 +82,8 @@ TEXT ·sighandler(SB),NOSPLIT,$0
 
 	MOVD	R2, 8(RSP)
 	BL	·bluepillHandler(SB)   // Call the handler.
+//	MSR R18_PLATFORM, TPIDR_EL0
+//MRS TPIDR_EL0, R11
 
 	RET
 

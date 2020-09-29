@@ -39,6 +39,9 @@ var (
 	}
 )
 
+// SetTLS writes the TPIDR_EL0 value.
+func SetTLS(value uint64)
+
 // bluepillArchEnter is called during bluepillEnter.
 //
 //go:nosplit
@@ -65,6 +68,7 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	context.Pstate = regs.Pstate
 	context.Pstate &^= uint64(ring0.PsrFlagsClear)
 	context.Pstate |= ring0.UserFlagsSet
+	SetTLS(uint64(regs.Regs[18]))
 
 	lazyVfp := c.GetLazyVFP()
 	if lazyVfp != 0 {
