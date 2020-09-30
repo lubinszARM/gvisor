@@ -198,7 +198,6 @@ var Metrics = tcpip.Stats{
 		PacketsSent:              mustCreateMetric("/netstack/udp/packets_sent", "Number of UDP datagrams sent."),
 		PacketSendErrors:         mustCreateMetric("/netstack/udp/packet_send_errors", "Number of UDP datagrams failed to be sent."),
 		ChecksumErrors:           mustCreateMetric("/netstack/udp/checksum_errors", "Number of UDP datagrams dropped due to bad checksums."),
-		InvalidSourceAddress:     mustCreateMetric("/netstack/udp/invalid_source", "Number of UDP datagrams dropped due to invalid source address."),
 	},
 }
 
@@ -1718,6 +1717,26 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, err
 		}
 		return &entries, nil
+
+	case linux.IPT_SO_GET_REVISION_TARGET:
+		if outLen < linux.SizeOfXTGetRevision {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		// Only valid for raw IPv4 sockets.
+		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
+			return nil, syserr.ErrProtocolNotAvailable
+		}
+
+		stack := inet.StackFromContext(t)
+		if stack == nil {
+			return nil, syserr.ErrNoDevice
+		}
+		ret, err := netfilter.TargetRevision(t, outPtr, header.IPv4ProtocolNumber)
+		if err != nil {
+			return nil, err
+		}
+		return &ret, nil
 
 	default:
 		emitUnimplementedEventIP(t, name)
