@@ -1289,7 +1289,7 @@ func (ndp *ndpState) generateSLAACAddr(prefix tcpip.Subnet, state *slaacPrefixSt
 			//
 			// TODO(b/141011931): Validate a LinkEndpoint's link address (provided by
 			// LinkEndpoint.LinkAddress) before reaching this point.
-			linkAddr := ndp.ep.linkEP.LinkAddress()
+			linkAddr := ndp.ep.nic.LinkAddress()
 			if !header.IsValidUnicastEthernetAddress(linkAddr) {
 				return false
 			}
@@ -1891,7 +1891,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 		// As per RFC 4861 section 4.1, the source of the RS is an address assigned
 		// to the sending interface, or the unspecified address if no address is
 		// assigned to the sending interface.
-		addressEndpoint := ndp.ep.acquirePrimaryAddressRLocked(header.IPv6AllRoutersMulticastAddress, false)
+		addressEndpoint := ndp.ep.acquireOutgoingPrimaryAddressRLocked(header.IPv6AllRoutersMulticastAddress, false)
 		if addressEndpoint == nil {
 			// Incase this ends up creating a new temporary address, we need to hold
 			// onto the endpoint until a route is obtained. If we decrement the

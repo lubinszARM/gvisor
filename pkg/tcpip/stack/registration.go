@@ -208,6 +208,10 @@ const (
 	// transport layer and callers need not take any further action.
 	TransportPacketHandled TransportPacketDisposition = iota
 
+	// TransportPacketProtocolUnreachable indicates that the transport
+	// protocol requested in the packet is not supported.
+	TransportPacketProtocolUnreachable
+
 	// TransportPacketDestinationPortUnreachable indicates that there weren't any
 	// listeners interested in the packet and the transport protocol has no means
 	// to notify the sender.
@@ -322,10 +326,6 @@ const (
 // AssignableAddressEndpoint is a reference counted address endpoint that may be
 // assigned to a NetworkEndpoint.
 type AssignableAddressEndpoint interface {
-	// NetworkEndpoint returns the NetworkEndpoint the receiver is associated
-	// with.
-	NetworkEndpoint() NetworkEndpoint
-
 	// AddressWithPrefix returns the endpoint's address.
 	AddressWithPrefix() tcpip.AddressWithPrefix
 
@@ -435,7 +435,10 @@ type AddressableEndpoint interface {
 	// permanent address.
 	RemovePermanentAddress(addr tcpip.Address) *tcpip.Error
 
-	// AcquireAssignedAddress returns an AddressEndpoint for the passed address
+	// MainAddress returns the endpoint's primary permanent address.
+	MainAddress() tcpip.AddressWithPrefix
+
+	// AcquireAssignedAddress returns an address endpoint for the passed address
 	// that is considered bound to the endpoint, optionally creating a temporary
 	// endpoint if requested and no existing address exists.
 	//
@@ -444,15 +447,15 @@ type AddressableEndpoint interface {
 	// Returns nil if the specified address is not local to this endpoint.
 	AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB PrimaryEndpointBehavior) AddressEndpoint
 
-	// AcquirePrimaryAddress returns a primary endpoint to use when communicating
-	// with the passed remote address.
+	// AcquireOutgoingPrimaryAddress returns a primary address that may be used as
+	// a source address when sending packets to the passed remote address.
 	//
 	// If allowExpired is true, expired addresses may be returned.
 	//
 	// The returned endpoint's reference count is incremented.
 	//
-	// Returns nil if a primary endpoint is not available.
-	AcquirePrimaryAddress(remoteAddr tcpip.Address, allowExpired bool) AddressEndpoint
+	// Returns nil if a primary address is not available.
+	AcquireOutgoingPrimaryAddress(remoteAddr tcpip.Address, allowExpired bool) AddressEndpoint
 
 	// PrimaryAddresses returns the primary addresses.
 	PrimaryAddresses() []tcpip.AddressWithPrefix
@@ -472,6 +475,8 @@ type NDPEndpoint interface {
 
 // NetworkInterface is a network interface.
 type NetworkInterface interface {
+	NetworkLinkEndpoint
+
 	// ID returns the interface's ID.
 	ID() tcpip.NICID
 
@@ -485,9 +490,6 @@ type NetworkInterface interface {
 
 	// Enabled returns true if the interface is enabled.
 	Enabled() bool
-
-	// LinkEndpoint returns the link endpoint backing the interface.
-	LinkEndpoint() LinkEndpoint
 }
 
 // NetworkEndpoint is the interface that needs to be implemented by endpoints
@@ -660,21 +662,14 @@ const (
 	CapabilitySoftwareGSO
 )
 
-// LinkEndpoint is the interface implemented by data link layer protocols (e.g.,
-// ethernet, loopback, raw) and used by network layer protocols to send packets
-// out through the implementer's data link endpoint. When a link header exists,
-// it sets each PacketBuffer's LinkHeader field before passing it up the
-// stack.
-type LinkEndpoint interface {
+// NetworkLinkEndpoint is a data-link layer that supports sending network
+// layer packets.
+type NetworkLinkEndpoint interface {
 	// MTU is the maximum transmission unit for this endpoint. This is
 	// usually dictated by the backing physical network; when such a
 	// physical network doesn't exist, the limit is generally 64k, which
 	// includes the maximum size of an IP packet.
 	MTU() uint32
-
-	// Capabilities returns the set of capabilities supported by the
-	// endpoint.
-	Capabilities() LinkEndpointCapabilities
 
 	// MaxHeaderLength returns the maximum size the data link (and
 	// lower level layers combined) headers can have. Higher levels use this
@@ -683,7 +678,7 @@ type LinkEndpoint interface {
 	MaxHeaderLength() uint16
 
 	// LinkAddress returns the link address (typically a MAC) of the
-	// link endpoint.
+	// endpoint.
 	LinkAddress() tcpip.LinkAddress
 
 	// WritePacket writes a packet with the given protocol through the
@@ -703,6 +698,19 @@ type LinkEndpoint interface {
 	// offload is enabled. If it will be used for something else, it may
 	// require to change syscall filters.
 	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
+}
+
+// LinkEndpoint is the interface implemented by data link layer protocols (e.g.,
+// ethernet, loopback, raw) and used by network layer protocols to send packets
+// out through the implementer's data link endpoint. When a link header exists,
+// it sets each PacketBuffer's LinkHeader field before passing it up the
+// stack.
+type LinkEndpoint interface {
+	NetworkLinkEndpoint
+
+	// Capabilities returns the set of capabilities supported by the
+	// endpoint.
+	Capabilities() LinkEndpointCapabilities
 
 	// WriteRawPacket writes a packet directly to the link. The packet
 	// should already have an ethernet header. It takes ownership of vv.
