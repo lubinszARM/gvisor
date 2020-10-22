@@ -190,29 +190,6 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 	return e.protocol.Number()
 }
 
-// writePacketFragments fragments pkt and writes the results on the link
-// endpoint. The IP header must already present in the original packet. The mtu
-// is the maximum size of the packets.
-func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu uint32, pkt *stack.PacketBuffer) *tcpip.Error {
-	networkHeader := header.IPv4(pkt.NetworkHeader().View())
-	fragMTU := int(calculateFragmentInnerMTU(mtu, pkt))
-	pf := fragmentation.MakePacketFragmenter(pkt, fragMTU, pkt.AvailableHeaderBytes()+len(networkHeader))
-
-	for {
-		fragPkt, more := buildNextFragment(&pf, networkHeader)
-		if err := e.nic.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
-			r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pf.RemainingFragmentCount() + 1))
-			return err
-		}
-		r.Stats().IP.PacketsSent.Increment()
-		if !more {
-			break
-		}
-	}
-
-	return nil
-}
-
 func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
 	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
 	length := uint16(pkt.Size())
@@ -234,10 +211,39 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 	pkt.NetworkProtocolNumber = ProtocolNumber
 }
 
+func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
+	return (gso == nil || gso.Type == stack.GSONone) && pkt.Size() > int(e.nic.MTU())
+}
+
+// handleFragments fragments pkt and calls the handler function on each
+// fragment. It returns the number of fragments handled and the number of
+// fragments left to be processed. The IP header must already be present in the
+// original packet. The mtu is the maximum size of the packets.
+func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, mtu uint32, pkt *stack.PacketBuffer, handler func(*stack.PacketBuffer) *tcpip.Error) (int, int, *tcpip.Error) {
+	fragMTU := int(calculateFragmentInnerMTU(mtu, pkt))
+	networkHeader := header.IPv4(pkt.NetworkHeader().View())
+	pf := fragmentation.MakePacketFragmenter(pkt, fragMTU, pkt.AvailableHeaderBytes()+len(networkHeader))
+
+	var n int
+	for {
+		fragPkt, more := buildNextFragment(&pf, networkHeader)
+		if err := handler(fragPkt); err != nil {
+			return n, pf.RemainingFragmentCount() + 1, err
+		}
+		n++
+		if !more {
+			return n, pf.RemainingFragmentCount(), nil
+		}
+	}
+}
+
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
 	e.addIPHeader(r, pkt, params)
+	return e.writePacket(r, gso, pkt)
+}
 
+func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.PacketBuffer) *tcpip.Error {
 	// iptables filtering. All packets that reach here are locally
 	// generated.
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
@@ -273,8 +279,18 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	if r.Loop&stack.PacketOut == 0 {
 		return nil
 	}
-	if pkt.Size() > int(e.nic.MTU()) && (gso == nil || gso.Type == stack.GSONone) {
-		return e.writePacketFragments(r, gso, e.nic.MTU(), pkt)
+
+	if e.packetMustBeFragmented(pkt, gso) {
+		sent, remain, err := e.handleFragments(r, gso, e.nic.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
+			// fragment one by one using WritePacket() (current strategy) or if we
+			// want to create a PacketBufferList from the fragments and feed it to
+			// WritePackets(). It'll be faster but cost more memory.
+			return e.nic.WritePacket(r, gso, ProtocolNumber, fragPkt)
+		})
+		r.Stats().IP.PacketsSent.IncrementBy(uint64(sent))
+		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(remain))
+		return err
 	}
 	if err := e.nic.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
@@ -293,9 +309,23 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		return pkts.Len(), nil
 	}
 
-	for pkt := pkts.Front(); pkt != nil; {
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		e.addIPHeader(r, pkt, params)
-		pkt = pkt.Next()
+		if e.packetMustBeFragmented(pkt, gso) {
+			// Keep track of the packet that is about to be fragmented so it can be
+			// removed once the fragmentation is done.
+			originalPkt := pkt
+			if _, _, err := e.handleFragments(r, gso, e.nic.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+				// Modify the packet list in place with the new fragments.
+				pkts.InsertAfter(pkt, fragPkt)
+				pkt = fragPkt
+				return nil
+			}); err != nil {
+				panic(fmt.Sprintf("e.handleFragments(_, _, %d, _, _) = %s", e.nic.MTU(), err))
+			}
+			// Remove the packet that was just fragmented and process the rest.
+			pkts.Remove(originalPkt)
+		}
 	}
 
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
@@ -347,30 +377,27 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	return n + len(dropped), nil
 }
 
-// WriteHeaderIncludedPacket writes a packet already containing a network
-// header through the given route.
+// WriteHeaderIncludedPacket implements stack.NetworkEndpoint.
 func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
 	// The packet already has an IP header, but there are a few required
 	// checks.
 	h, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
 	if !ok {
-		return tcpip.ErrInvalidOptionValue
+		return tcpip.ErrMalformedHeader
 	}
 	ip := header.IPv4(h)
-	if !ip.IsValid(pkt.Data.Size()) {
-		return tcpip.ErrInvalidOptionValue
-	}
 
 	// Always set the total length.
-	ip.SetTotalLength(uint16(pkt.Data.Size()))
+	pktSize := pkt.Data.Size()
+	ip.SetTotalLength(uint16(pktSize))
 
 	// Set the source address when zero.
-	if ip.SourceAddress() == tcpip.Address(([]byte{0, 0, 0, 0})) {
+	if ip.SourceAddress() == header.IPv4Any {
 		ip.SetSourceAddress(r.LocalAddress)
 	}
 
-	// Set the destination. If the packet already included a destination,
-	// it will be part of the route.
+	// Set the destination. If the packet already included a destination, it will
+	// be part of the route anyways.
 	ip.SetDestinationAddress(r.RemoteAddress)
 
 	// Set the packet ID when zero.
@@ -387,19 +414,17 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 	ip.SetChecksum(0)
 	ip.SetChecksum(^ip.CalculateChecksum())
 
-	if r.Loop&stack.PacketLoop != 0 {
-		e.HandlePacket(r, pkt.Clone())
-	}
-	if r.Loop&stack.PacketOut == 0 {
-		return nil
+	// Populate the packet buffer's network header and don't allow an invalid
+	// packet to be sent.
+	//
+	// Note that parsing only makes sure that the packet is well formed as per the
+	// wire format. We also want to check if the header's fields are valid before
+	// sending the packet.
+	if !parse.IPv4(pkt) || !header.IPv4(pkt.NetworkHeader().View()).IsValid(pktSize) {
+		return tcpip.ErrMalformedHeader
 	}
 
-	if err := e.nic.WritePacket(r, nil /* gso */, ProtocolNumber, pkt); err != nil {
-		r.Stats().IP.OutgoingPacketErrors.Increment()
-		return err
-	}
-	r.Stats().IP.PacketsSent.Increment()
-	return nil
+	return e.writePacket(r, nil /* gso */, pkt)
 }
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
@@ -411,6 +436,32 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 
 	h := header.IPv4(pkt.NetworkHeader().View())
 	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
+		r.Stats().IP.MalformedPacketsReceived.Increment()
+		return
+	}
+
+	// There has been some confusion regarding verifying checksums. We need
+	// just look for negative 0 (0xffff) as the checksum, as it's not possible to
+	// get positive 0 (0) for the checksum. Some bad implementations could get it
+	// when doing entry replacement in the early days of the Internet,
+	// however the lore that one needs to check for both persists.
+	//
+	// RFC 1624 section 1 describes the source of this confusion as:
+	//     [the partial recalculation method described in RFC 1071] computes a
+	//     result for certain cases that differs from the one obtained from
+	//     scratch (one's complement of one's complement sum of the original
+	//     fields).
+	//
+	// However RFC 1624 section 5 clarifies that if using the verification method
+	// "recommended by RFC 1071, it does not matter if an intermediate system
+	// generated a -0 instead of +0".
+	//
+	// RFC1071 page 1 specifies the verification method as:
+	//	  (3)  To check a checksum, the 1's complement sum is computed over the
+	//        same set of octets, including the checksum field.  If the result
+	//        is all 1 bits (-0 in 1's complement arithmetic), the check
+	//        succeeds.
+	if h.CalculateChecksum() != 0xffff {
 		r.Stats().IP.MalformedPacketsReceived.Increment()
 		return
 	}
