@@ -16,16 +16,17 @@ package gofer
 
 import (
 	"fmt"
-	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -92,13 +93,16 @@ func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
 	child := &dentry{
 		refs:      1, // held by d
 		fs:        d.fs,
-		ino:       d.fs.nextSyntheticIno(),
+		ino:       d.fs.nextIno(),
 		mode:      uint32(opts.mode),
 		uid:       uint32(opts.kuid),
 		gid:       uint32(opts.kgid),
 		blockSize: usermem.PageSize, // arbitrary
 		hostFD:    -1,
 		nlink:     uint32(2),
+	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(child, "gofer.dentry")
 	}
 	switch opts.mode.FileType() {
 	case linux.S_IFDIR:
@@ -235,7 +239,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 				}
 				dirent := vfs.Dirent{
 					Name:    p9d.Name,
-					Ino:     uint64(inoFromPath(p9d.QID.Path)),
+					Ino:     d.fs.inoFromQIDPath(p9d.QID.Path),
 					NextOff: int64(len(dirents) + 1),
 				}
 				// p9 does not expose 9P2000.U's DMDEVICE, DMNAMEDPIPE, or

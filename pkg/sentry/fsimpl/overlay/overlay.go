@@ -33,12 +33,14 @@
 package overlay
 
 import (
+	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -458,9 +460,9 @@ type dentry struct {
 	//
 	// - isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
 	// accessed using atomic memory operations.
-	mapsMu          sync.Mutex
+	mapsMu          sync.Mutex `state:"nosave"`
 	lowerMappings   memmap.MappingSet
-	dataMu          sync.RWMutex
+	dataMu          sync.RWMutex `state:"nosave"`
 	wrappedMappable memmap.Mappable
 	isMappable      uint32
 
@@ -484,6 +486,9 @@ func (fs *filesystem) newDentry() *dentry {
 	}
 	d.lowerVDs = d.inlineLowerVDs[:0]
 	d.vfsd.Init(d)
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Register(d, "overlay.dentry")
+	}
 	return d
 }
 
@@ -583,6 +588,14 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 			panic("overlay.dentry.DecRef() called without holding a reference")
 		}
 	}
+	if refsvfs2.LeakCheckEnabled() {
+		refsvfs2.Unregister(d, "overlay.dentry")
+	}
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.

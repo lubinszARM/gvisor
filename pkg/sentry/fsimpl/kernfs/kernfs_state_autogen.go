@@ -23,10 +23,9 @@ func (r *DentryRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *DentryRefs) afterLoad() {}
-
 func (r *DentryRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (f *DynamicBytesFile) StateTypeName() string {
@@ -274,6 +273,10 @@ func (a *InodeAttrs) StateFields() []string {
 		"uid",
 		"gid",
 		"nlink",
+		"blockSize",
+		"atime",
+		"mtime",
+		"ctime",
 	}
 }
 
@@ -288,6 +291,10 @@ func (a *InodeAttrs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &a.uid)
 	stateSinkObject.Save(5, &a.gid)
 	stateSinkObject.Save(6, &a.nlink)
+	stateSinkObject.Save(7, &a.blockSize)
+	stateSinkObject.Save(8, &a.atime)
+	stateSinkObject.Save(9, &a.mtime)
+	stateSinkObject.Save(10, &a.ctime)
 }
 
 func (a *InodeAttrs) afterLoad() {}
@@ -300,6 +307,10 @@ func (a *InodeAttrs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &a.uid)
 	stateSourceObject.Load(5, &a.gid)
 	stateSourceObject.Load(6, &a.nlink)
+	stateSourceObject.Load(7, &a.blockSize)
+	stateSourceObject.Load(8, &a.atime)
+	stateSourceObject.Load(9, &a.mtime)
+	stateSourceObject.Load(10, &a.ctime)
 }
 
 func (s *slot) StateTypeName() string {
@@ -677,10 +688,9 @@ func (r *StaticDirectoryRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *StaticDirectoryRefs) afterLoad() {}
-
 func (r *StaticDirectoryRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (s *StaticSymlink) StateTypeName() string {
@@ -776,10 +786,9 @@ func (r *syntheticDirectoryRefs) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (r *syntheticDirectoryRefs) afterLoad() {}
-
 func (r *syntheticDirectoryRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func init() {
