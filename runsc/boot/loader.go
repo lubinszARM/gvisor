@@ -50,6 +50,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/sighandling"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux/vfs2"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -479,9 +480,7 @@ func (l *Loader) Destroy() {
 
 	// All sentry-created resources should have been released at this point;
 	// check for reference leaks.
-	if refsvfs2.LeakCheckEnabled() {
-		refsvfs2.DoLeakCheck()
-	}
+	refsvfs2.DoLeakCheck()
 
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
@@ -1086,6 +1085,7 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID) (in
 		// privileges.
 		RawFactory: raw.EndpointFactory{},
 		UniqueID:   uniqueID,
+		IPTables:   netfilter.DefaultLinuxTables(),
 	})}
 
 	// Enable SACK Recovery.

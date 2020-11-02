@@ -687,7 +687,8 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 
 		// n doesn't have a destination endpoint.
 		// Send the packet out of n.
-		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease the TTL field for ipv4/ipv6.
+		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease
+		// the TTL field for ipv4/ipv6.
 
 		// pkt may have set its header and may not have enough headroom for
 		// link-layer header for the other link to prepend. Here we create a new
@@ -894,7 +895,7 @@ func (n *NIC) unregisterPacketEndpoint(netProto tcpip.NetworkProtocolNumber, ep 
 }
 
 // isValidForOutgoing returns true if the endpoint can be used to send out a
-// packet. It requires the endpoint to not be marked expired (i.e., its address)
+// packet. It requires the endpoint to not be marked expired (i.e., its address
 // has been removed) unless the NIC is in spoofing mode, or temporary.
 func (n *NIC) isValidForOutgoing(ep AssignableAddressEndpoint) bool {
 	n.mu.RLock()

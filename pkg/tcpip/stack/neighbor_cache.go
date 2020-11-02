@@ -16,7 +16,6 @@ package stack
 
 import (
 	"fmt"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -121,10 +120,10 @@ func (n *neighborCache) getOrCreateEntry(remoteAddr tcpip.Address, linkRes LinkA
 func (n *neighborCache) entry(remoteAddr, localAddr tcpip.Address, linkRes LinkAddressResolver, w *sleep.Waker) (NeighborEntry, <-chan struct{}, *tcpip.Error) {
 	if linkAddr, ok := linkRes.ResolveStaticAddress(remoteAddr); ok {
 		e := NeighborEntry{
-			Addr:      remoteAddr,
-			LinkAddr:  linkAddr,
-			State:     Static,
-			UpdatedAt: time.Now(),
+			Addr:           remoteAddr,
+			LinkAddr:       linkAddr,
+			State:          Static,
+			UpdatedAtNanos: 0,
 		}
 		return e, nil, nil
 	}
@@ -210,7 +209,7 @@ func (n *neighborCache) addStaticEntry(addr tcpip.Address, linkAddr tcpip.LinkAd
 		} else {
 			// Static entry found with the same address but different link address.
 			entry.neigh.LinkAddr = linkAddr
-			entry.dispatchChangeEventLocked(entry.neigh.State)
+			entry.dispatchChangeEventLocked()
 			entry.mu.Unlock()
 			return
 		}
@@ -223,8 +222,7 @@ func (n *neighborCache) addStaticEntry(addr tcpip.Address, linkAddr tcpip.LinkAd
 		entry.mu.Unlock()
 	}
 
-	entry := newStaticNeighborEntry(n.nic, addr, linkAddr, n.state)
-	n.cache[addr] = entry
+	n.cache[addr] = newStaticNeighborEntry(n.nic, addr, linkAddr, n.state)
 }
 
 // removeEntryLocked removes the specified entry from the neighbor cache.

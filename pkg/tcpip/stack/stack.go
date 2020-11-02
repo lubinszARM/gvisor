@@ -518,6 +518,10 @@ type Options struct {
 	//
 	// RandSource must be thread-safe.
 	RandSource mathrand.Source
+
+	// IPTables are the initial iptables rules. If nil, iptables will allow
+	// all traffic.
+	IPTables *IPTables
 }
 
 // TransportEndpointInfo holds useful information about a transport endpoint
@@ -620,6 +624,10 @@ func New(opts Options) *Stack {
 		randSrc = &lockedRandomSource{src: mathrand.NewSource(generateRandInt64())}
 	}
 
+	if opts.IPTables == nil {
+		opts.IPTables = DefaultTables()
+	}
+
 	opts.NUDConfigs.resetInvalidFields()
 
 	s := &Stack{
@@ -633,7 +641,7 @@ func New(opts Options) *Stack {
 		clock:              clock,
 		stats:              opts.Stats.FillIn(),
 		handleLocal:        opts.HandleLocal,
-		tables:             DefaultTables(),
+		tables:             opts.IPTables,
 		icmpRateLimiter:    NewICMPRateLimiter(),
 		seed:               generateRandUint32(),
 		nudConfigs:         opts.NUDConfigs,
@@ -828,6 +836,20 @@ func (s *Stack) AddRoute(route tcpip.Route) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.routeTable = append(s.routeTable, route)
+}
+
+// RemoveRoutes removes matching routes from the route table.
+func (s *Stack) RemoveRoutes(match func(tcpip.Route) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var filteredRoutes []tcpip.Route
+	for _, route := range s.routeTable {
+		if !match(route) {
+			filteredRoutes = append(filteredRoutes, route)
+		}
+	}
+	s.routeTable = filteredRoutes
 }
 
 // NewEndpoint creates a new transport layer endpoint of the given protocol.
@@ -1188,7 +1210,9 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 
 	isLocalBroadcast := remoteAddr == header.IPv4Broadcast
 	isMulticast := header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)
-	needRoute := !(isLocalBroadcast || isMulticast || header.IsV6LinkLocalAddress(remoteAddr))
+	isLinkLocal := header.IsV6LinkLocalAddress(remoteAddr) || header.IsV6LinkLocalMulticastAddress(remoteAddr)
+	IsLoopback := header.IsV4LoopbackAddress(remoteAddr) || header.IsV6LoopbackAddress(remoteAddr)
+	needRoute := !(isLocalBroadcast || isMulticast || isLinkLocal || IsLoopback)
 	if id != 0 && !needRoute {
 		if nic, ok := s.nics[id]; ok && nic.Enabled() {
 			if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, netProto); addressEndpoint != nil {
@@ -1224,6 +1248,9 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 	}
 
 	if !needRoute {
+		if IsLoopback {
+			return Route{}, tcpip.ErrBadLocalAddress
+		}
 		return Route{}, tcpip.ErrNetworkUnreachable
 	}
 

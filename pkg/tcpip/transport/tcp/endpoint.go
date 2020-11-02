@@ -440,6 +440,11 @@ type endpoint struct {
 	ttl               uint8
 	v6only            bool
 	isConnectNotified bool
+	// h stores a reference to the current handshake state if the endpoint is in
+	// the SYN-SENT or SYN-RECV states, in which case endpoint == endpoint.h.ep.
+	// nil otherwise.
+	h *handshake `state:"nosave"`
+
 	// TCP should never broadcast but Linux nevertheless supports enabling/
 	// disabling SO_BROADCAST, albeit as a NOOP.
 	broadcast bool
@@ -721,9 +726,9 @@ func (e *endpoint) LockUser() {
 	for {
 		// Try first if the sock is locked then check if it's owned
 		// by another user goroutine if not then we spin, otherwise
-		// we just goto sleep on the Lock() and wait.
+		// we just go to sleep on the Lock() and wait.
 		if !e.mu.TryLock() {
-			// If socket is owned by the user then just goto sleep
+			// If socket is owned by the user then just go to sleep
 			// as the lock could be held for a reasonably long time.
 			if atomic.LoadUint32(&e.ownedByUser) == 1 {
 				e.mu.Lock()
@@ -922,6 +927,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 	e.segmentQueue.ep = e
 	e.tsOffset = timeStampOffset()
 	e.acceptCond = sync.NewCond(&e.acceptMu)
+	e.keepalive.timer.init(&e.keepalive.waker)
 
 	return e
 }
@@ -1143,6 +1149,7 @@ func (e *endpoint) cleanupLocked() {
 	// Close all endpoints that might have been accepted by TCP but not by
 	// the client.
 	e.closePendingAcceptableConnectionsLocked()
+	e.keepalive.timer.cleanup()
 
 	e.workerCleanup = false
 
@@ -2182,6 +2189,8 @@ func (*endpoint) Disconnect() *tcpip.Error {
 func (e *endpoint) Connect(addr tcpip.FullAddress) *tcpip.Error {
 	err := e.connect(addr, true, true)
 	if err != nil && !err.IgnoreStats() {
+		// Connect failed. Let's wake up any waiters.
+		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
 		e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
 		e.stats.FailedConnectionAttempts.Increment()
 	}
@@ -2395,12 +2404,60 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 	}
 
 	if run {
-		e.workerRunning = true
-		e.stack.Stats().TCP.ActiveConnectionOpenings.Increment()
-		go e.protocolMainLoop(handshake, nil) // S/R-SAFE: will be drained before save.
+		if err := e.startMainLoop(handshake); err != nil {
+			return err
+		}
 	}
 
 	return tcpip.ErrConnectStarted
+}
+
+// startMainLoop sends the initial SYN and starts the main loop for the
+// endpoint.
+func (e *endpoint) startMainLoop(handshake bool) *tcpip.Error {
+	preloop := func() *tcpip.Error {
+		if handshake {
+			h := e.newHandshake()
+			e.setEndpointState(StateSynSent)
+			if err := h.start(); err != nil {
+				e.lastErrorMu.Lock()
+				e.lastError = err
+				e.lastErrorMu.Unlock()
+
+				e.setEndpointState(StateError)
+				e.HardError = err
+
+				// Call cleanupLocked to free up any reservations.
+				e.cleanupLocked()
+				return err
+			}
+		}
+		e.stack.Stats().TCP.ActiveConnectionOpenings.Increment()
+		e.workerRunning = true
+		return nil
+	}
+
+	if e.route.IsResolutionRequired() {
+		// Sending the initial SYN may block due to route resolution; do it in a
+		// separate goroutine to avoid blocking the syscall goroutine.
+		go func() { // S/R-SAFE: will be drained before save.
+			if err := preloop(); err != nil {
+				return
+			}
+			e.protocolMainLoop(handshake, nil)
+		}()
+		return nil
+	}
+
+	// No route resolution is required, so we can send the initial SYN here without
+	// blocking. This will hopefully reduce overall latency by overlapping time
+	// spent waiting for a SYN-ACK and time spent spinning up a new goroutine
+	// for the main loop.
+	if err := preloop(); err != nil {
+		return err
+	}
+	go e.protocolMainLoop(handshake, nil) // S/R-SAFE: will be drained before save.
+	return nil
 }
 
 // ConnectEndpoint is not supported.
@@ -2633,14 +2690,16 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err *tcpip.Error) {
 		return err
 	}
 
-	// Expand netProtos to include v4 and v6 if the caller is binding to a
-	// wildcard (empty) address, and this is an IPv6 endpoint with v6only
-	// set to false.
 	netProtos := []tcpip.NetworkProtocolNumber{netProto}
-	if netProto == header.IPv6ProtocolNumber && !e.v6only && addr.Addr == "" {
-		netProtos = []tcpip.NetworkProtocolNumber{
-			header.IPv6ProtocolNumber,
-			header.IPv4ProtocolNumber,
+
+	// Expand netProtos to include v4 and v6 under dual-stack if the caller is
+	// binding to a wildcard (empty) address, and this is an IPv6 endpoint with
+	// v6only set to false.
+	if netProto == header.IPv6ProtocolNumber {
+		stackHasV4 := e.stack.CheckNetworkProtocol(header.IPv4ProtocolNumber)
+		alsoBindToV4 := !e.v6only && addr.Addr == "" && stackHasV4
+		if alsoBindToV4 {
+			netProtos = append(netProtos, header.IPv4ProtocolNumber)
 		}
 	}
 

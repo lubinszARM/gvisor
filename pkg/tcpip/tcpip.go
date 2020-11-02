@@ -356,10 +356,9 @@ func (s *Subnet) IsBroadcast(address Address) bool {
 	return s.Prefix() <= 30 && s.Broadcast() == address
 }
 
-// Equal returns true if s equals o.
-//
-// Needed to use cmp.Equal on Subnet as its fields are unexported.
+// Equal returns true if this Subnet is equal to the given Subnet.
 func (s Subnet) Equal(o Subnet) bool {
+	// If this changes, update Route.Equal accordingly.
 	return s == o
 }
 
@@ -1260,6 +1259,12 @@ func (r Route) String() string {
 	return out.String()
 }
 
+// Equal returns true if the given Route is equal to this Route.
+func (r Route) Equal(to Route) bool {
+	// NOTE: This relies on the fact that r.Destination == to.Destination
+	return r == to
+}
+
 // TransportProtocolNumber is the number of a transport protocol.
 type TransportProtocolNumber uint32
 
@@ -1500,6 +1505,15 @@ type IPStats struct {
 	// IPTablesOutputDropped is the total number of IP packets dropped in
 	// the Output chain.
 	IPTablesOutputDropped *StatCounter
+
+	// OptionTSReceived is the number of Timestamp options seen.
+	OptionTSReceived *StatCounter
+
+	// OptionRRReceived is the number of Record Route options seen.
+	OptionRRReceived *StatCounter
+
+	// OptionUnknownReceived is the number of unknown IP options seen.
+	OptionUnknownReceived *StatCounter
 }
 
 // TCPStats collects TCP-specific stats.

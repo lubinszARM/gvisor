@@ -6,26 +6,56 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (r *DentryRefs) StateTypeName() string {
-	return "pkg/sentry/fsimpl/kernfs.DentryRefs"
+func (l *dentryList) StateTypeName() string {
+	return "pkg/sentry/fsimpl/kernfs.dentryList"
 }
 
-func (r *DentryRefs) StateFields() []string {
+func (l *dentryList) StateFields() []string {
 	return []string{
-		"refCount",
+		"head",
+		"tail",
 	}
 }
 
-func (r *DentryRefs) beforeSave() {}
+func (l *dentryList) beforeSave() {}
 
-func (r *DentryRefs) StateSave(stateSinkObject state.Sink) {
-	r.beforeSave()
-	stateSinkObject.Save(0, &r.refCount)
+func (l *dentryList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
 }
 
-func (r *DentryRefs) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(r.afterLoad)
+func (l *dentryList) afterLoad() {}
+
+func (l *dentryList) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *dentryEntry) StateTypeName() string {
+	return "pkg/sentry/fsimpl/kernfs.dentryEntry"
+}
+
+func (e *dentryEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *dentryEntry) beforeSave() {}
+
+func (e *dentryEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *dentryEntry) afterLoad() {}
+
+func (e *dentryEntry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func (f *DynamicBytesFile) StateTypeName() string {
@@ -397,25 +427,6 @@ func (o *OrderedChildren) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &o.set)
 }
 
-func (r *renameAcrossDifferentImplementationsError) StateTypeName() string {
-	return "pkg/sentry/fsimpl/kernfs.renameAcrossDifferentImplementationsError"
-}
-
-func (r *renameAcrossDifferentImplementationsError) StateFields() []string {
-	return []string{}
-}
-
-func (r *renameAcrossDifferentImplementationsError) beforeSave() {}
-
-func (r *renameAcrossDifferentImplementationsError) StateSave(stateSinkObject state.Sink) {
-	r.beforeSave()
-}
-
-func (r *renameAcrossDifferentImplementationsError) afterLoad() {}
-
-func (r *renameAcrossDifferentImplementationsError) StateLoad(stateSourceObject state.Source) {
-}
-
 func (i *InodeSymlink) StateTypeName() string {
 	return "pkg/sentry/fsimpl/kernfs.InodeSymlink"
 }
@@ -555,6 +566,10 @@ func (fs *Filesystem) StateFields() []string {
 		"vfsfs",
 		"droppedDentries",
 		"nextInoMinusOne",
+		"cachedDentries",
+		"cachedDentriesLen",
+		"MaxCachedDentries",
+		"root",
 	}
 }
 
@@ -565,6 +580,10 @@ func (fs *Filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &fs.vfsfs)
 	stateSinkObject.Save(1, &fs.droppedDentries)
 	stateSinkObject.Save(2, &fs.nextInoMinusOne)
+	stateSinkObject.Save(3, &fs.cachedDentries)
+	stateSinkObject.Save(4, &fs.cachedDentriesLen)
+	stateSinkObject.Save(5, &fs.MaxCachedDentries)
+	stateSinkObject.Save(6, &fs.root)
 }
 
 func (fs *Filesystem) afterLoad() {}
@@ -573,6 +592,10 @@ func (fs *Filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fs.vfsfs)
 	stateSourceObject.Load(1, &fs.droppedDentries)
 	stateSourceObject.Load(2, &fs.nextInoMinusOne)
+	stateSourceObject.Load(3, &fs.cachedDentries)
+	stateSourceObject.Load(4, &fs.cachedDentriesLen)
+	stateSourceObject.Load(5, &fs.MaxCachedDentries)
+	stateSourceObject.Load(6, &fs.root)
 }
 
 func (d *Dentry) StateTypeName() string {
@@ -582,11 +605,13 @@ func (d *Dentry) StateTypeName() string {
 func (d *Dentry) StateFields() []string {
 	return []string{
 		"vfsd",
-		"DentryRefs",
+		"refs",
 		"fs",
 		"flags",
 		"parent",
 		"name",
+		"cached",
+		"dentryEntry",
 		"children",
 		"inode",
 	}
@@ -597,26 +622,83 @@ func (d *Dentry) beforeSave() {}
 func (d *Dentry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
 	stateSinkObject.Save(0, &d.vfsd)
-	stateSinkObject.Save(1, &d.DentryRefs)
+	stateSinkObject.Save(1, &d.refs)
 	stateSinkObject.Save(2, &d.fs)
 	stateSinkObject.Save(3, &d.flags)
 	stateSinkObject.Save(4, &d.parent)
 	stateSinkObject.Save(5, &d.name)
-	stateSinkObject.Save(6, &d.children)
-	stateSinkObject.Save(7, &d.inode)
+	stateSinkObject.Save(6, &d.cached)
+	stateSinkObject.Save(7, &d.dentryEntry)
+	stateSinkObject.Save(8, &d.children)
+	stateSinkObject.Save(9, &d.inode)
 }
-
-func (d *Dentry) afterLoad() {}
 
 func (d *Dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.vfsd)
-	stateSourceObject.Load(1, &d.DentryRefs)
+	stateSourceObject.Load(1, &d.refs)
 	stateSourceObject.Load(2, &d.fs)
 	stateSourceObject.Load(3, &d.flags)
 	stateSourceObject.Load(4, &d.parent)
 	stateSourceObject.Load(5, &d.name)
-	stateSourceObject.Load(6, &d.children)
-	stateSourceObject.Load(7, &d.inode)
+	stateSourceObject.Load(6, &d.cached)
+	stateSourceObject.Load(7, &d.dentryEntry)
+	stateSourceObject.Load(8, &d.children)
+	stateSourceObject.Load(9, &d.inode)
+	stateSourceObject.AfterLoad(d.afterLoad)
+}
+
+func (i *inodePlatformFile) StateTypeName() string {
+	return "pkg/sentry/fsimpl/kernfs.inodePlatformFile"
+}
+
+func (i *inodePlatformFile) StateFields() []string {
+	return []string{
+		"hostFD",
+		"fdRefs",
+		"fileMapper",
+	}
+}
+
+func (i *inodePlatformFile) beforeSave() {}
+
+func (i *inodePlatformFile) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.hostFD)
+	stateSinkObject.Save(1, &i.fdRefs)
+	stateSinkObject.Save(2, &i.fileMapper)
+}
+
+func (i *inodePlatformFile) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.hostFD)
+	stateSourceObject.Load(1, &i.fdRefs)
+	stateSourceObject.Load(2, &i.fileMapper)
+	stateSourceObject.AfterLoad(i.afterLoad)
+}
+
+func (i *CachedMappable) StateTypeName() string {
+	return "pkg/sentry/fsimpl/kernfs.CachedMappable"
+}
+
+func (i *CachedMappable) StateFields() []string {
+	return []string{
+		"mappings",
+		"pf",
+	}
+}
+
+func (i *CachedMappable) beforeSave() {}
+
+func (i *CachedMappable) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.mappings)
+	stateSinkObject.Save(1, &i.pf)
+}
+
+func (i *CachedMappable) afterLoad() {}
+
+func (i *CachedMappable) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.mappings)
+	stateSourceObject.Load(1, &i.pf)
 }
 
 func (l *slotList) StateTypeName() string {
@@ -792,7 +874,8 @@ func (r *syntheticDirectoryRefs) StateLoad(stateSourceObject state.Source) {
 }
 
 func init() {
-	state.Register((*DentryRefs)(nil))
+	state.Register((*dentryList)(nil))
+	state.Register((*dentryEntry)(nil))
 	state.Register((*DynamicBytesFile)(nil))
 	state.Register((*DynamicBytesFD)(nil))
 	state.Register((*SeekEndConfig)(nil))
@@ -806,7 +889,6 @@ func init() {
 	state.Register((*slot)(nil))
 	state.Register((*OrderedChildrenOptions)(nil))
 	state.Register((*OrderedChildren)(nil))
-	state.Register((*renameAcrossDifferentImplementationsError)(nil))
 	state.Register((*InodeSymlink)(nil))
 	state.Register((*StaticDirectory)(nil))
 	state.Register((*InodeAlwaysValid)(nil))
@@ -814,6 +896,8 @@ func init() {
 	state.Register((*InodeNoStatFS)(nil))
 	state.Register((*Filesystem)(nil))
 	state.Register((*Dentry)(nil))
+	state.Register((*inodePlatformFile)(nil))
+	state.Register((*CachedMappable)(nil))
 	state.Register((*slotList)(nil))
 	state.Register((*slotEntry)(nil))
 	state.Register((*StaticDirectoryRefs)(nil))

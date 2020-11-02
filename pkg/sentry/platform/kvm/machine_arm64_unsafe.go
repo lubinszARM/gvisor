@@ -159,7 +159,31 @@ func (c *vCPU) initArchState() error {
 	}
 
 	c.floatingPointState = arch.NewFloatingPointData()
+
+	return c.setSystemTime()
+}
+
+// setTSC sets the counter Virtual Offset.
+func (c *vCPU) setTSC(value uint64) error {
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_TIMER_CNT
+	data = uint64(value)
+
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// setSystemTime sets the vCPU to the system time.
+func (c *vCPU) setSystemTime() error {
+	return c.setSystemTimeLegacy()
 }
 
 //go:nosplit
@@ -197,7 +221,7 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	if regs := switchOpts.Registers; !ring0.IsCanonical(regs.Pc) {
 		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
-		return nonCanonical(regs.Sp, int32(syscall.SIGBUS), info)
+		return nonCanonical(regs.Sp, int32(syscall.SIGSEGV), info)
 	}
 
 	// Assign PCIDs.
