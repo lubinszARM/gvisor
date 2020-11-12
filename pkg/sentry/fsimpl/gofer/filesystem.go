@@ -371,9 +371,6 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if len(name) > maxFilenameLen {
 		return syserror.ENAMETOOLONG
 	}
-	if !dir && rp.MustBeDir() {
-		return syserror.ENOENT
-	}
 	if parent.isDeleted() {
 		return syserror.ENOENT
 	}
@@ -387,6 +384,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if parent.isSynthetic() {
 		if child := parent.children[name]; child != nil {
 			return syserror.EEXIST
+		}
+		if !dir && rp.MustBeDir() {
+			return syserror.ENOENT
 		}
 		if createInSyntheticDir == nil {
 			return syserror.EPERM
@@ -407,6 +407,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		if child := parent.children[name]; child != nil && child.isSynthetic() {
 			return syserror.EEXIST
 		}
+		if !dir && rp.MustBeDir() {
+			return syserror.ENOENT
+		}
 		// The existence of a non-synthetic dentry at name would be inconclusive
 		// because the file it represents may have been deleted from the remote
 		// filesystem, so we would need to make an RPC to revalidate the dentry.
@@ -426,6 +429,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	if child := parent.children[name]; child != nil {
 		return syserror.EEXIST
+	}
+	if !dir && rp.MustBeDir() {
+		return syserror.ENOENT
 	}
 	// No cached dentry exists; however, there might still be an existing file
 	// at name. As above, we attempt the file creation RPC anyway.
@@ -1161,18 +1167,21 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Incorporate the fid that was opened by lcreate.
 	useRegularFileFD := child.fileType() == linux.S_IFREG && !d.fs.opts.regularFilesUseSpecialFileFD
 	if useRegularFileFD {
+		openFD := int32(-1)
+		if fdobj != nil {
+			openFD = int32(fdobj.Release())
+		}
 		child.handleMu.Lock()
 		if vfs.MayReadFileWithOpenFlags(opts.Flags) {
 			child.readFile = openFile
 			if fdobj != nil {
-				child.hostFD = int32(fdobj.Release())
+				child.readFD = openFD
+				child.mmapFD = openFD
 			}
-		} else if fdobj != nil {
-			// Can't use fdobj if it's not readable.
-			fdobj.Close()
 		}
 		if vfs.MayWriteFileWithOpenFlags(opts.Flags) {
 			child.writeFile = openFile
+			child.writeFD = openFD
 		}
 		child.handleMu.Unlock()
 	}

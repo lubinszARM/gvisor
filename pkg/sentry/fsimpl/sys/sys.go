@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -126,6 +127,7 @@ func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) ker
 	// keep it in sys.
 	var children map[string]kernfs.Inode
 	if coverage.KcovAvailable() {
+		log.Debugf("Set up /sys/kernel/debug/kcov")
 		children = map[string]kernfs.Inode{
 			"debug": fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{
 				"kcov": fs.newKcovFile(ctx, creds),
@@ -160,7 +162,7 @@ func (fs *filesystem) newDir(ctx context.Context, creds *auth.Credentials, mode 
 	d := &dir{}
 	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
 	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	d.EnableLeakCheck()
+	d.InitRefs()
 	d.IncLinks(d.OrderedChildren.Populate(contents))
 	return d
 }

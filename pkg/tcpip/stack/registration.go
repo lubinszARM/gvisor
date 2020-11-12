@@ -63,17 +63,28 @@ const (
 	ControlUnknown
 )
 
+// NetworkPacketInfo holds information about a network layer packet.
+type NetworkPacketInfo struct {
+	// RemoteAddressBroadcast is true if the packet's remote address is a
+	// broadcast address.
+	RemoteAddressBroadcast bool
+
+	// LocalAddressBroadcast is true if the packet's local address is a broadcast
+	// address.
+	LocalAddressBroadcast bool
+}
+
 // TransportEndpoint is the interface that needs to be implemented by transport
 // protocol (e.g., tcp, udp) endpoints that can handle packets.
 type TransportEndpoint interface {
 	// UniqueID returns an unique ID for this transport endpoint.
 	UniqueID() uint64
 
-	// HandlePacket is called by the stack when new packets arrive to
-	// this transport endpoint. It sets pkt.TransportHeader.
+	// HandlePacket is called by the stack when new packets arrive to this
+	// transport endpoint. It sets the packet buffer's transport header.
 	//
-	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, id TransportEndpointID, pkt *PacketBuffer)
+	// HandlePacket takes ownership of the packet.
+	HandlePacket(TransportEndpointID, *PacketBuffer)
 
 	// HandleControlPacket is called by the stack when new control (e.g.
 	// ICMP) packets arrive to this transport endpoint.
@@ -105,8 +116,8 @@ type RawTransportEndpoint interface {
 	// this transport endpoint. The packet contains all data from the link
 	// layer up.
 	//
-	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt *PacketBuffer)
+	// HandlePacket takes ownership of the packet.
+	HandlePacket(*PacketBuffer)
 }
 
 // PacketEndpoint is the interface that needs to be implemented by packet
@@ -127,7 +138,7 @@ type PacketEndpoint interface {
 	HandlePacket(nicID tcpip.NICID, addr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 }
 
-// UnknownDestinationPacketDisposition enumerates the possible return vaues from
+// UnknownDestinationPacketDisposition enumerates the possible return values from
 // HandleUnknownDestinationPacket().
 type UnknownDestinationPacketDisposition int
 
@@ -172,9 +183,9 @@ type TransportProtocol interface {
 	// protocol that don't match any existing endpoint. For example,
 	// it is targeted at a port that has no listeners.
 	//
-	// HandleUnknownDestinationPacket takes ownership of pkt if it handles
+	// HandleUnknownDestinationPacket takes ownership of the packet if it handles
 	// the issue.
-	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) UnknownDestinationPacketDisposition
+	HandleUnknownDestinationPacket(TransportEndpointID, *PacketBuffer) UnknownDestinationPacketDisposition
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
@@ -227,8 +238,8 @@ type TransportDispatcher interface {
 	//
 	// pkt.NetworkHeader must be set before calling DeliverTransportPacket.
 	//
-	// DeliverTransportPacket takes ownership of pkt.
-	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition
+	// DeliverTransportPacket takes ownership of the packet.
+	DeliverTransportPacket(tcpip.TransportProtocolNumber, *PacketBuffer) TransportPacketDisposition
 
 	// DeliverTransportControlPacket delivers control packets to the
 	// appropriate transport protocol endpoint.
@@ -252,6 +263,15 @@ const (
 	PacketLoop
 )
 
+// NetOptions is an interface that allows us to pass network protocol specific
+// options through the Stack layer code.
+type NetOptions interface {
+	// AllocationSize returns the amount of memory that must be allocated to
+	// hold the options given that the value must be rounded up to the next
+	// multiple of 4 bytes.
+	AllocationSize() int
+}
+
 // NetworkHeaderParams are the header parameters given as input by the
 // transport endpoint to the network.
 type NetworkHeaderParams struct {
@@ -263,6 +283,10 @@ type NetworkHeaderParams struct {
 
 	// TOS refers to TypeOfService or TrafficClass field of the IP-header.
 	TOS uint8
+
+	// Options is a set of options to add to a network header (or nil).
+	// It will be protocol specific opaque information from higher layers.
+	Options NetOptions
 }
 
 // GroupAddressableEndpoint is an endpoint that supports group addressing.
@@ -270,7 +294,7 @@ type NetworkHeaderParams struct {
 // An endpoint is considered to support group addressing when one or more
 // endpoints may associate themselves with the same identifier (group address).
 type GroupAddressableEndpoint interface {
-	// JoinGroup joins the spcified group.
+	// JoinGroup joins the specified group.
 	//
 	// Returns true if the group was newly joined.
 	JoinGroup(group tcpip.Address) (bool, *tcpip.Error)
@@ -329,6 +353,9 @@ type AssignableAddressEndpoint interface {
 	// AddressWithPrefix returns the endpoint's address.
 	AddressWithPrefix() tcpip.AddressWithPrefix
 
+	// Subnet returns the subnet of the endpoint's address.
+	Subnet() tcpip.Subnet
+
 	// IsAssigned returns whether or not the endpoint is considered bound
 	// to its NetworkEndpoint.
 	IsAssigned(allowExpired bool) bool
@@ -364,7 +391,7 @@ type AddressEndpoint interface {
 	SetDeprecated(bool)
 }
 
-// AddressKind is the kind of of an address.
+// AddressKind is the kind of an address.
 //
 // See the values of AddressKind for more details.
 type AddressKind int
@@ -547,7 +574,7 @@ type NetworkEndpoint interface {
 	// this network endpoint. It sets pkt.NetworkHeader.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt *PacketBuffer)
+	HandlePacket(pkt *PacketBuffer)
 
 	// Close is called when the endpoint is reomved from a stack.
 	Close()

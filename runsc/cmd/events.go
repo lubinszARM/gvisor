@@ -74,7 +74,7 @@ func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
 	id := f.Arg(0)
 	conf := args[0].(*config.Config)
 
-	c, err := container.Load(conf.RootDir, id)
+	c, err := container.LoadAndCheck(conf.RootDir, id)
 	if err != nil {
 		Fatalf("loading sandbox: %v", err)
 	}
@@ -85,7 +85,12 @@ func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
 		ev, err := c.Event()
 		if err != nil {
 			log.Warningf("Error getting events for container: %v", err)
+			if evs.stats {
+				return subcommands.ExitFailure
+			}
 		}
+		log.Debugf("Events: %+v", ev)
+
 		// err must be preserved because it is used below when breaking
 		// out of the loop.
 		b, err := json.Marshal(ev)
@@ -101,11 +106,9 @@ func (evs *Events) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
 			if err != nil {
 				return subcommands.ExitFailure
 			}
-			break
+			return subcommands.ExitSuccess
 		}
 
 		time.Sleep(time.Duration(evs.intervalSec) * time.Second)
 	}
-
-	return subcommands.ExitSuccess
 }

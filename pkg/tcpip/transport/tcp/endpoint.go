@@ -1069,9 +1069,7 @@ func (e *endpoint) Close() {
 	e.closeNoShutdownLocked()
 }
 
-// closeNoShutdown closes the endpoint without doing a full shutdown. This is
-// used when a connection needs to be aborted with a RST and we want to skip
-// a full 4 way TCP shutdown.
+// closeNoShutdown closes the endpoint without doing a full shutdown.
 func (e *endpoint) closeNoShutdownLocked() {
 	// For listening sockets, we always release ports inline so that they
 	// are immediately available for reuse after Close() is called. If also
@@ -1098,6 +1096,7 @@ func (e *endpoint) closeNoShutdownLocked() {
 		return
 	}
 
+	eventMask := waiter.EventIn | waiter.EventOut
 	// Either perform the local cleanup or kick the worker to make sure it
 	// knows it needs to cleanup.
 	if e.workerRunning {
@@ -1109,8 +1108,12 @@ func (e *endpoint) closeNoShutdownLocked() {
 	} else {
 		e.transitionToStateCloseLocked()
 		// Notify that the endpoint is closed.
-		e.waiterQueue.Notify(waiter.EventHUp)
+		eventMask |= waiter.EventHUp
 	}
+
+	// The TCP closing state-machine would eventually notify EventHUp, but we
+	// notify EventIn|EventOut immediately to unblock any blocked waiters.
+	e.waiterQueue.Notify(eventMask)
 }
 
 // closePendingAcceptableConnections closes all connections that have completed
@@ -1425,7 +1428,7 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 
 	queueAndSend := func() (int64, <-chan struct{}, *tcpip.Error) {
 		// Add data to the send queue.
-		s := newSegmentFromView(&e.route, e.ID, v)
+		s := newOutgoingSegment(e.ID, v)
 		e.sndBufUsed += len(v)
 		e.sndBufInQueue += seqnum.Size(len(v))
 		e.sndQueue.PushBack(s)
@@ -2316,7 +2319,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 				// done yet) or the reservation was freed between the check above and
 				// the FindTransportEndpoint below. But rather than retry the same port
 				// we just skip it and move on.
-				transEP := e.stack.FindTransportEndpoint(netProto, ProtocolNumber, transEPID, &r)
+				transEP := e.stack.FindTransportEndpoint(netProto, ProtocolNumber, transEPID, r.NICID())
 				if transEP == nil {
 					// ReservePort failed but there is no registered endpoint with
 					// demuxer. Which indicates there is at least some endpoint that has
@@ -2385,7 +2388,6 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 		for _, l := range []segmentList{e.segmentQueue.list, e.sndQueue, e.snd.writeList} {
 			for s := l.Front(); s != nil; s = s.Next() {
 				s.id = e.ID
-				s.route = r.Clone()
 				e.sndWaker.Assert()
 			}
 		}
@@ -2451,7 +2453,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) *tcpip.Error {
 			}
 
 			// Queue fin segment.
-			s := newSegmentFromView(&e.route, e.ID, nil)
+			s := newOutgoingSegment(e.ID, nil)
 			e.sndQueue.PushBack(s)
 			e.sndBufInQueue++
 			// Mark endpoint as closed.
@@ -2723,7 +2725,7 @@ func (e *endpoint) getRemoteAddress() tcpip.FullAddress {
 	}
 }
 
-func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
+func (*endpoint) HandlePacket(stack.TransportEndpointID, *stack.PacketBuffer) {
 	// TCP HandlePacket is not required anymore as inbound packets first
 	// land at the Dispatcher which then can either delivery using the
 	// worker go routine or directly do the invoke the tcp processing inline
@@ -3082,9 +3084,9 @@ func (e *endpoint) initHardwareGSO() {
 }
 
 func (e *endpoint) initGSO() {
-	if e.route.Capabilities()&stack.CapabilityHardwareGSO != 0 {
+	if e.route.HasHardwareGSOCapability() {
 		e.initHardwareGSO()
-	} else if e.route.Capabilities()&stack.CapabilitySoftwareGSO != 0 {
+	} else if e.route.HasSoftwareGSOCapability() {
 		e.gso = &stack.GSO{
 			MaxSize:   e.route.GSOMaxSize(),
 			Type:      stack.GSOSW,
