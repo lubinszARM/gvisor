@@ -115,7 +115,7 @@ func next(start uintptr, size uintptr) uintptr {
 //go:nosplit
 func (w *Walker) iterateRangeCanonical(start, end uintptr) {
 	pgdEntryIndex := w.pageTables.root
-	if start >= upperBottom {
+	if w.pageTables.upperSharedPageTables != nil && start >= upperBottom {
 		pgdEntryIndex = w.pageTables.upperSharedPageTables.root
 	}
 

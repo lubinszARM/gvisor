@@ -23,14 +23,16 @@ import (
 )
 
 func Test2MAnd4K(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.Map(0xffff000000400000, pteSize, MapOpts{AccessType: usermem.ReadWrite, User: false}, pteSize*42)
+	upperPT.Map(0xffffff0000000000, pmdSize, MapOpts{AccessType: usermem.Read, User: false}, pmdSize*47)
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map a small page and a huge page.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite, User: true}, pteSize*42)
 	pt.Map(0x0000ff0000000000, pmdSize, MapOpts{AccessType: usermem.Read, User: true}, pmdSize*47)
-
-	pt.Map(0xffff000000400000, pteSize, MapOpts{AccessType: usermem.ReadWrite, User: false}, pteSize*42)
-	pt.Map(0xffffff0000000000, pmdSize, MapOpts{AccessType: usermem.Read, User: false}, pmdSize*47)
 
 	checkMappings(t, pt, []mapping{
 		{0x400000, pteSize, pteSize * 42, MapOpts{AccessType: usermem.ReadWrite, User: true}},
@@ -41,7 +43,9 @@ func Test2MAnd4K(t *testing.T) {
 }
 
 func Test1GAnd4K(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map a small page and a super page.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite, User: true}, pteSize*42)
@@ -54,7 +58,10 @@ func Test1GAnd4K(t *testing.T) {
 }
 
 func TestSplit1GPage(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map a super page and knock out the middle.
 	pt.Map(0x0000ff0000000000, pudSize, MapOpts{AccessType: usermem.Read, User: true}, pudSize*42)
@@ -67,7 +74,10 @@ func TestSplit1GPage(t *testing.T) {
 }
 
 func TestSplit2MPage(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map a huge page and knock out the middle.
 	pt.Map(0x0000ff0000000000, pmdSize, MapOpts{AccessType: usermem.Read, User: true}, pmdSize*42)

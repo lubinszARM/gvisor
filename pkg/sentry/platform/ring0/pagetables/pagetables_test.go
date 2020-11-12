@@ -86,7 +86,10 @@ func checkMappings(t *testing.T, pt *PageTables, m []mapping) {
 }
 
 func TestUnmap(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map and unmap one entry.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite}, pteSize*42)
@@ -96,7 +99,10 @@ func TestUnmap(t *testing.T) {
 }
 
 func TestReadOnly(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map one entry.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.Read}, pteSize*42)
@@ -107,7 +113,10 @@ func TestReadOnly(t *testing.T) {
 }
 
 func TestReadWrite(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map one entry.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite}, pteSize*42)
@@ -118,7 +127,10 @@ func TestReadWrite(t *testing.T) {
 }
 
 func TestSerialEntries(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map two sequential entries.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite}, pteSize*42)
@@ -131,7 +143,10 @@ func TestSerialEntries(t *testing.T) {
 }
 
 func TestSpanningEntries(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//	pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Span a pgd with two pages.
 	pt.Map(0x00007efffffff000, 2*pteSize, MapOpts{AccessType: usermem.Read}, pteSize*42)
@@ -143,7 +158,10 @@ func TestSpanningEntries(t *testing.T) {
 }
 
 func TestSparseEntries(t *testing.T) {
-	pt := New(NewRuntimeAllocator())
+	//pt := New(NewRuntimeAllocator())
+	upperPT := New(NewRuntimeAllocator())
+	upperPT.MarkReadOnlyShared()
+	pt := NewWithUpper(NewRuntimeAllocator(), upperPT, upperBottom)
 
 	// Map two entries in different pgds.
 	pt.Map(0x400000, pteSize, MapOpts{AccessType: usermem.ReadWrite}, pteSize*42)
