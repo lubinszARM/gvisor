@@ -634,6 +634,10 @@ type Endpoint interface {
 
 	// LastError clears and returns the last error reported by the endpoint.
 	LastError() *Error
+
+	// SocketOptions returns the structure which contains all the socket
+	// level options.
+	SocketOptions() *SocketOptions
 }
 
 // LinkPacketInfo holds Link layer information for a received packet.
@@ -694,15 +698,10 @@ type WriteOptions struct {
 type SockOptBool int
 
 const (
-	// BroadcastOption is used by SetSockOptBool/GetSockOptBool to specify
-	// whether datagram sockets are allowed to send packets to a broadcast
-	// address.
-	BroadcastOption SockOptBool = iota
-
 	// CorkOption is used by SetSockOptBool/GetSockOptBool to specify if
 	// data should be held until segments are full by the TCP transport
 	// protocol.
-	CorkOption
+	CorkOption SockOptBool = iota
 
 	// DelayOption is used by SetSockOptBool/GetSockOptBool to specify if
 	// data should be sent out immediately by the transport protocol. For
@@ -1464,8 +1463,12 @@ type ICMPStats struct {
 // IPStats collects IP-specific stats (both v4 and v6).
 type IPStats struct {
 	// PacketsReceived is the total number of IP packets received from the
-	// link layer in nic.DeliverNetworkPacket.
+	// link layer.
 	PacketsReceived *StatCounter
+
+	// DisabledPacketsReceived is the total number of IP packets received from the
+	// link layer when the IP layer is disabled.
+	DisabledPacketsReceived *StatCounter
 
 	// InvalidDestinationAddressesReceived is the total number of IP packets
 	// received with an unknown or invalid destination address.

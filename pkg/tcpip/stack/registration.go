@@ -65,10 +65,6 @@ const (
 
 // NetworkPacketInfo holds information about a network layer packet.
 type NetworkPacketInfo struct {
-	// RemoteAddressBroadcast is true if the packet's remote address is a
-	// broadcast address.
-	RemoteAddressBroadcast bool
-
 	// LocalAddressBroadcast is true if the packet's local address is a broadcast
 	// address.
 	LocalAddressBroadcast bool
@@ -266,10 +262,10 @@ const (
 // NetOptions is an interface that allows us to pass network protocol specific
 // options through the Stack layer code.
 type NetOptions interface {
-	// AllocationSize returns the amount of memory that must be allocated to
+	// SizeWithPadding returns the amount of memory that must be allocated to
 	// hold the options given that the value must be rounded up to the next
 	// multiple of 4 bytes.
-	AllocationSize() int
+	SizeWithPadding() int
 }
 
 // NetworkHeaderParams are the header parameters given as input by the
@@ -517,6 +513,9 @@ type NetworkInterface interface {
 
 	// Enabled returns true if the interface is enabled.
 	Enabled() bool
+
+	// Promiscuous returns true if the interface is in promiscuous mode.
+	Promiscuous() bool
 
 	// WritePacketToRemote writes the packet to the given remote link address.
 	WritePacketToRemote(tcpip.LinkAddress, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) *tcpip.Error
