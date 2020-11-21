@@ -79,14 +79,51 @@ func getHypercallID(addr uintptr) int {
 // bluepillStopGuest is reponsible for injecting sError.
 //
 //go:nosplit
-func bluepillStopGuest(c *vCPU) {
+func bluepillSetIrq(c *vCPU, irqType, irq, level uint32) {
+	kvmIrq := (irqType << _KVM_ARM_IRQ_TYPE_SHIFT) | irq
+	cpuIdx1 := uint32(c.id % 256)
+	cpuIdx2 := uint32(c.id / 256)
+
+	kvmIrq |= (cpuIdx1 << _KVM_ARM_IRQ_VCPU_SHIFT) | (cpuIdx2 << _KVM_ARM_IRQ_VCPU2_SHIFT)
+
+	irqLevel := irqLevel{
+		irq:   kvmIrq,
+		level: level,
+	}
 	if _, _, errno := syscall.RawSyscall( // escapes: no.
 		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_VCPU_EVENTS,
-		uintptr(unsafe.Pointer(&vcpuSErrBounce))); errno != 0 {
-		throw("sErr injection failed")
+		uintptr(c.machine.fd),
+		_KVM_IRQ_LINE,
+		uintptr(unsafe.Pointer(&irqLevel))); errno != 0 {
+		throw("irq injection failed")
 	}
+}
+
+// bluepillStopGuest is reponsible for injecting sError.
+//
+//go:nosplit
+func bluepillStopGuest(c *vCPU) {
+	/*
+	   int kvm_irq = (irqtype << KVM_ARM_IRQ_TYPE_SHIFT) | irq;
+	   int cpu_idx1 = cpu % 256;
+	   int cpu_idx2 = cpu / 256;
+
+	   kvm_irq |= (cpu_idx1 << KVM_ARM_IRQ_VCPU_SHIFT) |
+	              (cpu_idx2 << KVM_ARM_IRQ_VCPU2_SHIFT);
+
+	   return kvm_set_irq(kvm_state, kvm_irq, !!level);
+	*/
+
+	/*	if _, _, errno := syscall.RawSyscall( // escapes: no.
+			syscall.SYS_IOCTL,
+			uintptr(c.fd),
+			_KVM_SET_VCPU_EVENTS,
+			uintptr(unsafe.Pointer(&vcpuSErrBounce))); errno != 0 {
+			throw("sErr injection failed")
+		}
+	*/
+	bluepillSetIrq(c, _KVM_ARM_IRQ_TYPE_CPU, _KVM_ARM_IRQ_CPU_FIQ, 1)
+	bluepillSetIrq(c, _KVM_ARM_IRQ_TYPE_CPU, _KVM_ARM_IRQ_CPU_FIQ, 0)
 }
 
 // bluepillSigBus is reponsible for injecting sError to trigger sigbus.

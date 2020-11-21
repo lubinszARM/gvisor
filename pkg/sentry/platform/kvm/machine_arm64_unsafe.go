@@ -46,6 +46,14 @@ func (m *machine) initArchState() error {
 		uintptr(unsafe.Pointer(&vcpuInit))); errno != 0 {
 		panic(fmt.Sprintf("error setting KVM_ARM_PREFERRED_TARGET failed: %v", errno))
 	}
+	/*
+		if _, _, errno := syscall.RawSyscall(
+			syscall.SYS_IOCTL,
+			uintptr(m.fd),
+			_KVM_CREATE_IRQCHIP, 0); errno != 0 {
+			panic(fmt.Sprintf("error setting KVM_CREATE_IRQCHIP failed: %v", errno))
+		}
+	*/
 	return nil
 }
 

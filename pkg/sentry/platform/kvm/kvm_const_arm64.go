@@ -156,6 +156,27 @@ const (
 	_ESR_ELx_SERR_NMI = 0x1
 )
 
+const (
+	/* irq_type field */
+	_KVM_ARM_IRQ_TYPE_CPU = 0
+	_KVM_ARM_IRQ_TYPE_SPI = 1
+	_KVM_ARM_IRQ_TYPE_PPI = 2
+
+	/* out-of-kernel GIC cpu interrupt injection irq_number field */
+	_KVM_ARM_IRQ_CPU_IRQ = 0
+	_KVM_ARM_IRQ_CPU_FIQ = 1
+
+	/* KVM_IRQ_LINE irq field index values */
+	_KVM_ARM_IRQ_VCPU2_SHIFT = 28
+	_KVM_ARM_IRQ_VCPU2_MASK  = 0xf
+	_KVM_ARM_IRQ_TYPE_SHIFT  = 24
+	_KVM_ARM_IRQ_TYPE_MASK   = 0xf
+	_KVM_ARM_IRQ_VCPU_SHIFT  = 16
+	_KVM_ARM_IRQ_VCPU_MASK   = 0xff
+	_KVM_ARM_IRQ_NUM_SHIFT   = 0
+	_KVM_ARM_IRQ_NUM_MASK    = 0xffff
+)
+
 // Arm64: MMIO base address used to dispatch hypercalls.
 const (
 	// on Arm64, the MMIO address must be 64-bit aligned.

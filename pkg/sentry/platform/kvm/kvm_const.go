@@ -23,6 +23,7 @@ const (
 	_KVM_GET_VCPU_MMAP_SIZE     = 0xae04
 	_KVM_CREATE_VCPU            = 0xae41
 	_KVM_SET_TSS_ADDR           = 0xae47
+	_KVM_CREATE_IRQCHIP         = 0xae60
 	_KVM_RUN                    = 0xae80
 	_KVM_NMI                    = 0xae9a
 	_KVM_CHECK_EXTENSION        = 0xae03
@@ -41,6 +42,7 @@ const (
 	_KVM_SET_SIGNAL_MASK        = 0x4004ae8b
 	_KVM_GET_VCPU_EVENTS        = 0x8040ae9f
 	_KVM_SET_VCPU_EVENTS        = 0x4040aea0
+	_KVM_IRQ_LINE               = 0xc008ae67
 )
 
 // KVM exit reasons.

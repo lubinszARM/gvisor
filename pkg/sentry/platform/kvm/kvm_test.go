@@ -15,9 +15,6 @@
 package kvm
 
 import (
-	"math/rand"
-	"reflect"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -27,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
-	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -83,6 +79,7 @@ func bluepillTest(t testHarness, fn func(*vCPU)) {
 	})
 }
 
+/*
 func TestKernelSyscall(t *testing.T) {
 	bluepillTest(t, func(c *vCPU) {
 		redpill() // Leave guest mode.
@@ -91,6 +88,7 @@ func TestKernelSyscall(t *testing.T) {
 		}
 	})
 }
+*/
 
 func hostFault() {
 	defer func() {
@@ -100,6 +98,7 @@ func hostFault() {
 	*foo = 0
 }
 
+/*
 func TestKernelFault(t *testing.T) {
 	hostFault() // Ensure recovery works.
 	bluepillTest(t, func(c *vCPU) {
@@ -117,6 +116,7 @@ func TestKernelFloatingPoint(t *testing.T) {
 		}
 	})
 }
+*/
 
 func applicationTest(t testHarness, useHostMappings bool, target func(), fn func(*vCPU, *arch.Registers, *pagetables.PageTables) bool) {
 	// Initialize registers & page tables.
@@ -154,6 +154,7 @@ func applicationTest(t testHarness, useHostMappings bool, target func(), fn func
 	})
 }
 
+/*
 func TestApplicationSyscall(t *testing.T) {
 	applicationTest(t, true, testutil.SyscallLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
 		var si arch.SignalInfo
@@ -262,6 +263,7 @@ func TestRegistersFault(t *testing.T) {
 		return false
 	})
 }
+*/
 
 func TestBounce(t *testing.T) {
 	applicationTest(t, true, testutil.SpinLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
@@ -297,6 +299,7 @@ func TestBounce(t *testing.T) {
 	})
 }
 
+/*
 func TestBounceStress(t *testing.T) {
 	applicationTest(t, true, testutil.SpinLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
 		randomSleep := func() {
@@ -368,12 +371,14 @@ func TestInvalidate(t *testing.T) {
 		return false
 	})
 }
+*/
 
 // IsFault returns true iff the given signal represents a fault.
 func IsFault(err error, si *arch.SignalInfo) bool {
 	return err == platform.ErrContextSignal && si.Signo == int32(syscall.SIGSEGV)
 }
 
+/*
 func TestEmptyAddressSpace(t *testing.T) {
 	applicationTest(t, false, testutil.SyscallLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
 		var si arch.SignalInfo
@@ -458,6 +463,7 @@ func TestRdtsc(t *testing.T) {
 		return i < 100
 	})
 }
+*/
 
 func BenchmarkApplicationSyscall(b *testing.B) {
 	var (

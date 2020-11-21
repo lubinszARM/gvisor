@@ -708,12 +708,17 @@ el0_invalid:
 	EXCEPTION_EL0(El0SyncInv)
 
 TEXT ·El0_irq(SB),NOSPLIT,$0
+MOVD $0x99, R9
+WFI
 	B ·Shutdown(SB)
 
 TEXT ·El0_fiq(SB),NOSPLIT,$0
+MOVD $0x111, R9
+WFI
 	B ·Shutdown(SB)
 
 TEXT ·El0_error(SB),NOSPLIT,$0
+WFI
 	KERNEL_ENTRY_FROM_EL0
 	WORD $0xd5385219        // MRS ESR_EL1, R25
 	AND $ESR_ELx_SERR_MASK, R25, R24
@@ -752,15 +757,20 @@ el0_bounce:
 	B ·kernelExitToEl1(SB)
 
 TEXT ·El0_sync_invalid(SB),NOSPLIT,$0
+WFI
 	B ·Shutdown(SB)
 
 TEXT ·El0_irq_invalid(SB),NOSPLIT,$0
+WFI
 	B ·Shutdown(SB)
 
 TEXT ·El0_fiq_invalid(SB),NOSPLIT,$0
+WFI
 	B ·Shutdown(SB)
 
 TEXT ·El0_error_invalid(SB),NOSPLIT,$0
+WFI
+
 	B ·Shutdown(SB)
 
 // Vectors implements exception vector table.

@@ -53,6 +53,11 @@ type exception struct {
 	sErrEsr     uint64
 }
 
+type irqLevel struct {
+	irq   uint32
+	level uint32
+}
+
 type kvmVcpuEvents struct {
 	exception
 	rsvd [12]uint32
