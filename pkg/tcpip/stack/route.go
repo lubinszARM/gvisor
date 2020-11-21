@@ -71,22 +71,24 @@ type Route struct {
 // ownership of the provided local address.
 //
 // Returns an empty route if validation fails.
-func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndpoint AssignableAddressEndpoint, localAddressNIC, outgoingNIC *NIC, gateway, remoteAddr tcpip.Address, handleLocal, multicastLoop bool) Route {
-	addrWithPrefix := addressEndpoint.AddressWithPrefix()
+func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndpoint AssignableAddressEndpoint, localAddressNIC, outgoingNIC *NIC, gateway, localAddr, remoteAddr tcpip.Address, handleLocal, multicastLoop bool) Route {
+	if len(localAddr) == 0 {
+		localAddr = addressEndpoint.AddressWithPrefix().Address
+	}
 
-	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalAddress(addrWithPrefix.Address) {
+	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalAddress(localAddr) {
 		addressEndpoint.DecRef()
 		return Route{}
 	}
 
 	// If no remote address is provided, use the local address.
 	if len(remoteAddr) == 0 {
-		remoteAddr = addrWithPrefix.Address
+		remoteAddr = localAddr
 	}
 
 	r := makeRoute(
 		netProto,
-		addrWithPrefix.Address,
+		localAddr,
 		remoteAddr,
 		outgoingNIC,
 		localAddressNIC,
@@ -99,7 +101,7 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 	// broadcast it.
 	if len(gateway) > 0 {
 		r.NextHop = gateway
-	} else if subnet := addrWithPrefix.Subnet(); subnet.IsBroadcast(remoteAddr) {
+	} else if subnet := addressEndpoint.Subnet(); subnet.IsBroadcast(remoteAddr) {
 		r.RemoteLinkAddress = header.EthernetBroadcastAddress
 	}
 
@@ -111,6 +113,10 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool) Route {
 	if localAddressNIC.stack != outgoingNIC.stack {
 		panic(fmt.Sprintf("cannot create a route with NICs from different stacks"))
+	}
+
+	if len(localAddr) == 0 {
+		localAddr = localAddressEndpoint.AddressWithPrefix().Address
 	}
 
 	loop := PacketOut
@@ -391,23 +397,6 @@ func (r *Route) Clone() Route {
 	return *r
 }
 
-// MakeLoopedRoute duplicates the given route with special handling for routes
-// used for sending multicast or broadcast packets. In those cases the
-// multicast/broadcast address is the remote address when sending out, but for
-// incoming (looped) packets it becomes the local address. Similarly, the local
-// interface address that was the local address going out becomes the remote
-// address coming in. This is different to unicast routes where local and
-// remote addresses remain the same as they identify location (local vs remote)
-// not direction (source vs destination).
-func (r *Route) MakeLoopedRoute() Route {
-	l := r.Clone()
-	if r.RemoteAddress == header.IPv4Broadcast || header.IsV4MulticastAddress(r.RemoteAddress) || header.IsV6MulticastAddress(r.RemoteAddress) {
-		l.RemoteAddress, l.LocalAddress = l.LocalAddress, l.RemoteAddress
-		l.RemoteLinkAddress = l.LocalLinkAddress
-	}
-	return l
-}
-
 // Stack returns the instance of the Stack that owns this route.
 func (r *Route) Stack() *Stack {
 	return r.outgoingNIC.stack
@@ -427,28 +416,4 @@ func (r *Route) isV4Broadcast(addr tcpip.Address) bool {
 func (r *Route) IsOutboundBroadcast() bool {
 	// Only IPv4 has a notion of broadcast.
 	return r.isV4Broadcast(r.RemoteAddress)
-}
-
-// isInboundBroadcast returns true if the route is for an inbound broadcast
-// packet.
-func (r *Route) isInboundBroadcast() bool {
-	// Only IPv4 has a notion of broadcast.
-	return r.isV4Broadcast(r.LocalAddress)
-}
-
-// ReverseRoute returns new route with given source and destination address.
-func (r *Route) ReverseRoute(src tcpip.Address, dst tcpip.Address) Route {
-	return Route{
-		NetProto:             r.NetProto,
-		LocalAddress:         dst,
-		LocalLinkAddress:     r.RemoteLinkAddress,
-		RemoteAddress:        src,
-		RemoteLinkAddress:    r.LocalLinkAddress,
-		Loop:                 r.Loop,
-		localAddressNIC:      r.localAddressNIC,
-		localAddressEndpoint: r.localAddressEndpoint,
-		outgoingNIC:          r.outgoingNIC,
-		linkCache:            r.linkCache,
-		linkRes:              r.linkRes,
-	}
 }

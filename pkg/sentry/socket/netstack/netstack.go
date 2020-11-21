@@ -260,10 +260,12 @@ type commonEndpoint interface {
 	// transport.Endpoint.GetSockOpt.
 	GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error)
 
-	// LastError implements tcpip.Endpoint.LastError.
+	// LastError implements tcpip.Endpoint.LastError and
+	// transport.Endpoint.LastError.
 	LastError() *tcpip.Error
 
-	// SocketOptions implements tcpip.Endpoint.SocketOptions.
+	// SocketOptions implements tcpip.Endpoint.SocketOptions and
+	// transport.Endpoint.SocketOptions.
 	SocketOptions() *tcpip.SocketOptions
 }
 
@@ -1068,13 +1070,8 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.PasscredOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetPassCred()))
+		return &v, nil
 
 	case linux.SO_SNDBUF:
 		if outLen < sizeOfInt32 {
@@ -1115,25 +1112,16 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReuseAddressOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReuseAddress()))
+		return &v, nil
 
 	case linux.SO_REUSEPORT:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.ReusePortOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReusePort()))
+		return &v, nil
 
 	case linux.SO_BINDTODEVICE:
 		var v tcpip.BindToDeviceOption
@@ -1174,13 +1162,8 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.KeepaliveEnabledOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetKeepAlive()))
+		return &v, nil
 
 	case linux.SO_LINGER:
 		if outLen < linux.SizeOfLinger {
@@ -1235,24 +1218,16 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.NoChecksumOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetNoChecksum()))
+		return &v, nil
 
 	case linux.SO_ACCEPTCONN:
 		if outLen < sizeOfInt32 {
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v, err := ep.GetSockOptBool(tcpip.AcceptConnOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetAcceptConn()))
+		return &v, nil
 
 	default:
 		socket.GetSockOptEmitUnimplementedEvent(t, name)
@@ -1876,7 +1851,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReuseAddressOption, v != 0))
+		ep.SocketOptions().SetReuseAddress(v != 0)
+		return nil
 
 	case linux.SO_REUSEPORT:
 		if len(optVal) < sizeOfInt32 {
@@ -1884,7 +1860,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.ReusePortOption, v != 0))
+		ep.SocketOptions().SetReusePort(v != 0)
+		return nil
 
 	case linux.SO_BINDTODEVICE:
 		n := bytes.IndexByte(optVal, 0)
@@ -1923,7 +1900,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.PasscredOption, v != 0))
+		ep.SocketOptions().SetPassCred(v != 0)
+		return nil
 
 	case linux.SO_KEEPALIVE:
 		if len(optVal) < sizeOfInt32 {
@@ -1931,7 +1909,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.KeepaliveEnabledOption, v != 0))
+		ep.SocketOptions().SetKeepAlive(v != 0)
+		return nil
 
 	case linux.SO_SNDTIMEO:
 		if len(optVal) < linux.SizeOfTimeval {
@@ -1979,7 +1958,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptBool(tcpip.NoChecksumOption, v != 0))
+		ep.SocketOptions().SetNoChecksum(v != 0)
+		return nil
 
 	case linux.SO_LINGER:
 		if len(optVal) < linux.SizeOfLinger {
@@ -2686,7 +2666,7 @@ func (s *socketOpsCommon) coalescingRead(ctx context.Context, dst usermem.IOSequ
 		// Always do at least one fetchReadView, even if the number of bytes to
 		// read is 0.
 		err = s.fetchReadView()
-		if err != nil {
+		if err != nil || len(s.readView) == 0 {
 			break
 		}
 		if dst.NumBytes() == 0 {
@@ -2709,15 +2689,20 @@ func (s *socketOpsCommon) coalescingRead(ctx context.Context, dst usermem.IOSequ
 		}
 		copied += n
 		s.readView.TrimFront(n)
-		if len(s.readView) == 0 {
-			atomic.StoreUint32(&s.readViewHasData, 0)
-		}
 
 		dst = dst.DropFirst(n)
 		if e != nil {
 			err = syserr.FromError(e)
 			break
 		}
+		// If we are done reading requested data then stop.
+		if dst.NumBytes() == 0 {
+			break
+		}
+	}
+
+	if len(s.readView) == 0 {
+		atomic.StoreUint32(&s.readViewHasData, 0)
 	}
 
 	// If we managed to copy something, we must deliver it.

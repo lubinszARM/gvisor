@@ -49,6 +49,7 @@ const (
 // +stateify savable
 type endpoint struct {
 	stack.TransportEndpointInfo
+	tcpip.DefaultSocketOptionsHandler
 
 	// The following fields are initialized at creation time and are
 	// immutable.
@@ -85,7 +86,7 @@ type endpoint struct {
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return &endpoint{
+	ep := &endpoint{
 		stack: s,
 		TransportEndpointInfo: stack.TransportEndpointInfo{
 			NetProto:   netProto,
@@ -96,7 +97,9 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 		sndBufSize:    32 * 1024,
 		state:         stateInitial,
 		uniqueID:      s.UniqueID(),
-	}, nil
+	}
+	ep.ops.InitHandler(ep)
+	return ep, nil
 }
 
 // UniqueID implements stack.TransportEndpoint.UniqueID.
@@ -380,13 +383,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
-	switch opt {
-	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
-		return false, nil
-
-	default:
-		return false, tcpip.ErrUnknownProtocolOption
-	}
+	return false, tcpip.ErrUnknownProtocolOption
 }
 
 // GetSockOptInt implements tcpip.Endpoint.GetSockOptInt.
@@ -857,6 +854,7 @@ func (*endpoint) LastError() *tcpip.Error {
 	return nil
 }
 
+// SocketOptions implements tcpip.Endpoint.SocketOptions.
 func (e *endpoint) SocketOptions() *tcpip.SocketOptions {
 	return &e.ops
 }

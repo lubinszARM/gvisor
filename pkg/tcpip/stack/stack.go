@@ -1118,6 +1118,16 @@ func (s *Stack) AddAddress(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber,
 	return s.AddAddressWithOptions(id, protocol, addr, CanBePrimaryEndpoint)
 }
 
+// AddAddressWithPrefix is the same as AddAddress, but allows you to specify
+// the address prefix.
+func (s *Stack) AddAddressWithPrefix(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.AddressWithPrefix) *tcpip.Error {
+	ap := tcpip.ProtocolAddress{
+		Protocol:          protocol,
+		AddressWithPrefix: addr,
+	}
+	return s.AddProtocolAddressWithOptions(id, ap, CanBePrimaryEndpoint)
+}
+
 // AddProtocolAddress adds a new network-layer protocol address to the
 // specified NIC.
 func (s *Stack) AddProtocolAddress(id tcpip.NICID, protocolAddress tcpip.ProtocolAddress) *tcpip.Error {
@@ -1240,7 +1250,7 @@ func (s *Stack) findLocalRouteFromNICRLocked(localAddressNIC *NIC, localAddr, re
 
 	r := makeLocalRoute(
 		netProto,
-		localAddressEndpoint.AddressWithPrefix().Address,
+		localAddr,
 		remoteAddr,
 		outgoingNIC,
 		localAddressNIC,
@@ -1317,7 +1327,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 			if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, netProto); addressEndpoint != nil {
 				return makeRoute(
 					netProto,
-					addressEndpoint.AddressWithPrefix().Address,
+					localAddr,
 					remoteAddr,
 					nic, /* outboundNIC */
 					nic, /* localAddressNIC*/
@@ -1354,7 +1364,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 				if needRoute {
 					gateway = route.Gateway
 				}
-				r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, remoteAddr, s.handleLocal, multicastLoop)
+				r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop)
 				if r == (Route{}) {
 					panic(fmt.Sprintf("non-forwarding route validation failed with route table entry = %#v, id = %d, localAddr = %s, remoteAddr = %s", route, id, localAddr, remoteAddr))
 				}
@@ -1391,7 +1401,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 		if id != 0 {
 			if aNIC, ok := s.nics[id]; ok {
 				if addressEndpoint := s.getAddressEP(aNIC, localAddr, remoteAddr, netProto); addressEndpoint != nil {
-					if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, nic /* outgoingNIC */, gateway, remoteAddr, s.handleLocal, multicastLoop); r != (Route{}) {
+					if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop); r != (Route{}) {
 						return r, nil
 					}
 				}
@@ -1409,7 +1419,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 					continue
 				}
 
-				if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, nic /* outgoingNIC */, gateway, remoteAddr, s.handleLocal, multicastLoop); r != (Route{}) {
+				if r := constructAndValidateRoute(netProto, addressEndpoint, aNIC /* localAddressNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop); r != (Route{}) {
 					return r, nil
 				}
 			}
@@ -1810,49 +1820,20 @@ func (s *Stack) unregisterPacketEndpointLocked(nicID tcpip.NICID, netProto tcpip
 	nic.unregisterPacketEndpoint(netProto, ep)
 }
 
-// WritePacket writes data directly to the specified NIC. It adds an ethernet
-// header based on the arguments.
-func (s *Stack) WritePacket(nicID tcpip.NICID, dst tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.VectorisedView) *tcpip.Error {
+// WritePacketToRemote writes a payload on the specified NIC using the provided
+// network protocol and remote link address.
+func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.VectorisedView) *tcpip.Error {
 	s.mu.Lock()
 	nic, ok := s.nics[nicID]
 	s.mu.Unlock()
 	if !ok {
 		return tcpip.ErrUnknownDevice
 	}
-
-	// Add our own fake ethernet header.
-	ethFields := header.EthernetFields{
-		SrcAddr: nic.LinkEndpoint.LinkAddress(),
-		DstAddr: dst,
-		Type:    netProto,
-	}
-	fakeHeader := make(header.Ethernet, header.EthernetMinimumSize)
-	fakeHeader.Encode(&ethFields)
-	vv := buffer.View(fakeHeader).ToVectorisedView()
-	vv.Append(payload)
-
-	if err := nic.LinkEndpoint.WriteRawPacket(vv); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// WriteRawPacket writes data directly to the specified NIC without adding any
-// headers.
-func (s *Stack) WriteRawPacket(nicID tcpip.NICID, payload buffer.VectorisedView) *tcpip.Error {
-	s.mu.Lock()
-	nic, ok := s.nics[nicID]
-	s.mu.Unlock()
-	if !ok {
-		return tcpip.ErrUnknownDevice
-	}
-
-	if err := nic.LinkEndpoint.WriteRawPacket(payload); err != nil {
-		return err
-	}
-
-	return nil
+	pkt := NewPacketBuffer(PacketBufferOptions{
+		ReserveHeaderBytes: int(nic.MaxHeaderLength()),
+		Data:               payload,
+	})
+	return nic.WritePacketToRemote(remote, nil, netProto, pkt)
 }
 
 // NetworkProtocolInstance returns the protocol instance in the stack for the
@@ -1912,7 +1893,6 @@ func (s *Stack) RemoveTCPProbe() {
 
 // JoinGroup joins the given multicast group on the given NIC.
 func (s *Stack) JoinGroup(protocol tcpip.NetworkProtocolNumber, nicID tcpip.NICID, multicastAddr tcpip.Address) *tcpip.Error {
-	// TODO: notify network of subscription via igmp protocol.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2158,4 +2138,44 @@ func (s *Stack) networkProtocolNumbers() []tcpip.NetworkProtocolNumber {
 		protos = append(protos, p)
 	}
 	return protos
+}
+
+func isSubnetBroadcastOnNIC(nic *NIC, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
+	addressEndpoint := nic.getAddressOrCreateTempInner(protocol, addr, false /* createTemp */, NeverPrimaryEndpoint)
+	if addressEndpoint == nil {
+		return false
+	}
+
+	subnet := addressEndpoint.Subnet()
+	addressEndpoint.DecRef()
+	return subnet.IsBroadcast(addr)
+}
+
+// IsSubnetBroadcast returns true if the provided address is a subnet-local
+// broadcast address on the specified NIC and protocol.
+//
+// Returns false if the NIC is unknown or if the protocol is unknown or does
+// not support addressing.
+//
+// If the NIC is not specified, the stack will check all NICs.
+func (s *Stack) IsSubnetBroadcast(nicID tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if nicID != 0 {
+		nic, ok := s.nics[nicID]
+		if !ok {
+			return false
+		}
+
+		return isSubnetBroadcastOnNIC(nic, protocol, addr)
+	}
+
+	for _, nic := range s.nics {
+		if isSubnetBroadcastOnNIC(nic, protocol, addr) {
+			return true
+		}
+	}
+
+	return false
 }

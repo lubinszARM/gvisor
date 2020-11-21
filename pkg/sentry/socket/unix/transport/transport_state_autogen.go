@@ -329,7 +329,7 @@ func (e *baseEndpoint) StateTypeName() string {
 func (e *baseEndpoint) StateFields() []string {
 	return []string{
 		"Queue",
-		"passcred",
+		"DefaultSocketOptionsHandler",
 		"receiver",
 		"connected",
 		"path",
@@ -343,7 +343,7 @@ func (e *baseEndpoint) beforeSave() {}
 func (e *baseEndpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.Queue)
-	stateSinkObject.Save(1, &e.passcred)
+	stateSinkObject.Save(1, &e.DefaultSocketOptionsHandler)
 	stateSinkObject.Save(2, &e.receiver)
 	stateSinkObject.Save(3, &e.connected)
 	stateSinkObject.Save(4, &e.path)
@@ -355,7 +355,7 @@ func (e *baseEndpoint) afterLoad() {}
 
 func (e *baseEndpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.Queue)
-	stateSourceObject.Load(1, &e.passcred)
+	stateSourceObject.Load(1, &e.DefaultSocketOptionsHandler)
 	stateSourceObject.Load(2, &e.receiver)
 	stateSourceObject.Load(3, &e.connected)
 	stateSourceObject.Load(4, &e.path)

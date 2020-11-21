@@ -58,6 +58,8 @@ type rawPacket struct {
 // +stateify savable
 type endpoint struct {
 	stack.TransportEndpointInfo
+	tcpip.DefaultSocketOptionsHandler
+
 	// The following fields are initialized at creation time and are
 	// immutable.
 	stack       *stack.Stack `state:"manual"`
@@ -116,6 +118,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 		associated:    associated,
 		hdrIncluded:   !associated,
 	}
+	e.ops.InitHandler(e)
 
 	// Override with stack defaults.
 	var ss stack.SendBufferSizeOption
@@ -604,9 +607,6 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
-	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
-		return false, nil
-
 	case tcpip.IPHdrIncludedOption:
 		e.mu.Lock()
 		v := e.hdrIncluded
@@ -756,10 +756,12 @@ func (e *endpoint) Stats() tcpip.EndpointStats {
 // Wait implements stack.TransportEndpoint.Wait.
 func (*endpoint) Wait() {}
 
+// LastError implements tcpip.Endpoint.LastError.
 func (*endpoint) LastError() *tcpip.Error {
 	return nil
 }
 
+// SocketOptions implements tcpip.Endpoint.SocketOptions.
 func (e *endpoint) SocketOptions() *tcpip.SocketOptions {
 	return &e.ops
 }

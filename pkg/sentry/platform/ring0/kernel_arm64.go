@@ -24,6 +24,10 @@ func HaltAndResume()
 //go:nosplit
 func HaltEl1SvcAndResume()
 
+// HaltEl1ExceptionAndResume calls Hooks.KernelException and resume.
+//go:nosplit
+func HaltEl1ExceptionAndResume()
+
 // init initializes architecture-specific state.
 func (k *Kernel) init(maxCPUs int) {
 }
@@ -61,11 +65,13 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	regs.Pstate &= ^uint64(PsrFlagsClear)
 	regs.Pstate |= UserFlagsSet
 
+	EnableVFP()
 	LoadFloatingPoint(switchOpts.FloatingPointState)
 
 	kernelExitToEl0()
 
 	SaveFloatingPoint(switchOpts.FloatingPointState)
+	DisableVFP()
 
 	vector = c.vecCode
 

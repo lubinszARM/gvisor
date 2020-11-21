@@ -72,6 +72,7 @@ type endpoint struct {
 	nic        stack.NetworkInterface
 	dispatcher stack.TransportDispatcher
 	protocol   *protocol
+	igmp       igmpState
 
 	// enabled is set to 1 when the enpoint is enabled and 0 when it is
 	// disabled.
@@ -94,6 +95,7 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, _ stack.LinkAddressCa
 		protocol:   p,
 	}
 	e.mu.addressableEndpointState.Init(e)
+	e.igmp.init(e)
 	return e
 }
 
@@ -566,21 +568,6 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		stats.IP.MalformedPacketsReceived.Increment()
 		return
 	}
-	srcAddr := h.SourceAddress()
-	dstAddr := h.DestinationAddress()
-
-	addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint)
-	if addressEndpoint == nil {
-		if !e.protocol.Forwarding() {
-			stats.IP.InvalidDestinationAddressesReceived.Increment()
-			return
-		}
-
-		_ = e.forwardPacket(pkt)
-		return
-	}
-	subnet := addressEndpoint.AddressWithPrefix().Subnet()
-	addressEndpoint.DecRef()
 
 	// There has been some confusion regarding verifying checksums. We need
 	// just look for negative 0 (0xffff) as the checksum, as it's not possible to
@@ -608,16 +595,42 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		return
 	}
 
+	srcAddr := h.SourceAddress()
+	dstAddr := h.DestinationAddress()
+
 	// As per RFC 1122 section 3.2.1.3:
 	//   When a host sends any datagram, the IP source address MUST
 	//   be one of its own IP addresses (but not a broadcast or
 	//   multicast address).
-	if directedBroadcast := subnet.IsBroadcast(srcAddr); directedBroadcast || srcAddr == header.IPv4Broadcast || header.IsV4MulticastAddress(srcAddr) {
+	if srcAddr == header.IPv4Broadcast || header.IsV4MulticastAddress(srcAddr) {
 		stats.IP.InvalidSourceAddressesReceived.Increment()
 		return
 	}
+	// Make sure the source address is not a subnet-local broadcast address.
+	if addressEndpoint := e.AcquireAssignedAddress(srcAddr, false /* createTemp */, stack.NeverPrimaryEndpoint); addressEndpoint != nil {
+		subnet := addressEndpoint.Subnet()
+		addressEndpoint.DecRef()
+		if subnet.IsBroadcast(srcAddr) {
+			stats.IP.InvalidSourceAddressesReceived.Increment()
+			return
+		}
+	}
 
-	pkt.NetworkPacketInfo.LocalAddressBroadcast = subnet.IsBroadcast(dstAddr) || dstAddr == header.IPv4Broadcast
+	// The destination address should be an address we own or a group we joined
+	// for us to receive the packet. Otherwise, attempt to forward the packet.
+	if addressEndpoint := e.AcquireAssignedAddress(dstAddr, e.nic.Promiscuous(), stack.CanBePrimaryEndpoint); addressEndpoint != nil {
+		subnet := addressEndpoint.AddressWithPrefix().Subnet()
+		addressEndpoint.DecRef()
+		pkt.NetworkPacketInfo.LocalAddressBroadcast = subnet.IsBroadcast(dstAddr) || dstAddr == header.IPv4Broadcast
+	} else if !e.IsInGroup(dstAddr) {
+		if !e.protocol.Forwarding() {
+			stats.IP.InvalidDestinationAddressesReceived.Increment()
+			return
+		}
+
+		_ = e.forwardPacket(pkt)
+		return
+	}
 
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
@@ -690,6 +703,13 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		// unnecessary and removed.
 		pkt.TransportProtocolNumber = p
 		e.handleICMP(pkt)
+		return
+	}
+	if p == header.IGMPProtocolNumber {
+		if e.protocol.options.IGMPEnabled {
+			e.igmp.handleIGMP(pkt)
+		}
+		// Nothing further to do with an IGMP packet, even if IGMP is not enabled.
 		return
 	}
 	if opts := h.Options(); len(opts) != 0 {
@@ -823,14 +843,26 @@ func (e *endpoint) JoinGroup(addr tcpip.Address) (bool, *tcpip.Error) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.mu.addressableEndpointState.JoinGroup(addr)
+
+	joinedGroup, err := e.mu.addressableEndpointState.JoinGroup(addr)
+	if err == nil && joinedGroup && e.protocol.options.IGMPEnabled {
+		_ = e.igmp.joinGroup(addr)
+	}
+
+	return joinedGroup, err
 }
 
 // LeaveGroup implements stack.GroupAddressableEndpoint.
 func (e *endpoint) LeaveGroup(addr tcpip.Address) (bool, *tcpip.Error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.mu.addressableEndpointState.LeaveGroup(addr)
+
+	leftGroup, err := e.mu.addressableEndpointState.LeaveGroup(addr)
+	if err == nil && leftGroup && e.protocol.options.IGMPEnabled {
+		e.igmp.leaveGroup(addr)
+	}
+
+	return leftGroup, err
 }
 
 // IsInGroup implements stack.GroupAddressableEndpoint.
@@ -863,6 +895,8 @@ type protocol struct {
 	hashIV uint32
 
 	fragmentation *fragmentation.Fragmentation
+
+	options Options
 }
 
 // Number returns the ipv4 protocol number.
@@ -996,8 +1030,15 @@ func hashRoute(r *stack.Route, protocol tcpip.TransportProtocolNumber, hashIV ui
 	return hash.Hash3Words(a, b, uint32(protocol), hashIV)
 }
 
-// NewProtocol returns an IPv4 network protocol.
-func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
+// Options holds options to configure a new protocol.
+type Options struct {
+	// IGMPEnabled indicates whether incoming IGMP packets will be handled and if
+	// this endpoint will transmit IGMP packets on IGMP related events.
+	IGMPEnabled bool
+}
+
+// NewProtocolWithOptions returns an IPv4 network protocol.
+func NewProtocolWithOptions(opts Options) stack.NetworkProtocolFactory {
 	ids := make([]uint32, buckets)
 
 	// Randomly initialize hashIV and the ids.
@@ -1007,14 +1048,22 @@ func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
 	}
 	hashIV := r[buckets]
 
-	p := &protocol{
-		stack:      s,
-		ids:        ids,
-		hashIV:     hashIV,
-		defaultTTL: DefaultTTL,
+	return func(s *stack.Stack) stack.NetworkProtocol {
+		p := &protocol{
+			stack:      s,
+			ids:        ids,
+			hashIV:     hashIV,
+			defaultTTL: DefaultTTL,
+			options:    opts,
+		}
+		p.fragmentation = fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, ReassembleTimeout, s.Clock(), p)
+		return p
 	}
-	p.fragmentation = fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, ReassembleTimeout, s.Clock(), p)
-	return p
+}
+
+// NewProtocol is equivalent to NewProtocolWithOptions with an empty Options.
+func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
+	return NewProtocolWithOptions(Options{})(s)
 }
 
 func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader header.IPv4) (*stack.PacketBuffer, bool) {
@@ -1129,6 +1178,12 @@ func handleTimestamp(tsOpt header.IPv4OptionTimestamp, localAddress tcpip.Addres
 	}
 
 	pointer := tsOpt.Pointer()
+	// RFC 791 page 22 states: "The smallest legal value is 5."
+	// Since the pointer is 1 based, and the header is 4 bytes long the
+	// pointer must point beyond the header therefore 4 or less is bad.
+	if pointer <= header.IPv4OptionTimestampHdrLength {
+		return header.IPv4OptTSPointerOffset, errIPv4TimestampOptInvalidPointer
+	}
 	// To simplify processing below, base further work on the array of timestamps
 	// beyond the header, rather than on the whole option. Also to aid
 	// calculations set 'nextSlot' to be 0 based as in the packet it is 1 based.
@@ -1215,7 +1270,15 @@ func handleRecordRoute(rrOpt header.IPv4OptionRecordRoute, localAddress tcpip.Ad
 		return header.IPv4OptionLengthOffset, errIPv4RecordRouteOptInvalidLength
 	}
 
-	nextSlot := rrOpt.Pointer() - 1 // Pointer is 1 based.
+	pointer := rrOpt.Pointer()
+	// RFC 791 page 20 states:
+	//      The pointer is relative to this option, and the
+	//      smallest legal value for the pointer is 4.
+	// Since the pointer is 1 based, and the header is 3 bytes long the
+	// pointer must point beyond the header therefore 3 or less is bad.
+	if pointer <= header.IPv4OptionRecordRouteHdrLength {
+		return header.IPv4OptRRPointerOffset, errIPv4RecordRouteOptInvalidPointer
+	}
 
 	// RFC 791 page 21 says
 	//       If the route data area is already full (the pointer exceeds the
@@ -1230,14 +1293,14 @@ func handleRecordRoute(rrOpt header.IPv4OptionRecordRoute, localAddress tcpip.Ad
 	// do this (as do most implementations). It is probable that the inclusion
 	// of these words is a copy/paste error from the timestamp option where
 	// there are two failure reasons given.
-	if nextSlot >= optlen {
+	if pointer > optlen {
 		return 0, nil
 	}
 
 	// The data area isn't full but there isn't room for a new entry.
 	// Either Length or Pointer could be bad. We must select Pointer for Linux
-	// compatibility, even if only the length is bad.
-	if nextSlot+header.IPv4AddressSize > optlen {
+	// compatibility, even if only the length is bad. NB. pointer is 1 based.
+	if pointer+header.IPv4AddressSize > optlen+1 {
 		if false {
 			// This is what we would do if we were not being Linux compatible.
 			// Check for bad pointer or length value. Must be a multiple of 4 after

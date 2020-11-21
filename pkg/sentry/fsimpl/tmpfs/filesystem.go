@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -381,6 +382,8 @@ afterTrailingSymlink:
 		creds := rp.Credentials()
 		child := fs.newDentry(fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode))
 		parentDir.insertChildLocked(child, name)
+		child.IncRef()
+		defer child.DecRef(ctx)
 		unlock()
 		fd, err := child.open(ctx, rp, &opts, true)
 		if err != nil {
@@ -436,6 +439,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			if _, err := impl.truncate(0); err != nil {
 				return nil, err
 			}
+		}
+		if fd.vfsfd.IsWritable() {
+			fsmetric.TmpfsOpensW.Increment()
+		} else if fd.vfsfd.IsReadable() {
+			fsmetric.TmpfsOpensRO.Increment()
 		}
 		return &fd.vfsfd, nil
 	case *directory:

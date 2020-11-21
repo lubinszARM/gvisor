@@ -77,6 +77,7 @@ func (s EndpointState) String() string {
 // +stateify savable
 type endpoint struct {
 	stack.TransportEndpointInfo
+	tcpip.DefaultSocketOptionsHandler
 
 	// The following fields are initialized at creation time and do not
 	// change throughout the lifetime of the endpoint.
@@ -108,7 +109,6 @@ type endpoint struct {
 	multicastLoop  bool
 	portFlags      ports.Flags
 	bindToDevice   tcpip.NICID
-	noChecksum     bool
 
 	lastErrorMu sync.Mutex   `state:"nosave"`
 	lastError   *tcpip.Error `state:".(string)"`
@@ -195,6 +195,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		state:                StateInitial,
 		uniqueID:             s.UniqueID(),
 	}
+	e.ops.InitHandler(e)
 
 	// Override with stack defaults.
 	var ss stack.SendBufferSizeOption
@@ -369,7 +370,7 @@ func (e *endpoint) prepareForWrite(to *tcpip.FullAddress) (retry bool, err *tcpi
 // specified address is a multicast address.
 func (e *endpoint) connectRoute(nicID tcpip.NICID, addr tcpip.FullAddress, netProto tcpip.NetworkProtocolNumber) (stack.Route, tcpip.NICID, *tcpip.Error) {
 	localAddr := e.ID.LocalAddress
-	if isBroadcastOrMulticast(localAddr) {
+	if e.isBroadcastOrMulticast(nicID, netProto, localAddr) {
 		// A packet can only originate from a unicast address (i.e., an interface).
 		localAddr = ""
 	}
@@ -429,7 +430,13 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 	to := opts.To
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	lockReleased := false
+	defer func() {
+		if lockReleased {
+			return
+		}
+		e.mu.RUnlock()
+	}()
 
 	// If we've shutdown with SHUT_WR we are in an invalid state for sending.
 	if e.shutdownFlags&tcpip.ShutdownWrite != 0 {
@@ -475,7 +482,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 			if e.state != StateConnected {
 				err = tcpip.ErrInvalidEndpointState
 			}
-			return
+			return ch, err
 		}
 	} else {
 		// Reject destination address if it goes through a different
@@ -541,7 +548,24 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		useDefaultTTL = false
 	}
 
-	if err := sendUDP(route, buffer.View(v).ToVectorisedView(), e.ID.LocalPort, dstPort, ttl, useDefaultTTL, e.sendTOS, e.owner, e.noChecksum); err != nil {
+	localPort := e.ID.LocalPort
+	sendTOS := e.sendTOS
+	owner := e.owner
+	noChecksum := e.SocketOptions().GetNoChecksum()
+	lockReleased = true
+	e.mu.RUnlock()
+
+	// Do not hold lock when sending as loopback is synchronous and if the UDP
+	// datagram ends up generating an ICMP response then it can result in a
+	// deadlock where the ICMP response handling ends up acquiring this endpoint's
+	// mutex using e.mu.RLock() in endpoint.HandleControlPacket which can cause a
+	// deadlock if another caller is trying to acquire e.mu in exclusive mode w/
+	// e.mu.Lock(). Since e.mu.Lock() prevents any new read locks to ensure the
+	// lock can be eventually acquired.
+	//
+	// See: https://golang.org/pkg/sync/#RWMutex for details on why recursive read
+	// locking is prohibited.
+	if err := sendUDP(route, buffer.View(v).ToVectorisedView(), localPort, dstPort, ttl, useDefaultTTL, sendTOS, owner, noChecksum); err != nil {
 		return 0, nil, err
 	}
 	return int64(len(v)), nil, nil
@@ -552,17 +576,26 @@ func (e *endpoint) Peek([][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
 	return 0, tcpip.ControlMessages{}, nil
 }
 
+// OnReuseAddressSet implements tcpip.SocketOptionsHandler.OnReuseAddressSet.
+func (e *endpoint) OnReuseAddressSet(v bool) {
+	e.mu.Lock()
+	e.portFlags.MostRecent = v
+	e.mu.Unlock()
+}
+
+// OnReusePortSet implements tcpip.SocketOptionsHandler.OnReusePortSet.
+func (e *endpoint) OnReusePortSet(v bool) {
+	e.mu.Lock()
+	e.portFlags.LoadBalanced = v
+	e.mu.Unlock()
+}
+
 // SetSockOptBool implements tcpip.Endpoint.SetSockOptBool.
 func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 	switch opt {
 	case tcpip.MulticastLoopOption:
 		e.mu.Lock()
 		e.multicastLoop = v
-		e.mu.Unlock()
-
-	case tcpip.NoChecksumOption:
-		e.mu.Lock()
-		e.noChecksum = v
 		e.mu.Unlock()
 
 	case tcpip.ReceiveTOSOption:
@@ -583,16 +616,6 @@ func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 	case tcpip.ReceiveIPPacketInfoOption:
 		e.mu.Lock()
 		e.receiveIPPacketInfo = v
-		e.mu.Unlock()
-
-	case tcpip.ReuseAddressOption:
-		e.mu.Lock()
-		e.portFlags.MostRecent = v
-		e.mu.Unlock()
-
-	case tcpip.ReusePortOption:
-		e.mu.Lock()
-		e.portFlags.LoadBalanced = v
 		e.mu.Unlock()
 
 	case tcpip.V6OnlyOption:
@@ -826,18 +849,9 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
-	case tcpip.KeepaliveEnabledOption:
-		return false, nil
-
 	case tcpip.MulticastLoopOption:
 		e.mu.RLock()
 		v := e.multicastLoop
-		e.mu.RUnlock()
-		return v, nil
-
-	case tcpip.NoChecksumOption:
-		e.mu.RLock()
-		v := e.noChecksum
 		e.mu.RUnlock()
 		return v, nil
 
@@ -864,20 +878,6 @@ func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 		e.mu.RUnlock()
 		return v, nil
 
-	case tcpip.ReuseAddressOption:
-		e.mu.RLock()
-		v := e.portFlags.MostRecent
-		e.mu.RUnlock()
-
-		return v, nil
-
-	case tcpip.ReusePortOption:
-		e.mu.RLock()
-		v := e.portFlags.LoadBalanced
-		e.mu.RUnlock()
-
-		return v, nil
-
 	case tcpip.V6OnlyOption:
 		// We only recognize this option on v6 endpoints.
 		if e.NetProto != header.IPv6ProtocolNumber {
@@ -889,9 +889,6 @@ func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 		e.mu.RUnlock()
 
 		return v, nil
-
-	case tcpip.AcceptConnOption:
-		return false, nil
 
 	default:
 		return false, tcpip.ErrUnknownProtocolOption
@@ -1267,7 +1264,7 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) *tcpip.Error {
 	}
 
 	nicID := addr.NIC
-	if len(addr.Addr) != 0 && !isBroadcastOrMulticast(addr.Addr) {
+	if len(addr.Addr) != 0 && !e.isBroadcastOrMulticast(addr.NIC, netProto, addr.Addr) {
 		// A local unicast address was specified, verify that it's valid.
 		nicID = e.stack.CheckLocalAddress(addr.NIC, netProto, addr.Addr)
 		if nicID == 0 {
@@ -1508,14 +1505,16 @@ func (e *endpoint) Stats() tcpip.EndpointStats {
 // Wait implements tcpip.Endpoint.Wait.
 func (*endpoint) Wait() {}
 
-func isBroadcastOrMulticast(a tcpip.Address) bool {
-	return a == header.IPv4Broadcast || header.IsV4MulticastAddress(a) || header.IsV6MulticastAddress(a)
+func (e *endpoint) isBroadcastOrMulticast(nicID tcpip.NICID, netProto tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
+	return addr == header.IPv4Broadcast || header.IsV4MulticastAddress(addr) || header.IsV6MulticastAddress(addr) || e.stack.IsSubnetBroadcast(nicID, netProto, addr)
 }
 
+// SetOwner implements tcpip.Endpoint.SetOwner.
 func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 	e.owner = owner
 }
 
+// SocketOptions implements tcpip.Endpoint.SocketOptions.
 func (e *endpoint) SocketOptions() *tcpip.SocketOptions {
 	return &e.ops
 }
