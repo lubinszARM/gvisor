@@ -15,6 +15,23 @@
 #include "funcdata.h"
 #include "textflag.h"
 
+#define TLBI_ASID_SHIFT		48
+
+TEXT ·FlushTlbByVA(SB),NOSPLIT,$0-8
+	MOVD addr+0(FP), R1
+	DSB $10                 // dsb(ishst)
+	WORD $0xd50883a1        // tlbi vale1is, x1
+	DSB $11                 // dsb(ish)
+	RET
+
+TEXT ·FlushTlbByASID(SB),NOSPLIT,$0-8
+	MOVD asid+0(FP), R1
+	LSL $TLBI_ASID_SHIFT, R1, R1
+	DSB $10                 // dsb(ishst)
+	WORD $0xd5088341        // tlbi aside1is, x1
+	DSB $11                 // dsb(ish)
+	RET
+
 TEXT ·LocalFlushTlbAll(SB),NOSPLIT,$0
 	DSB $6			// dsb(nshst)
 	WORD $0xd508871f	// __tlbi(vmalle1)
@@ -47,11 +64,13 @@ TEXT ·GetFPSR(SB),NOSPLIT,$0-8
 TEXT ·SetFPCR(SB),NOSPLIT,$0-8
 	MOVD addr+0(FP), R1
 	MOVD R1, FPCR
+	ISB $15
 	RET
 
 TEXT ·SetFPSR(SB),NOSPLIT,$0-8
 	MOVD addr+0(FP), R1
 	MOVD R1, FPSR
+	ISB $15
 	RET
 
 TEXT ·SaveVRegs(SB),NOSPLIT,$0-8
@@ -131,6 +150,7 @@ TEXT ·LoadFloatingPoint(SB),NOSPLIT,$0-8
 	WORD $0xad4e741c 	// ldp	q28, q29, [x0, #448]
 	WORD $0xad4f7c1e 	// ldp	q30, q31, [x0, #480]
 
+	ISB $15
 	RET
 
 TEXT ·SaveFloatingPoint(SB),NOSPLIT,$0-8

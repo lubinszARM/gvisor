@@ -412,7 +412,7 @@ func TestWrongVCPU(t *testing.T) {
 			// Basic test, one then the other.
 			bluepill(c1)
 			bluepill(c2)
-			if c2.guestExits == 0 {
+			if c1.guestExits == 0 {
 				// Don't allow the test to proceed if this fails.
 				t.Fatalf("wrong vCPU#2 exits: vCPU1=%+v,vCPU2=%+v", c1, c2)
 			}

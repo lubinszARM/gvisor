@@ -69,31 +69,32 @@ func (c *vCPU) initArchState() error {
 		uintptr(unsafe.Pointer(&vcpuInit))); errno != 0 {
 		panic(fmt.Sprintf("error setting KVM_ARM_VCPU_INIT failed: %v", errno))
 	}
+	/*
+		// cpacr_el1
+		reg.id = _KVM_ARM64_REGS_CPACR_EL1
+		// It is off by default, and it is turned on only when in use.
+		data = 0 // Disable fpsimd.
+		if err := c.setOneRegister(&reg); err != nil {
+			return err
+		}
 
-	// cpacr_el1
-	reg.id = _KVM_ARM64_REGS_CPACR_EL1
-	// It is off by default, and it is turned on only when in use.
-	data = 0 // Disable fpsimd.
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
+		// tcr_el1
+		data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
+		reg.id = _KVM_ARM64_REGS_TCR_EL1
+		if err := c.setOneRegister(&reg); err != nil {
+			return err
+		}
 
-	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
-	reg.id = _KVM_ARM64_REGS_TCR_EL1
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
-	// mair_el1
-	data = _MT_EL1_INIT
-	reg.id = _KVM_ARM64_REGS_MAIR_EL1
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
+		// mair_el1
+		data = _MT_EL1_INIT
+		reg.id = _KVM_ARM64_REGS_MAIR_EL1
+		if err := c.setOneRegister(&reg); err != nil {
+			return err
+		}
+	*/
 
 	// ttbr0_el1
-	data = c.machine.kernel.PageTables.TTBR0_EL1(false, 0)
+	data = c.machine.kernel.PageTables.TTBR0_EL1(false, 1)
 
 	reg.id = _KVM_ARM64_REGS_TTBR0_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -103,7 +104,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -134,21 +135,15 @@ func (c *vCPU) initArchState() error {
 	// vbar_el1
 	reg.id = _KVM_ARM64_REGS_VBAR_EL1
 
-	fromLocation := reflect.ValueOf(ring0.Vectors).Pointer()
-	offset := fromLocation & (1<<11 - 1)
-	if offset != 0 {
-		offset = 1<<11 - offset
-	}
-
-	toLocation := fromLocation + offset
-	data = uint64(ring0.KernelStartAddress | toLocation)
+	location := reflect.ValueOf(ring0.Vectors).Pointer()
+	data = uint64(ring0.KernelStartAddress | location)
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
 
 	// Use the address of the exception vector table as
 	// the MMIO address base.
-	arm64HypercallMMIOBase = toLocation
+	arm64HypercallMMIOBase = location
 
 	// Initialize the PCID database.
 	if hasGuestPCID {
@@ -222,6 +217,8 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
 		return nonCanonical(regs.Sp, int32(syscall.SIGSEGV), info)
+	} else if !ring0.IsCanonical(regs.TPIDR_EL0) {
+		return nonCanonical(regs.TPIDR_EL0, int32(syscall.SIGSEGV), info)
 	}
 
 	// Assign PCIDs.
@@ -232,18 +229,19 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	}
 
 	var vector ring0.Vector
-	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, 0)
-	c.SetTtbr0App(uintptr(ttbr0App))
+	/*	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, 0)
+		c.SetTtbr0App(uintptr(ttbr0App))
 
-	// TODO(gvisor.dev/issue/1238): full context-switch supporting for Arm64.
-	// The Arm64 user-mode execution state consists of:
-	// x0-x30
-	// PC, SP, PSTATE
-	// V0-V31: 32 128-bit registers for floating point, and simd
-	// FPSR
-	// TPIDR_EL0, used for TLS
-	appRegs := switchOpts.Registers
-	c.SetAppAddr(ring0.KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
+		// TODO(gvisor.dev/issue/1238): full context-switch supporting for Arm64.
+		// The Arm64 user-mode execution state consists of:
+		// x0-x30
+		// PC, SP, PSTATE
+		// V0-V31: 32 128-bit registers for floating point, and simd
+		// FPSR
+		// TPIDR_EL0, used for TLS
+		appRegs := switchOpts.Registers
+		c.SetAppAddr(ring0.KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
+	*/
 
 	entersyscall()
 	bluepill(c)

@@ -16,6 +16,10 @@
 
 package ring0
 
+import (
+	"unsafe"
+)
+
 // HaltAndResume halts execution and point the pointer to the resume function.
 //go:nosplit
 func HaltAndResume()
@@ -55,11 +59,23 @@ func IsCanonical(addr uint64) bool {
 
 //go:nosplit
 func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
+	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, switchOpts.UserASID)
+	//	c.SetTtbr0App(uintptr(ttbr0App))
+	storeTTBR0App(uintptr(ttbr0App))
+	appRegs := switchOpts.Registers
+	//c.SetAppAddr(KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
+	//storeAppASID
+	storeAppAddr(KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
+
 	storeAppASID(uintptr(switchOpts.UserASID))
 	if switchOpts.Flush {
-		FlushTlbAll()
+		//FlushTlbAll()
+		FlushTlbByASID(uintptr(switchOpts.UserASID))
 	}
 
+	if switchOpts.UserASID == 0 {
+		FlushTlbAll()
+	}
 	regs := switchOpts.Registers
 
 	regs.Pstate &= ^uint64(PsrFlagsClear)

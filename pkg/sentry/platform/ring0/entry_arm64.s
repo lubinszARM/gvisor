@@ -52,6 +52,70 @@
 
 #define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT | SCTLR_UCI | SCTLR_DZE)
 
+// Position the attr at the correct index
+#define MAIR_ATTRIDX(attr, idx)     ((attr) << ((idx) * 8))
+
+// MAIR_ELx memory attributes
+#define MT_DEVICE_nGnRnE       0
+#define MT_DEVICE_nGnRE        1
+#define MT_DEVICE_GRE          2
+#define MT_NORMAL_NC           3
+#define MT_NORMAL              4
+#define MT_NORMAL_WT           5
+#define MT_ATTR_DEVICE_nGnRnE  0x00
+#define MT_ATTR_DEVICE_nGnRE   0x04
+#define MT_ATTR_DEVICE_GRE     0x0c
+#define MT_ATTR_NORMAL_NC      0x44
+#define MT_ATTR_NORMAL_WT      0xbb
+#define MT_ATTR_NORMAL         0xff
+#define MT_ATTR_MASK           0xff
+#define MT_EL1_INIT            (MT_ATTR_DEVICE_nGnRnE << (MT_DEVICE_nGnRnE * 8)) | (MT_ATTR_DEVICE_nGnRE << (MT_DEVICE_nGnRE * 8)) | (MT_ATTR_DEVICE_GRE << (MT_DEVICE_GRE * 8)) | (MT_ATTR_NORMAL_NC << (MT_NORMAL_NC * 8)) | (MT_ATTR_NORMAL << (MT_NORMAL * 8)) | (MT_ATTR_NORMAL_WT << (MT_NORMAL_WT * 8))
+
+#define TCR_IPS_40BITS  (2 << 32) // PA=40
+#define TCR_IPS_48BITS  (5 << 32) // PA=48
+
+#define TCR_T0SZ_OFFSET  0
+#define TCR_T1SZ_OFFSET  16
+#define TCR_IRGN0_SHIFT  8
+#define TCR_IRGN1_SHIFT  24
+#define TCR_ORGN0_SHIFT  10
+#define TCR_ORGN1_SHIFT  26
+#define TCR_SH0_SHIFT    12
+#define TCR_SH1_SHIFT    28
+#define TCR_TG0_SHIFT    14
+#define TCR_TG1_SHIFT    30
+
+#define TCR_T0SZ_VA48  (64 - 48) // VA=48
+#define TCR_T1SZ_VA48  (64 - 48) // VA=48
+
+#define TCR_A1      (1 << 22)
+#define TCR_ASID16  (1 << 36)
+#define TCR_TBI0    (1 << 37)
+
+#define TCR_TXSZ_VA48  (TCR_T0SZ_VA48 << TCR_T0SZ_OFFSET) | (TCR_T1SZ_VA48 << TCR_T1SZ_OFFSET)
+
+#define TCR_TG0_4K   (0 << TCR_TG0_SHIFT) // 4K
+#define TCR_TG0_64K  (1 << TCR_TG0_SHIFT) // 64K
+
+#define TCR_TG1_4K  (2 << TCR_TG1_SHIFT)
+
+#define TCR_TG_FLAGS (TCR_TG0_4K | TCR_TG1_4K)
+
+#define TCR_IRGN0_WBWA  (1 << TCR_IRGN0_SHIFT)
+#define TCR_IRGN1_WBWA  (1 << TCR_IRGN1_SHIFT)
+#define TCR_IRGN_WBWA   (TCR_IRGN0_WBWA | TCR_IRGN1_WBWA)
+
+#define TCR_ORGN0_WBWA  (1 << TCR_ORGN0_SHIFT)
+#define TCR_ORGN1_WBWA  (1 << TCR_ORGN1_SHIFT)
+
+#define TCR_ORGN_WBWA  (TCR_ORGN0_WBWA | TCR_ORGN1_WBWA)
+
+#define TCR_SHARED  (3 << TCR_SH0_SHIFT) | (3 << TCR_SH1_SHIFT)
+
+#define TCR_CACHE_FLAGS  (TCR_IRGN_WBWA | TCR_ORGN_WBWA)
+
+#define TCR_DEFAULT TCR_TXSZ_VA48 | TCR_CACHE_FLAGS | TCR_SHARED | TCR_TG_FLAGS | TCR_ASID16 | TCR_IPS_40BITS | TCR_A1
+
 // cntkctl_el1: counter-timer kernel control register el1.
 #define CNTKCTL_EL0PCTEN 	1 << 0
 #define CNTKCTL_EL0VCTEN 	1 << 1
@@ -131,40 +195,6 @@
   MOVD offset+PTRACE_R28(reg), g; \
   MOVD offset+PTRACE_R29(reg), R29; \
   MOVD offset+PTRACE_R30(reg), R30;
-
-// NOP-s
-#define nop31Instructions() \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f; \
-        WORD $0xd503201f;
 
 #define ESR_ELx_EC_UNKNOWN	(0x00)
 #define ESR_ELx_EC_WFx		(0x01)
@@ -304,25 +334,30 @@
 	MOVD RSV_REG, RSP; \
 	WORD $0xd538d092;   //MRS   TPIDR_EL1, R18
 
+#define POST_TTBR() \
+	NOP; \
+	NOP; \
+	NOP; \
+	WORD $0xd508751f; \
+	DSB $7; \
+	ISB $15;
+	
 // SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
 #define SWITCH_TO_APP_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD CPU_APP_ASID(from), R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
-	ISB $15; \
 	MOVD CPU_TTBR0_APP(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15;
 
 // SWITCH_TO_KVM_PAGETABLE sets the kvm pagetable.
 #define SWITCH_TO_KVM_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD $1, R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \
-	ISB $15; \
 	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15;
+
+#define CPU_SET_RSVD_TTBR0() \
+	MRS TTBR1_EL1, R0; \
+	MSR R0, TTBR0_EL1; \
+	ISB $15;
 
 TEXT ·EnableVFP(SB),NOSPLIT,$0
 	MOVD $FPEN_ENABLE, R0
@@ -352,6 +387,7 @@ TEXT ·DisableVFP(SB),NOSPLIT,$0
 	STP (RSV_REG, RSV_REG_APP), 16*0(RSP); \
 	WORD $0xd538d092; \    // MRS   TPIDR_EL1, R18
 	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP; \ // step2, load app context pointer.
+	ORR $0xffff000000000000, RSV_REG_APP, RSV_REG_APP; \
 	REGISTERS_SAVE(RSV_REG_APP, 0); \          // step3, save app context.
 	MOVD RSV_REG_APP, R20; \
 	LDP 16*0(RSP), (RSV_REG, RSV_REG_APP); \
@@ -408,15 +444,27 @@ TEXT ·storeAppASID(SB),NOSPLIT,$0-8
 	MOVD R1, CPU_APP_ASID(RSV_REG)
 	RET
 
+TEXT ·storeTTBR0App(SB),NOSPLIT,$0-8
+        MOVD addr+0(FP), R1
+        MRS  TPIDR_EL1, RSV_REG
+        MOVD R1, CPU_TTBR0_APP(RSV_REG)
+        RET
+
+TEXT ·storeAppAddr(SB),NOSPLIT,$0-8
+        MOVD addr+0(FP), R1
+        MRS  TPIDR_EL1, RSV_REG
+        MOVD R1, CPU_APP_ADDR(RSV_REG)
+        RET
+
 // Halt halts execution.
 TEXT ·Halt(SB),NOSPLIT,$0
 	// Clear bluepill.
-	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
-	CMP RSV_REG, R9
-	BNE mmio_exit
-	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
+//	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
+//	CMP RSV_REG, R9
+//	BNE mmio_exit
+//	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
 
-mmio_exit:
+//mmio_exit:
 	// Disable fpsimd.
 	WORD $0xd5381041 // MRS CPACR_EL1, R1
 	MOVD R1, CPU_LAZY_VFP(RSV_REG)
@@ -495,6 +543,7 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 
 	// Step3, load app context pointer.
 	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP
+	ORR $0xffff000000000000, RSV_REG_APP, RSV_REG_APP
 
 	// Step4, prepare the environment for container application.
 	// set sp_el0.
@@ -531,6 +580,7 @@ do_exit_to_el0:
 	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
 
 	SWITCH_TO_APP_PAGETABLE(RSV_REG)
+	POST_TTBR()
 
 	LDP 16*1(RSP), (R0, R1)
 	LDP 16*0(RSP), (RSV_REG, RSV_REG_APP)
@@ -556,6 +606,8 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 	MOVD R1, RSP
 
 	SWITCH_TO_KVM_PAGETABLE(RSV_REG)
+	POST_TTBR()
+
 	MRS TPIDR_EL1, RSV_REG
 
 	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
@@ -566,8 +618,35 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 // Start is the CPU entrypoint.
 TEXT ·Start(SB),NOSPLIT,$0
 	// Init.
-	MOVD $SCTLR_EL1_DEFAULT, R1
+   // __cpu_setup.
+  WORD $0xd508871f    // __tlbi(vmalle1)
+    DSB $7          // dsb(nsh)
+
+    MOVD $1<<12, R1         // Reset mdscr_el1 and disable
+    MSR R1, MDSCR_EL1       // access to the DCC from EL0
+    ISB $15
+
+
+    // Memory region attributes
+    MOVD $MT_EL1_INIT, R1
+    MSR R1, MAIR_EL1
+
+    // Set/prepare TCR.
+    MOVD $TCR_DEFAULT, R1
+    MSR R1, TCR_EL1
+
+    // Enable mmu.
+    MOVD $SCTLR_EL1_DEFAULT, R1
+    MSR R1, SCTLR_EL1
+  ISB $15
+    WORD $0xd508751f // ic iallu
+
+    DSB $7          // dsb(nsh)
+    ISB $15
+
+/*	MOVD $SCTLR_EL1_DEFAULT, R1
 	MSR R1, SCTLR_EL1
+*/
 
 	MOVD $CNTKCTL_EL1_DEFAULT, R1
 	MSR R1, CNTKCTL_EL1
@@ -575,6 +654,12 @@ TEXT ·Start(SB),NOSPLIT,$0
 	MOVD R8, RSV_REG
 	ORR $0xffff000000000000, RSV_REG, RSV_REG
 	WORD $0xd518d092        //MSR R18, TPIDR_EL1
+
+WORD $0xd508871f    // __tlbi(vmalle1)
+DSB $7          // dsb(nsh)
+//CPU_SET_RSVD_TTBR0()
+SWITCH_TO_KVM_PAGETABLE(RSV_REG)
+POST_TTBR()
 
 	B ·kernelExitToEl1(SB)
 
@@ -765,78 +850,43 @@ TEXT ·El0_error_invalid(SB),NOSPLIT,$0
 
 // Vectors implements exception vector table.
 TEXT ·Vectors(SB),NOSPLIT,$0
+	PCALIGN $2048
 	B ·El1_sync_invalid(SB)
-	nop31Instructions()
+	PCALIGN $128
 	B ·El1_irq_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El1_fiq_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El1_error_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 
 	B ·El1_sync(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El1_irq(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El1_fiq(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El1_error(SB)
-	nop31Instructions()
+PCALIGN $128
 
 	B ·El0_sync(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_irq(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_fiq(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_error(SB)
-	nop31Instructions()
+PCALIGN $128
 
 	B ·El0_sync_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_irq_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_fiq_invalid(SB)
-	nop31Instructions()
+PCALIGN $128
 	B ·El0_error_invalid(SB)
-	nop31Instructions()
-
+PCALIGN $128
 	// The exception-vector-table is required to be 11-bits aligned.
 	// Please see Linux source code as reference: arch/arm64/kernel/entry.s.
 	// For gvisor, I defined it as 4K in length, filled the 2nd 2K part with NOPs.
 	// So that, I can safely move the 1st 2K part into the address with 11-bits alignment.
-	WORD $0xd503201f	//nop
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()
-	WORD $0xd503201f
-	nop31Instructions()

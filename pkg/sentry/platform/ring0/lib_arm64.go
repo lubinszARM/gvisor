@@ -18,6 +18,14 @@ package ring0
 
 // storeAppASID writes the application's asid value.
 func storeAppASID(asid uintptr)
+func storeTTBR0AppiTBR0App(addr uintptr)
+func storeAppAddr(addr uintptr)
+
+// FlushTlbByVA invalidates tlb by VA/Last-level/Inner-Shareable.
+func FlushTlbByVA(addr uintptr)
+
+// FlushTlbByASID invalidates tlb by ASID/Inner-Shareable.
+func FlushTlbByASID(asid uintptr)
 
 // LocalFlushTlbAll same as FlushTlbAll, but only applies to the calling CPU.
 func LocalFlushTlbAll()
@@ -63,5 +71,4 @@ func DisableVFP()
 //
 // This must be called prior to using ring0.
 func Init() {
-	rewriteVectors()
 }
