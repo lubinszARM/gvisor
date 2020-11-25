@@ -258,7 +258,7 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 
 	case Failed:
 		e.notifyWakersLocked()
-		e.job = e.nic.stack.newJob(&e.mu, func() {
+		e.job = e.nic.stack.newJob(&doubleLock{first: &e.nic.neigh.mu, second: &e.mu}, func() {
 			e.nic.neigh.removeEntryLocked(e)
 		})
 		e.job.Schedule(config.UnreachableTime)
@@ -347,9 +347,10 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 		e.setStateLocked(Delay)
 		e.dispatchChangeEventLocked()
 
-	case Incomplete, Reachable, Delay, Probe, Static, Failed:
+	case Incomplete, Reachable, Delay, Probe, Static:
 		// Do nothing
-
+	case Failed:
+		e.nic.stats.Neighbor.FailedEntryLookups.Increment()
 	default:
 		panic(fmt.Sprintf("Invalid cache entry state: %s", e.neigh.State))
 	}
@@ -510,4 +511,24 @@ func (e *neighborEntry) handleUpperLevelConfirmationLocked() {
 	default:
 		panic(fmt.Sprintf("Invalid cache entry state: %s", e.neigh.State))
 	}
+}
+
+// doubleLock combines two locks into one while maintaining lock ordering.
+//
+// TODO(gvisor.dev/issue/4796): Remove this once subsequent traffic to a Failed
+// neighbor is allowed.
+type doubleLock struct {
+	first, second sync.Locker
+}
+
+// Lock locks both locks in order: first then second.
+func (l *doubleLock) Lock() {
+	l.first.Lock()
+	l.second.Lock()
+}
+
+// Unlock unlocks both locks in reverse order: second then first.
+func (l *doubleLock) Unlock() {
+	l.second.Unlock()
+	l.first.Unlock()
 }

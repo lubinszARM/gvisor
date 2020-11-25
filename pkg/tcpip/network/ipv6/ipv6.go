@@ -34,7 +34,9 @@ import (
 )
 
 const (
+	// ReassembleTimeout controls how long a fragment will be held.
 	// As per RFC 8200 section 4.5:
+	//
 	//   If insufficient fragments are received to complete reassembly of a packet
 	//   within 60 seconds of the reception of the first-arriving fragment of that
 	//   packet, reassembly of that packet must be abandoned.
@@ -273,7 +275,7 @@ func (e *endpoint) Enable() *tcpip.Error {
 	}
 
 	// Do not auto-generate an IPv6 link-local address for loopback devices.
-	if e.protocol.autoGenIPv6LinkLocal && !e.nic.IsLoopback() {
+	if e.protocol.options.AutoGenLinkLocal && !e.nic.IsLoopback() {
 		// The valid and preferred lifetime is infinite for the auto-generated
 		// link-local address.
 		e.mu.ndp.doSLAAC(header.IPv6LinkLocalPrefix.Subnet(), header.NDPInfiniteLifetime, header.NDPInfiniteLifetime)
@@ -1092,9 +1094,16 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 					//
 					// Which when taken together indicate that an unknown protocol should
 					// be treated as an unrecognized next header value.
+					// The location of the Next Header field is in a different place in
+					// the initial IPv6 header than it is in the extension headers so
+					// treat it specially.
+					prevHdrIDOffset := uint32(header.IPv6NextHeaderOffset)
+					if previousHeaderStart != 0 {
+						prevHdrIDOffset = previousHeaderStart
+					}
 					_ = e.protocol.returnError(&icmpReasonParameterProblem{
 						code:    header.ICMPv6UnknownHeader,
-						pointer: it.ParseOffset(),
+						pointer: prevHdrIDOffset,
 					}, pkt)
 				default:
 					panic(fmt.Sprintf("unrecognized result from DeliverTransportPacket = %d", res))
@@ -1102,12 +1111,11 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 			}
 
 		default:
-			_ = e.protocol.returnError(&icmpReasonParameterProblem{
-				code:    header.ICMPv6UnknownHeader,
-				pointer: it.ParseOffset(),
-			}, pkt)
-			stats.UnknownProtocolRcvdPackets.Increment()
-			return
+			// Since the iterator returns IPv6RawPayloadHeader for unknown Extension
+			// Header IDs this should never happen unless we missed a supported type
+			// here.
+			panic(fmt.Sprintf("unrecognized type from it.Next() = %T", extHdr))
+
 		}
 	}
 }
@@ -1407,7 +1415,8 @@ var _ stack.NetworkProtocol = (*protocol)(nil)
 var _ fragmentation.TimeoutHandler = (*protocol)(nil)
 
 type protocol struct {
-	stack *stack.Stack
+	stack   *stack.Stack
+	options Options
 
 	mu struct {
 		sync.RWMutex
@@ -1431,26 +1440,6 @@ type protocol struct {
 	forwarding uint32
 
 	fragmentation *fragmentation.Fragmentation
-
-	// ndpDisp is the NDP event dispatcher that is used to send the netstack
-	// integrator NDP related events.
-	ndpDisp NDPDispatcher
-
-	// ndpConfigs is the default NDP configurations used by an IPv6 endpoint.
-	ndpConfigs NDPConfigurations
-
-	// opaqueIIDOpts hold the options for generating opaque interface identifiers
-	// (IIDs) as outlined by RFC 7217.
-	opaqueIIDOpts OpaqueInterfaceIdentifierOptions
-
-	// tempIIDSeed is used to seed the initial temporary interface identifier
-	// history value used to generate IIDs for temporary SLAAC addresses.
-	tempIIDSeed []byte
-
-	// autoGenIPv6LinkLocal determines whether or not the stack attempts to
-	// auto-generate an IPv6 link-local address for newly enabled non-loopback
-	// NICs. See the AutoGenIPv6LinkLocal field of Options for more details.
-	autoGenIPv6LinkLocal bool
 }
 
 // Number returns the ipv6 protocol number.
@@ -1486,7 +1475,7 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, linkAddrCache stack.L
 	e.mu.addressableEndpointState.Init(e)
 	e.mu.ndp = ndpState{
 		ep:             e,
-		configs:        p.ndpConfigs,
+		configs:        p.options.NDPConfigs,
 		dad:            make(map[tcpip.Address]dadState),
 		defaultRouters: make(map[tcpip.Address]defaultRouterState),
 		onLinkPrefixes: make(map[tcpip.Subnet]onLinkPrefixState),
@@ -1615,17 +1604,17 @@ type Options struct {
 	// NDPConfigs is the default NDP configurations used by interfaces.
 	NDPConfigs NDPConfigurations
 
-	// AutoGenIPv6LinkLocal determines whether or not the stack attempts to
-	// auto-generate an IPv6 link-local address for newly enabled non-loopback
+	// AutoGenLinkLocal determines whether or not the stack attempts to
+	// auto-generate a link-local address for newly enabled non-loopback
 	// NICs.
 	//
 	// Note, setting this to true does not mean that a link-local address is
 	// assigned right away, or at all. If Duplicate Address Detection is enabled,
 	// an address is only assigned if it successfully resolves. If it fails, no
-	// further attempts are made to auto-generate an IPv6 link-local adddress.
+	// further attempts are made to auto-generate a link-local adddress.
 	//
 	// The generated link-local address follows RFC 4291 Appendix A guidelines.
-	AutoGenIPv6LinkLocal bool
+	AutoGenLinkLocal bool
 
 	// NDPDisp is the NDP event dispatcher that an integrator can provide to
 	// receive NDP related events.
@@ -1660,15 +1649,11 @@ func NewProtocolWithOptions(opts Options) stack.NetworkProtocolFactory {
 
 	return func(s *stack.Stack) stack.NetworkProtocol {
 		p := &protocol{
-			stack:  s,
+			stack:   s,
+			options: opts,
+
 			ids:    ids,
 			hashIV: hashIV,
-
-			ndpDisp:              opts.NDPDisp,
-			ndpConfigs:           opts.NDPConfigs,
-			opaqueIIDOpts:        opts.OpaqueIIDOpts,
-			tempIIDSeed:          opts.TempIIDSeed,
-			autoGenIPv6LinkLocal: opts.AutoGenIPv6LinkLocal,
 		}
 		p.fragmentation = fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, ReassembleTimeout, s.Clock(), p)
 		p.mu.eps = make(map[*endpoint]struct{})
