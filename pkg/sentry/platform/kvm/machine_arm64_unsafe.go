@@ -79,7 +79,7 @@ func (c *vCPU) initArchState() error {
 	}
 
 	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
+	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS //| _TCR_A1
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -93,7 +93,7 @@ func (c *vCPU) initArchState() error {
 	}
 
 	// ttbr0_el1
-	data = c.machine.kernel.PageTables.TTBR0_EL1(false, 0)
+	data = c.machine.kernel.PageTables.TTBR0_EL1(false, 1)
 
 	reg.id = _KVM_ARM64_REGS_TTBR0_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -103,7 +103,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -232,7 +232,7 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	}
 
 	var vector ring0.Vector
-	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, 0)
+	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, switchOpts.UserASID)
 	c.SetTtbr0App(uintptr(ttbr0App))
 
 	// TODO(gvisor.dev/issue/1238): full context-switch supporting for Arm64.

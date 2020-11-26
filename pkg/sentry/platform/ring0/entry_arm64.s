@@ -306,23 +306,15 @@
 
 // SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
 #define SWITCH_TO_APP_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD CPU_APP_ASID(from), R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
-	ISB $15; \
 	MOVD CPU_TTBR0_APP(from), RSV_REG; \
 	MSR RSV_REG, TTBR0_EL1;
+	ISB $15;
 
 // SWITCH_TO_KVM_PAGETABLE sets the kvm pagetable.
 #define SWITCH_TO_KVM_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD $1, R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \
-	ISB $15; \
 	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15;
 
 TEXT ·EnableVFP(SB),NOSPLIT,$0
 	MOVD $FPEN_ENABLE, R0
@@ -568,6 +560,8 @@ TEXT ·Start(SB),NOSPLIT,$0
 	// Init.
 	MOVD $SCTLR_EL1_DEFAULT, R1
 	MSR R1, SCTLR_EL1
+	DSB $7
+  	ISB $15
 
 	MOVD $CNTKCTL_EL1_DEFAULT, R1
 	MSR R1, CNTKCTL_EL1

@@ -16,6 +16,12 @@
 
 package ring0
 
+// FlushTlbByVA invalidates tlb by VA/Last-level/Inner-Shareable.
+func FlushTlbByVA(addr uintptr)
+
+// FlushTlbByASID invalidates tlb by ASID/Inner-Shareable.
+func FlushTlbByASID(asid uintptr)
+
 // storeAppASID writes the application's asid value.
 func storeAppASID(asid uintptr)
 
