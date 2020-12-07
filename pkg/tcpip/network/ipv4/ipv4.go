@@ -95,7 +95,7 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, _ stack.LinkAddressCa
 		protocol:   p,
 	}
 	e.mu.addressableEndpointState.Init(e)
-	e.igmp.init(e)
+	e.igmp.init(e, p.options.IGMP)
 	return e
 }
 
@@ -123,11 +123,22 @@ func (e *endpoint) Enable() *tcpip.Error {
 	// We have no need for the address endpoint.
 	ep.DecRef()
 
+	// Groups may have been joined while the endpoint was disabled, or the
+	// endpoint may have left groups from the perspective of IGMP when the
+	// endpoint was disabled. Either way, we need to let routers know to
+	// send us multicast traffic.
+	e.igmp.initializeAll()
+
 	// As per RFC 1122 section 3.3.7, all hosts should join the all-hosts
 	// multicast group. Note, the IANA calls the all-hosts multicast group the
 	// all-systems multicast group.
-	_, err = e.mu.addressableEndpointState.JoinGroup(header.IPv4AllSystems)
-	return err
+	if err := e.joinGroupLocked(header.IPv4AllSystems); err != nil {
+		// joinGroupLocked only returns an error if the group address is not a valid
+		// IPv4 multicast address.
+		panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", header.IPv4AllSystems, err))
+	}
+
+	return nil
 }
 
 // Enabled implements stack.NetworkEndpoint.
@@ -164,9 +175,13 @@ func (e *endpoint) disableLocked() {
 	}
 
 	// The endpoint may have already left the multicast group.
-	if _, err := e.mu.addressableEndpointState.LeaveGroup(header.IPv4AllSystems); err != nil && err != tcpip.ErrBadLocalAddress {
+	if err := e.leaveGroupLocked(header.IPv4AllSystems); err != nil && err != tcpip.ErrBadLocalAddress {
 		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv4AllSystems, err))
 	}
+
+	// Leave groups from the perspective of IGMP so that routers know that
+	// we are no longer interested in the group.
+	e.igmp.softLeaveAll()
 
 	// The address may have already been removed.
 	if err := e.mu.addressableEndpointState.RemovePermanentAddress(ipv4BroadcastAddr.Address); err != nil && err != tcpip.ErrBadLocalAddress {
@@ -200,37 +215,34 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 	return e.protocol.Number()
 }
 
-func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
+func (e *endpoint) addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams, options header.IPv4OptionsSerializer) {
 	hdrLen := header.IPv4MinimumSize
-	var opts header.IPv4Options
-	if params.Options != nil {
-		var ok bool
-		if opts, ok = params.Options.(header.IPv4Options); !ok {
-			panic(fmt.Sprintf("want IPv4Options, got %T", params.Options))
-		}
-		hdrLen += opts.SizeWithPadding()
-		if hdrLen > header.IPv4MaximumHeaderSize {
-			// Since we have no way to report an error we must either panic or create
-			// a packet which is different to what was requested. Choose panic as this
-			// would be a programming error that should be caught in testing.
-			panic(fmt.Sprintf("IPv4 Options %d bytes, Max %d", params.Options.SizeWithPadding(), header.IPv4MaximumOptionsSize))
-		}
+	var optLen int
+	if options != nil {
+		optLen = int(options.Length())
+	}
+	hdrLen += optLen
+	if hdrLen > header.IPv4MaximumHeaderSize {
+		// Since we have no way to report an error we must either panic or create
+		// a packet which is different to what was requested. Choose panic as this
+		// would be a programming error that should be caught in testing.
+		panic(fmt.Sprintf("IPv4 Options %d bytes, Max %d", optLen, header.IPv4MaximumOptionsSize))
 	}
 	ip := header.IPv4(pkt.NetworkHeader().Push(hdrLen))
 	length := uint16(pkt.Size())
 	// RFC 6864 section 4.3 mandates uniqueness of ID values for non-atomic
 	// datagrams. Since the DF bit is never being set here, all datagrams
 	// are non-atomic and need an ID.
-	id := atomic.AddUint32(&e.protocol.ids[hashRoute(r, params.Protocol, e.protocol.hashIV)%buckets], 1)
+	id := atomic.AddUint32(&e.protocol.ids[hashRoute(srcAddr, dstAddr, params.Protocol, e.protocol.hashIV)%buckets], 1)
 	ip.Encode(&header.IPv4Fields{
 		TotalLength: length,
 		ID:          uint16(id),
 		TTL:         params.TTL,
 		TOS:         params.TOS,
 		Protocol:    uint8(params.Protocol),
-		SrcAddr:     r.LocalAddress,
-		DstAddr:     r.RemoteAddress,
-		Options:     opts,
+		SrcAddr:     srcAddr,
+		DstAddr:     dstAddr,
+		Options:     options,
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
 	pkt.NetworkProtocolNumber = ProtocolNumber
@@ -261,7 +273,7 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU ui
 
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.addIPHeader(r, pkt, params)
+	e.addIPHeader(r.LocalAddress, r.RemoteAddress, pkt, params, nil /* options */)
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
@@ -349,7 +361,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	}
 
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		e.addIPHeader(r, pkt, params)
+		e.addIPHeader(r.LocalAddress, r.RemoteAddress, pkt, params, nil /* options */)
 		networkMTU, err := calculateNetworkMTU(e.nic.MTU(), uint32(pkt.NetworkHeader().View().Size()))
 		if err != nil {
 			r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
@@ -463,7 +475,7 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 		// non-atomic datagrams, so assign an ID to all such datagrams
 		// according to the definition given in RFC 6864 section 4.
 		if ip.Flags()&header.IPv4FlagDontFragment == 0 || ip.Flags()&header.IPv4FlagMoreFragments != 0 || ip.FragmentOffset() > 0 {
-			ip.SetID(uint16(atomic.AddUint32(&e.protocol.ids[hashRoute(r, 0 /* protocol */, e.protocol.hashIV)%buckets], 1)))
+			ip.SetID(uint16(atomic.AddUint32(&e.protocol.ids[hashRoute(r.LocalAddress, r.RemoteAddress, 0 /* protocol */, e.protocol.hashIV)%buckets], 1)))
 		}
 	}
 
@@ -706,10 +718,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 		return
 	}
 	if p == header.IGMPProtocolNumber {
-		if e.protocol.options.IGMPEnabled {
-			e.igmp.handleIGMP(pkt)
-		}
-		// Nothing further to do with an IGMP packet, even if IGMP is not enabled.
+		e.igmp.handleIGMP(pkt)
 		return
 	}
 	if opts := h.Options(); len(opts) != 0 {
@@ -790,28 +799,12 @@ func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp boo
 	defer e.mu.Unlock()
 
 	loopback := e.nic.IsLoopback()
-	addressEndpoint := e.mu.addressableEndpointState.ReadOnly().AddrOrMatching(localAddr, allowTemp, func(addressEndpoint stack.AddressEndpoint) bool {
+	return e.mu.addressableEndpointState.AcquireAssignedAddressOrMatching(localAddr, func(addressEndpoint stack.AddressEndpoint) bool {
 		subnet := addressEndpoint.Subnet()
 		// IPv4 has a notion of a subnet broadcast address and considers the
 		// loopback interface bound to an address's whole subnet (on linux).
 		return subnet.IsBroadcast(localAddr) || (loopback && subnet.Contains(localAddr))
-	})
-	if addressEndpoint != nil {
-		return addressEndpoint
-	}
-
-	if !allowTemp {
-		return nil
-	}
-
-	addr := localAddr.WithPrefix()
-	addressEndpoint, err := e.mu.addressableEndpointState.AddAndAcquireTemporaryAddress(addr, tempPEB)
-	if err != nil {
-		// AddAddress only returns an error if the address is already assigned,
-		// but we just checked above if the address exists so we expect no error.
-		panic(fmt.Sprintf("e.mu.addressableEndpointState.AddAndAcquireTemporaryAddress(%s, %d): %s", addr, tempPEB, err))
-	}
-	return addressEndpoint
+	}, allowTemp, tempPEB)
 }
 
 // AcquireOutgoingPrimaryAddress implements stack.AddressableEndpoint.
@@ -836,40 +829,43 @@ func (e *endpoint) PermanentAddresses() []tcpip.AddressWithPrefix {
 }
 
 // JoinGroup implements stack.GroupAddressableEndpoint.
-func (e *endpoint) JoinGroup(addr tcpip.Address) (bool, *tcpip.Error) {
-	if !header.IsV4MulticastAddress(addr) {
-		return false, tcpip.ErrBadAddress
-	}
-
+func (e *endpoint) JoinGroup(addr tcpip.Address) *tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.joinGroupLocked(addr)
+}
 
-	joinedGroup, err := e.mu.addressableEndpointState.JoinGroup(addr)
-	if err == nil && joinedGroup && e.protocol.options.IGMPEnabled {
-		_ = e.igmp.joinGroup(addr)
+// joinGroupLocked is like JoinGroup but with locking requirements.
+//
+// Precondition: e.mu must be locked.
+func (e *endpoint) joinGroupLocked(addr tcpip.Address) *tcpip.Error {
+	if !header.IsV4MulticastAddress(addr) {
+		return tcpip.ErrBadAddress
 	}
 
-	return joinedGroup, err
+	e.igmp.joinGroup(addr)
+	return nil
 }
 
 // LeaveGroup implements stack.GroupAddressableEndpoint.
-func (e *endpoint) LeaveGroup(addr tcpip.Address) (bool, *tcpip.Error) {
+func (e *endpoint) LeaveGroup(addr tcpip.Address) *tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.leaveGroupLocked(addr)
+}
 
-	leftGroup, err := e.mu.addressableEndpointState.LeaveGroup(addr)
-	if err == nil && leftGroup && e.protocol.options.IGMPEnabled {
-		e.igmp.leaveGroup(addr)
-	}
-
-	return leftGroup, err
+// leaveGroupLocked is like LeaveGroup but with locking requirements.
+//
+// Precondition: e.mu must be locked.
+func (e *endpoint) leaveGroupLocked(addr tcpip.Address) *tcpip.Error {
+	return e.igmp.leaveGroup(addr)
 }
 
 // IsInGroup implements stack.GroupAddressableEndpoint.
 func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.mu.addressableEndpointState.IsInGroup(addr)
+	return e.igmp.isInGroup(addr)
 }
 
 var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
@@ -1021,20 +1017,19 @@ func addressToUint32(addr tcpip.Address) uint32 {
 	return uint32(addr[0]) | uint32(addr[1])<<8 | uint32(addr[2])<<16 | uint32(addr[3])<<24
 }
 
-// hashRoute calculates a hash value for the given route. It uses the source &
-// destination address, the transport protocol number and a 32-bit number to
-// generate the hash.
-func hashRoute(r *stack.Route, protocol tcpip.TransportProtocolNumber, hashIV uint32) uint32 {
-	a := addressToUint32(r.LocalAddress)
-	b := addressToUint32(r.RemoteAddress)
+// hashRoute calculates a hash value for the given source/destination pair using
+// the addresses, transport protocol number and a 32-bit number to generate the
+// hash.
+func hashRoute(srcAddr, dstAddr tcpip.Address, protocol tcpip.TransportProtocolNumber, hashIV uint32) uint32 {
+	a := addressToUint32(srcAddr)
+	b := addressToUint32(dstAddr)
 	return hash.Hash3Words(a, b, uint32(protocol), hashIV)
 }
 
 // Options holds options to configure a new protocol.
 type Options struct {
-	// IGMPEnabled indicates whether incoming IGMP packets will be handled and if
-	// this endpoint will transmit IGMP packets on IGMP related events.
-	IGMPEnabled bool
+	// IGMP holds options for IGMP.
+	IGMP IGMPOptions
 }
 
 // NewProtocolWithOptions returns an IPv4 network protocol.

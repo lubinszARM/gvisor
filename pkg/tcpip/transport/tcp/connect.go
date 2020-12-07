@@ -16,6 +16,7 @@ package tcp
 
 import (
 	"encoding/binary"
+	"math"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/rand"
@@ -133,7 +134,7 @@ func FindWndScale(wnd seqnum.Size) int {
 		return 0
 	}
 
-	max := seqnum.Size(0xffff)
+	max := seqnum.Size(math.MaxUint16)
 	s := 0
 	for wnd > max && s < header.MaxWndScale {
 		s++
@@ -300,7 +301,7 @@ func (h *handshake) synSentState(s *segment) *tcpip.Error {
 	if ttl == 0 {
 		ttl = h.ep.route.DefaultTTL()
 	}
-	h.ep.sendSynTCP(&h.ep.route, tcpFields{
+	h.ep.sendSynTCP(h.ep.route, tcpFields{
 		id:     h.ep.ID,
 		ttl:    ttl,
 		tos:    h.ep.sendTOS,
@@ -361,7 +362,7 @@ func (h *handshake) synRcvdState(s *segment) *tcpip.Error {
 			SACKPermitted: h.ep.sackPermitted,
 			MSS:           h.ep.amss,
 		}
-		h.ep.sendSynTCP(&h.ep.route, tcpFields{
+		h.ep.sendSynTCP(h.ep.route, tcpFields{
 			id:     h.ep.ID,
 			ttl:    h.ep.ttl,
 			tos:    h.ep.sendTOS,
@@ -547,7 +548,7 @@ func (h *handshake) start() *tcpip.Error {
 	}
 
 	h.sendSYNOpts = synOpts
-	h.ep.sendSynTCP(&h.ep.route, tcpFields{
+	h.ep.sendSynTCP(h.ep.route, tcpFields{
 		id:     h.ep.ID,
 		ttl:    h.ep.ttl,
 		tos:    h.ep.sendTOS,
@@ -596,7 +597,7 @@ func (h *handshake) complete() *tcpip.Error {
 			// the connection with another ACK or data (as ACKs are never
 			// retransmitted on their own).
 			if h.active || !h.acked || h.deferAccept != 0 && time.Since(h.startTime) > h.deferAccept {
-				h.ep.sendSynTCP(&h.ep.route, tcpFields{
+				h.ep.sendSynTCP(h.ep.route, tcpFields{
 					id:     h.ep.ID,
 					ttl:    h.ep.ttl,
 					tos:    h.ep.sendTOS,
@@ -818,8 +819,8 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 	data = data.Clone(nil)
 
 	optLen := len(tf.opts)
-	if tf.rcvWnd > 0xffff {
-		tf.rcvWnd = 0xffff
+	if tf.rcvWnd > math.MaxUint16 {
+		tf.rcvWnd = math.MaxUint16
 	}
 
 	mss := int(gso.MSS)
@@ -863,8 +864,8 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 // network endpoint and under the provided identity.
 func sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso *stack.GSO, owner tcpip.PacketOwner) *tcpip.Error {
 	optLen := len(tf.opts)
-	if tf.rcvWnd > 0xffff {
-		tf.rcvWnd = 0xffff
+	if tf.rcvWnd > math.MaxUint16 {
+		tf.rcvWnd = math.MaxUint16
 	}
 
 	if r.Loop&stack.PacketLoop == 0 && gso != nil && gso.Type == stack.GSOSW && int(gso.MSS) < data.Size() {
@@ -939,7 +940,7 @@ func (e *endpoint) sendRaw(data buffer.VectorisedView, flags byte, seq, ack seqn
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
 	}
 	options := e.makeOptions(sackBlocks)
-	err := e.sendTCP(&e.route, tcpFields{
+	err := e.sendTCP(e.route, tcpFields{
 		id:     e.ID,
 		ttl:    e.ttl,
 		tos:    e.sendTOS,
@@ -1078,7 +1079,7 @@ func (e *endpoint) transitionToStateCloseLocked() {
 // to any other listening endpoint. We reply with RST if we cannot find one.
 func (e *endpoint) tryDeliverSegmentFromClosedEndpoint(s *segment) {
 	ep := e.stack.FindTransportEndpoint(e.NetProto, e.TransProto, e.ID, s.nicID)
-	if ep == nil && e.NetProto == header.IPv6ProtocolNumber && e.EndpointInfo.TransportEndpointInfo.ID.LocalAddress.To4() != "" {
+	if ep == nil && e.NetProto == header.IPv6ProtocolNumber && e.TransportEndpointInfo.ID.LocalAddress.To4() != "" {
 		// Dual-stack socket, try IPv4.
 		ep = e.stack.FindTransportEndpoint(header.IPv4ProtocolNumber, e.TransProto, e.ID, s.nicID)
 	}
@@ -1635,7 +1636,7 @@ func (e *endpoint) handleTimeWaitSegments() (extendTimeWait bool, reuseTW func()
 		}
 		extTW, newSyn := e.rcv.handleTimeWaitSegment(s)
 		if newSyn {
-			info := e.EndpointInfo.TransportEndpointInfo
+			info := e.TransportEndpointInfo
 			newID := info.ID
 			newID.RemoteAddress = ""
 			newID.RemotePort = 0

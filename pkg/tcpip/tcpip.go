@@ -603,20 +603,12 @@ type Endpoint interface {
 	// SetSockOpt sets a socket option.
 	SetSockOpt(opt SettableSocketOption) *Error
 
-	// SetSockOptBool sets a socket option, for simple cases where a value
-	// has the bool type.
-	SetSockOptBool(opt SockOptBool, v bool) *Error
-
 	// SetSockOptInt sets a socket option, for simple cases where a value
 	// has the int type.
 	SetSockOptInt(opt SockOptInt, v int) *Error
 
 	// GetSockOpt gets a socket option.
 	GetSockOpt(opt GettableSocketOption) *Error
-
-	// GetSockOptBool gets a socket option for simple cases where a return
-	// value has the bool type.
-	GetSockOptBool(SockOptBool) (bool, *Error)
 
 	// GetSockOptInt gets a socket option for simple cases where a return
 	// value has the int type.
@@ -703,53 +695,6 @@ type WriteOptions struct {
 	// discarded if available endpoint buffer space is unsufficient.
 	Atomic bool
 }
-
-// SockOptBool represents socket options which values have the bool type.
-type SockOptBool int
-
-const (
-	// CorkOption is used by SetSockOptBool/GetSockOptBool to specify if
-	// data should be held until segments are full by the TCP transport
-	// protocol.
-	CorkOption SockOptBool = iota
-
-	// DelayOption is used by SetSockOptBool/GetSockOptBool to specify if
-	// data should be sent out immediately by the transport protocol. For
-	// TCP, it determines if the Nagle algorithm is on or off.
-	DelayOption
-
-	// MulticastLoopOption is used by SetSockOptBool/GetSockOptBool to
-	// specify whether multicast packets sent over a non-loopback interface
-	// will be looped back.
-	MulticastLoopOption
-
-	// QuickAckOption is stubbed out in SetSockOptBool/GetSockOptBool.
-	QuickAckOption
-
-	// ReceiveTClassOption is used by SetSockOptBool/GetSockOptBool to
-	// specify if the IPV6_TCLASS ancillary message is passed with incoming
-	// packets.
-	ReceiveTClassOption
-
-	// ReceiveTOSOption is used by SetSockOptBool/GetSockOptBool to specify
-	// if the TOS ancillary message is passed with incoming packets.
-	ReceiveTOSOption
-
-	// ReceiveIPPacketInfoOption is used by SetSockOptBool/GetSockOptBool to
-	// specify if more inforamtion is provided with incoming packets such as
-	// interface index and address.
-	ReceiveIPPacketInfoOption
-
-	// V6OnlyOption is used by SetSockOptBool/GetSockOptBool to specify
-	// whether an IPv6 socket is to be restricted to sending and receiving
-	// IPv6 packets only.
-	V6OnlyOption
-
-	// IPHdrIncludedOption is used by SetSockOpt to indicate for a raw
-	// endpoint that all packets being written have an IP header and the
-	// endpoint should not attach an IP header.
-	IPHdrIncludedOption
-)
 
 // SockOptInt represents socket options which values have the int type.
 type SockOptInt int
@@ -1373,6 +1318,18 @@ type ICMPv6PacketStats struct {
 	// RedirectMsg is the total number of ICMPv6 redirect message packets
 	// counted.
 	RedirectMsg *StatCounter
+
+	// MulticastListenerQuery is the total number of Multicast Listener Query
+	// messages counted.
+	MulticastListenerQuery *StatCounter
+
+	// MulticastListenerReport is the total number of Multicast Listener Report
+	// messages counted.
+	MulticastListenerReport *StatCounter
+
+	// MulticastListenerDone is the total number of Multicast Listener Done
+	// messages counted.
+	MulticastListenerDone *StatCounter
 }
 
 // ICMPv4SentPacketStats collects outbound ICMPv4-specific stats.
@@ -1414,6 +1371,10 @@ type ICMPv6SentPacketStats struct {
 type ICMPv6ReceivedPacketStats struct {
 	ICMPv6PacketStats
 
+	// Unrecognized is the total number of ICMPv6 packets received that the
+	// transport layer does not know how to parse.
+	Unrecognized *StatCounter
+
 	// Invalid is the total number of ICMPv6 packets received that the
 	// transport layer could not parse.
 	Invalid *StatCounter
@@ -1423,25 +1384,37 @@ type ICMPv6ReceivedPacketStats struct {
 	RouterOnlyPacketsDroppedByHost *StatCounter
 }
 
-// ICMPStats collects ICMP-specific stats (both v4 and v6).
-type ICMPStats struct {
+// ICMPv4Stats collects ICMPv4-specific stats.
+type ICMPv4Stats struct {
 	// ICMPv4SentPacketStats contains counts of sent packets by ICMPv4 packet type
 	// and a single count of packets which failed to write to the link
 	// layer.
-	V4PacketsSent ICMPv4SentPacketStats
+	PacketsSent ICMPv4SentPacketStats
 
 	// ICMPv4ReceivedPacketStats contains counts of received packets by ICMPv4
 	// packet type and a single count of invalid packets received.
-	V4PacketsReceived ICMPv4ReceivedPacketStats
+	PacketsReceived ICMPv4ReceivedPacketStats
+}
 
+// ICMPv6Stats collects ICMPv6-specific stats.
+type ICMPv6Stats struct {
 	// ICMPv6SentPacketStats contains counts of sent packets by ICMPv6 packet type
 	// and a single count of packets which failed to write to the link
 	// layer.
-	V6PacketsSent ICMPv6SentPacketStats
+	PacketsSent ICMPv6SentPacketStats
 
 	// ICMPv6ReceivedPacketStats contains counts of received packets by ICMPv6
 	// packet type and a single count of invalid packets received.
-	V6PacketsReceived ICMPv6ReceivedPacketStats
+	PacketsReceived ICMPv6ReceivedPacketStats
+}
+
+// ICMPStats collects ICMP-specific stats (both v4 and v6).
+type ICMPStats struct {
+	// V4 contains the ICMPv4-specifics stats.
+	V4 ICMPv4Stats
+
+	// V6 contains the ICMPv4-specifics stats.
+	V6 ICMPv6Stats
 }
 
 // IGMPPacketStats enumerates counts for all IGMP packet types.

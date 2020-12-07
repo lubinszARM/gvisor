@@ -18,18 +18,21 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/sleep"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 // Route represents a route through the networking stack to a given destination.
+//
+// It is safe to call Route's methods from multiple goroutines.
+//
+// The exported fields are immutable.
+//
+// TODO(gvisor.dev/issue/4902): Unexpose immutable fields.
 type Route struct {
 	// RemoteAddress is the final destination of the route.
 	RemoteAddress tcpip.Address
-
-	// RemoteLinkAddress is the link-layer (MAC) address of the
-	// final destination of the route.
-	RemoteLinkAddress tcpip.LinkAddress
 
 	// LocalAddress is the local address where the route starts.
 	LocalAddress tcpip.Address
@@ -52,8 +55,16 @@ type Route struct {
 	// address's assigned status without the NIC.
 	localAddressNIC *NIC
 
-	// localAddressEndpoint is the local address this route is associated with.
-	localAddressEndpoint AssignableAddressEndpoint
+	mu struct {
+		sync.RWMutex
+
+		// localAddressEndpoint is the local address this route is associated with.
+		localAddressEndpoint AssignableAddressEndpoint
+
+		// remoteLinkAddress is the link-layer (MAC) address of the next hop in the
+		// route.
+		remoteLinkAddress tcpip.LinkAddress
+	}
 
 	// outgoingNIC is the interface this route uses to write packets.
 	outgoingNIC *NIC
@@ -71,14 +82,14 @@ type Route struct {
 // ownership of the provided local address.
 //
 // Returns an empty route if validation fails.
-func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndpoint AssignableAddressEndpoint, localAddressNIC, outgoingNIC *NIC, gateway, localAddr, remoteAddr tcpip.Address, handleLocal, multicastLoop bool) Route {
+func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndpoint AssignableAddressEndpoint, localAddressNIC, outgoingNIC *NIC, gateway, localAddr, remoteAddr tcpip.Address, handleLocal, multicastLoop bool) *Route {
 	if len(localAddr) == 0 {
 		localAddr = addressEndpoint.AddressWithPrefix().Address
 	}
 
 	if localAddressNIC != outgoingNIC && header.IsV6LinkLocalAddress(localAddr) {
 		addressEndpoint.DecRef()
-		return Route{}
+		return nil
 	}
 
 	// If no remote address is provided, use the local address.
@@ -102,7 +113,7 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 	if len(gateway) > 0 {
 		r.NextHop = gateway
 	} else if subnet := addressEndpoint.Subnet(); subnet.IsBroadcast(remoteAddr) {
-		r.RemoteLinkAddress = header.EthernetBroadcastAddress
+		r.ResolveWith(header.EthernetBroadcastAddress)
 	}
 
 	return r
@@ -110,7 +121,7 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 
 // makeRoute initializes a new route. It takes ownership of the provided
 // AssignableAddressEndpoint.
-func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool) Route {
+func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool) *Route {
 	if localAddressNIC.stack != outgoingNIC.stack {
 		panic(fmt.Sprintf("cannot create a route with NICs from different stacks"))
 	}
@@ -139,17 +150,20 @@ func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip
 	return makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop)
 }
 
-func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, loop PacketLooping) Route {
-	r := Route{
-		NetProto:             netProto,
-		LocalAddress:         localAddr,
-		LocalLinkAddress:     outgoingNIC.LinkEndpoint.LinkAddress(),
-		RemoteAddress:        remoteAddr,
-		localAddressNIC:      localAddressNIC,
-		localAddressEndpoint: localAddressEndpoint,
-		outgoingNIC:          outgoingNIC,
-		Loop:                 loop,
+func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, loop PacketLooping) *Route {
+	r := &Route{
+		NetProto:         netProto,
+		LocalAddress:     localAddr,
+		LocalLinkAddress: outgoingNIC.LinkEndpoint.LinkAddress(),
+		RemoteAddress:    remoteAddr,
+		localAddressNIC:  localAddressNIC,
+		outgoingNIC:      outgoingNIC,
+		Loop:             loop,
 	}
+
+	r.mu.Lock()
+	r.mu.localAddressEndpoint = localAddressEndpoint
+	r.mu.Unlock()
 
 	if r.outgoingNIC.LinkEndpoint.Capabilities()&CapabilityResolutionRequired != 0 {
 		if linkRes, ok := r.outgoingNIC.stack.linkAddrResolvers[r.NetProto]; ok {
@@ -165,7 +179,7 @@ func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr 
 // provided AssignableAddressEndpoint.
 //
 // A local route is a route to a destination that is local to the stack.
-func makeLocalRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint) Route {
+func makeLocalRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint) *Route {
 	loop := PacketLoop
 	// TODO(gvisor.dev/issue/4689): Loopback interface loops back packets at the
 	// link endpoint level. We can remove this check once loopback interfaces
@@ -174,6 +188,14 @@ func makeLocalRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr 
 		loop = PacketOut
 	}
 	return makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop)
+}
+
+// RemoteLinkAddress returns the link-layer (MAC) address of the next hop in
+// the route.
+func (r *Route) RemoteLinkAddress() tcpip.LinkAddress {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.remoteLinkAddress
 }
 
 // NICID returns the id of the NIC from which this route originates.
@@ -237,7 +259,9 @@ func (r *Route) GSOMaxSize() uint32 {
 // ResolveWith immediately resolves a route with the specified remote link
 // address.
 func (r *Route) ResolveWith(addr tcpip.LinkAddress) {
-	r.RemoteLinkAddress = addr
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.remoteLinkAddress = addr
 }
 
 // Resolve attempts to resolve the link address if necessary. Returns ErrWouldBlock in
@@ -250,7 +274,10 @@ func (r *Route) ResolveWith(addr tcpip.LinkAddress) {
 //
 // The NIC r uses must not be locked.
 func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
-	if !r.IsResolutionRequired() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.isResolutionRequiredRLocked() {
 		// Nothing to do if there is no cache (which does the resolution on cache miss) or
 		// link address is already known.
 		return nil, nil
@@ -260,7 +287,7 @@ func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
 	if nextAddr == "" {
 		// Local link address is already known.
 		if r.RemoteAddress == r.LocalAddress {
-			r.RemoteLinkAddress = r.LocalLinkAddress
+			r.mu.remoteLinkAddress = r.LocalLinkAddress
 			return nil, nil
 		}
 		nextAddr = r.RemoteAddress
@@ -278,7 +305,7 @@ func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
 		if err != nil {
 			return ch, err
 		}
-		r.RemoteLinkAddress = entry.LinkAddr
+		r.mu.remoteLinkAddress = entry.LinkAddr
 		return nil, nil
 	}
 
@@ -286,7 +313,7 @@ func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
 	if err != nil {
 		return ch, err
 	}
-	r.RemoteLinkAddress = linkAddr
+	r.mu.remoteLinkAddress = linkAddr
 	return nil, nil
 }
 
@@ -315,7 +342,13 @@ func (r *Route) local() bool {
 //
 // The NICs the route is associated with must not be locked.
 func (r *Route) IsResolutionRequired() bool {
-	if !r.isValidForOutgoing() || r.RemoteLinkAddress != "" || r.local() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isResolutionRequiredRLocked()
+}
+
+func (r *Route) isResolutionRequiredRLocked() bool {
+	if !r.isValidForOutgoingRLocked() || r.mu.remoteLinkAddress != "" || r.local() {
 		return false
 	}
 
@@ -323,11 +356,18 @@ func (r *Route) IsResolutionRequired() bool {
 }
 
 func (r *Route) isValidForOutgoing() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isValidForOutgoingRLocked()
+}
+
+func (r *Route) isValidForOutgoingRLocked() bool {
 	if !r.outgoingNIC.Enabled() {
 		return false
 	}
 
-	if !r.localAddressNIC.isValidForOutgoing(r.localAddressEndpoint) {
+	localAddressEndpoint := r.mu.localAddressEndpoint
+	if localAddressEndpoint == nil || !r.localAddressNIC.isValidForOutgoing(localAddressEndpoint) {
 		return false
 	}
 
@@ -381,20 +421,44 @@ func (r *Route) MTU() uint32 {
 
 // Release frees all resources associated with the route.
 func (r *Route) Release() {
-	if r.localAddressEndpoint != nil {
-		r.localAddressEndpoint.DecRef()
-		r.localAddressEndpoint = nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.mu.localAddressEndpoint != nil {
+		r.mu.localAddressEndpoint.DecRef()
+		r.mu.localAddressEndpoint = nil
 	}
 }
 
 // Clone clones the route.
-func (r *Route) Clone() Route {
-	if r.localAddressEndpoint != nil {
-		if !r.localAddressEndpoint.IncRef() {
-			panic(fmt.Sprintf("failed to increment reference count for local address endpoint = %s", r.LocalAddress))
+func (r *Route) Clone() *Route {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	newRoute := &Route{
+		RemoteAddress:    r.RemoteAddress,
+		LocalAddress:     r.LocalAddress,
+		LocalLinkAddress: r.LocalLinkAddress,
+		NextHop:          r.NextHop,
+		NetProto:         r.NetProto,
+		Loop:             r.Loop,
+		localAddressNIC:  r.localAddressNIC,
+		outgoingNIC:      r.outgoingNIC,
+		linkCache:        r.linkCache,
+		linkRes:          r.linkRes,
+	}
+
+	newRoute.mu.Lock()
+	defer newRoute.mu.Unlock()
+	newRoute.mu.localAddressEndpoint = r.mu.localAddressEndpoint
+	if newRoute.mu.localAddressEndpoint != nil {
+		if !newRoute.mu.localAddressEndpoint.IncRef() {
+			panic(fmt.Sprintf("failed to increment reference count for local address endpoint = %s", newRoute.LocalAddress))
 		}
 	}
-	return *r
+	newRoute.mu.remoteLinkAddress = r.mu.remoteLinkAddress
+
+	return newRoute
 }
 
 // Stack returns the instance of the Stack that owns this route.
@@ -407,7 +471,14 @@ func (r *Route) isV4Broadcast(addr tcpip.Address) bool {
 		return true
 	}
 
-	subnet := r.localAddressEndpoint.Subnet()
+	r.mu.RLock()
+	localAddressEndpoint := r.mu.localAddressEndpoint
+	r.mu.RUnlock()
+	if localAddressEndpoint == nil {
+		return false
+	}
+
+	subnet := localAddressEndpoint.Subnet()
 	return subnet.IsBroadcast(addr)
 }
 

@@ -65,7 +65,6 @@ type endpoint struct {
 	stack       *stack.Stack `state:"manual"`
 	waiterQueue *waiter.Queue
 	associated  bool
-	hdrIncluded bool
 
 	// The following fields are used to manage the receive queue and are
 	// protected by rcvMu.
@@ -84,7 +83,7 @@ type endpoint struct {
 	bound         bool
 	// route is the route to a remote network endpoint. It is set via
 	// Connect(), and is valid only when conneted is true.
-	route stack.Route                  `state:"manual"`
+	route *stack.Route                 `state:"manual"`
 	stats tcpip.TransportEndpointStats `state:"nosave"`
 	// linger is used for SO_LINGER socket option.
 	linger tcpip.LingerOption
@@ -116,9 +115,9 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 		rcvBufSizeMax: 32 * 1024,
 		sndBufSizeMax: 32 * 1024,
 		associated:    associated,
-		hdrIncluded:   !associated,
 	}
 	e.ops.InitHandler(e)
+	e.ops.SetHeaderIncluded(!associated)
 
 	// Override with stack defaults.
 	var ss stack.SendBufferSizeOption
@@ -173,9 +172,11 @@ func (e *endpoint) Close() {
 		e.rcvList.Remove(e.rcvList.Front())
 	}
 
-	if e.connected {
+	e.connected = false
+
+	if e.route != nil {
 		e.route.Release()
-		e.connected = false
+		e.route = nil
 	}
 
 	e.closed = true
@@ -269,7 +270,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 
 	// If this is an unassociated socket and callee provided a nonzero
 	// destination address, route using that address.
-	if e.hdrIncluded {
+	if e.ops.GetHeaderIncluded() {
 		ip := header.IPv4(payloadBytes)
 		if !ip.IsValid(len(payloadBytes)) {
 			e.mu.RUnlock()
@@ -299,7 +300,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		}
 
 		if e.route.IsResolutionRequired() {
-			savedRoute := &e.route
+			savedRoute := e.route
 			// Promote lock to exclusive if using a shared route,
 			// given that it may need to change in finishWrite.
 			e.mu.RUnlock()
@@ -307,7 +308,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 
 			// Make sure that the route didn't change during the
 			// time we didn't hold the lock.
-			if !e.connected || savedRoute != &e.route {
+			if !e.connected || savedRoute != e.route {
 				e.mu.Unlock()
 				return 0, nil, tcpip.ErrInvalidEndpointState
 			}
@@ -317,7 +318,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 			return n, ch, err
 		}
 
-		n, ch, err := e.finishWrite(payloadBytes, &e.route)
+		n, ch, err := e.finishWrite(payloadBytes, e.route)
 		e.mu.RUnlock()
 		return n, ch, err
 	}
@@ -338,7 +339,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		return 0, nil, err
 	}
 
-	n, ch, err := e.finishWrite(payloadBytes, &route)
+	n, ch, err := e.finishWrite(payloadBytes, route)
 	route.Release()
 	e.mu.RUnlock()
 	return n, ch, err
@@ -359,7 +360,7 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 		}
 	}
 
-	if e.hdrIncluded {
+	if e.ops.GetHeaderIncluded() {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Data: buffer.View(payloadBytes).ToVectorisedView(),
 		})
@@ -534,18 +535,6 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	}
 }
 
-// SetSockOptBool implements tcpip.Endpoint.SetSockOptBool.
-func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
-	switch opt {
-	case tcpip.IPHdrIncludedOption:
-		e.mu.Lock()
-		e.hdrIncluded = v
-		e.mu.Unlock()
-		return nil
-	}
-	return tcpip.ErrUnknownProtocolOption
-}
-
 // SetSockOptInt implements tcpip.Endpoint.SetSockOptInt.
 func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	switch opt {
@@ -601,20 +590,6 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 
 	default:
 		return tcpip.ErrUnknownProtocolOption
-	}
-}
-
-// GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
-func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
-	switch opt {
-	case tcpip.IPHdrIncludedOption:
-		e.mu.Lock()
-		v := e.hdrIncluded
-		e.mu.Unlock()
-		return v, nil
-
-	default:
-		return false, tcpip.ErrUnknownProtocolOption
 	}
 }
 

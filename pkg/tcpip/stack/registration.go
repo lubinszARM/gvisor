@@ -259,15 +259,6 @@ const (
 	PacketLoop
 )
 
-// NetOptions is an interface that allows us to pass network protocol specific
-// options through the Stack layer code.
-type NetOptions interface {
-	// SizeWithPadding returns the amount of memory that must be allocated to
-	// hold the options given that the value must be rounded up to the next
-	// multiple of 4 bytes.
-	SizeWithPadding() int
-}
-
 // NetworkHeaderParams are the header parameters given as input by the
 // transport endpoint to the network.
 type NetworkHeaderParams struct {
@@ -279,10 +270,6 @@ type NetworkHeaderParams struct {
 
 	// TOS refers to TypeOfService or TrafficClass field of the IP-header.
 	TOS uint8
-
-	// Options is a set of options to add to a network header (or nil).
-	// It will be protocol specific opaque information from higher layers.
-	Options NetOptions
 }
 
 // GroupAddressableEndpoint is an endpoint that supports group addressing.
@@ -291,14 +278,10 @@ type NetworkHeaderParams struct {
 // endpoints may associate themselves with the same identifier (group address).
 type GroupAddressableEndpoint interface {
 	// JoinGroup joins the specified group.
-	//
-	// Returns true if the group was newly joined.
-	JoinGroup(group tcpip.Address) (bool, *tcpip.Error)
+	JoinGroup(group tcpip.Address) *tcpip.Error
 
 	// LeaveGroup attempts to leave the specified group.
-	//
-	// Returns tcpip.ErrBadLocalAddress if the endpoint has not joined the group.
-	LeaveGroup(group tcpip.Address) (bool, *tcpip.Error)
+	LeaveGroup(group tcpip.Address) *tcpip.Error
 
 	// IsInGroup returns true if the endpoint is a member of the specified group.
 	IsInGroup(group tcpip.Address) bool

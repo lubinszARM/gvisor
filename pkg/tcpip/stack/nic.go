@@ -267,7 +267,7 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 	if ch, err := r.Resolve(nil); err != nil {
 		if err == tcpip.ErrWouldBlock {
 			r := r.Clone()
-			n.stack.linkResQueue.enqueue(ch, &r, protocol, pkt)
+			n.stack.linkResQueue.enqueue(ch, r, protocol, pkt)
 			return nil
 		}
 		return err
@@ -279,9 +279,9 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 // WritePacketToRemote implements NetworkInterface.
 func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
 	r := Route{
-		NetProto:          protocol,
-		RemoteLinkAddress: remoteLinkAddr,
+		NetProto: protocol,
 	}
+	r.ResolveWith(remoteLinkAddr)
 	return n.writePacket(&r, gso, protocol, pkt)
 }
 
@@ -563,8 +563,7 @@ func (n *NIC) joinGroup(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address
 		return tcpip.ErrNotSupported
 	}
 
-	_, err := gep.JoinGroup(addr)
-	return err
+	return gep.JoinGroup(addr)
 }
 
 // leaveGroup decrements the count for the given multicast address, and when it
@@ -580,11 +579,7 @@ func (n *NIC) leaveGroup(protocol tcpip.NetworkProtocolNumber, addr tcpip.Addres
 		return tcpip.ErrNotSupported
 	}
 
-	if _, err := gep.LeaveGroup(addr); err != nil {
-		return err
-	}
-
-	return nil
+	return gep.LeaveGroup(addr)
 }
 
 // isInGroup returns true if n has joined the multicast group addr.

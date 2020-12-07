@@ -72,7 +72,7 @@ type endpoint struct {
 	// shutdownFlags represent the current shutdown state of the endpoint.
 	shutdownFlags tcpip.ShutdownFlags
 	state         endpointState
-	route         stack.Route `state:"manual"`
+	route         *stack.Route `state:"manual"`
 	ttl           uint8
 	stats         tcpip.TransportEndpointStats `state:"nosave"`
 	// linger is used for SO_LINGER socket option.
@@ -132,7 +132,10 @@ func (e *endpoint) Close() {
 	}
 	e.rcvMu.Unlock()
 
-	e.route.Release()
+	if e.route != nil {
+		e.route.Release()
+		e.route = nil
+	}
 
 	// Update the state.
 	e.state = stateClosed
@@ -145,6 +148,7 @@ func (e *endpoint) Close() {
 // ModerateRecvBuf implements tcpip.Endpoint.ModerateRecvBuf.
 func (e *endpoint) ModerateRecvBuf(copied int) {}
 
+// SetOwner implements tcpip.Endpoint.SetOwner.
 func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 	e.owner = owner
 }
@@ -270,26 +274,8 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		}
 	}
 
-	var route *stack.Route
-	if to == nil {
-		route = &e.route
-
-		if route.IsResolutionRequired() {
-			// Promote lock to exclusive if using a shared route,
-			// given that it may need to change in Route.Resolve()
-			// call below.
-			e.mu.RUnlock()
-			defer e.mu.RLock()
-
-			e.mu.Lock()
-			defer e.mu.Unlock()
-
-			// Recheck state after lock was re-acquired.
-			if e.state != stateConnected {
-				return 0, nil, tcpip.ErrInvalidEndpointState
-			}
-		}
-	} else {
+	route := e.route
+	if to != nil {
 		// Reject destination address if it goes through a different
 		// NIC than the endpoint was bound to.
 		nicID := to.NIC
@@ -313,7 +299,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		}
 		defer r.Release()
 
-		route = &r
+		route = r
 	}
 
 	if route.IsResolutionRequired() {
@@ -364,11 +350,6 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	return nil
 }
 
-// SetSockOptBool sets a socket option. Currently not supported.
-func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
-	return nil
-}
-
 // SetSockOptInt sets a socket option. Currently not supported.
 func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	switch opt {
@@ -379,11 +360,6 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 	}
 	return nil
-}
-
-// GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
-func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
-	return false, tcpip.ErrUnknownProtocolOption
 }
 
 // GetSockOptInt implements tcpip.Endpoint.GetSockOptInt.

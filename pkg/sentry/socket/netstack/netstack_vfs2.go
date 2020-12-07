@@ -51,9 +51,7 @@ var _ = socket.SocketVFS2(&SocketVFS2{})
 // NewVFS2 creates a new endpoint socket.
 func NewVFS2(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*vfs.FileDescription, *syserr.Error) {
 	if skType == linux.SOCK_STREAM {
-		if err := endpoint.SetSockOptBool(tcpip.DelayOption, true); err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		endpoint.SocketOptions().SetDelayOption(true)
 	}
 
 	mnt := t.Kernel().SocketMount()
@@ -191,7 +189,7 @@ func (s *SocketVFS2) Accept(t *kernel.Task, peerRequested bool, flags int, block
 	var addrLen uint32
 	if peerAddr != nil {
 		// Get address of the peer and write it to peer slice.
-		addr, addrLen = ConvertAddress(s.family, *peerAddr)
+		addr, addrLen = socket.ConvertAddress(s.family, *peerAddr)
 	}
 
 	fd, e := t.NewFDFromVFS2(0, ns, kernel.FDFlags{

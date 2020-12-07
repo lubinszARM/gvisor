@@ -19,6 +19,15 @@ func (so *SocketOptions) StateFields() []string {
 		"reuseAddressEnabled",
 		"reusePortEnabled",
 		"keepAliveEnabled",
+		"multicastLoopEnabled",
+		"receiveTOSEnabled",
+		"receiveTClassEnabled",
+		"receivePacketInfoEnabled",
+		"hdrIncludedEnabled",
+		"v6OnlyEnabled",
+		"quickAckEnabled",
+		"delayOptionEnabled",
+		"corkOptionEnabled",
 	}
 }
 
@@ -33,6 +42,15 @@ func (so *SocketOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &so.reuseAddressEnabled)
 	stateSinkObject.Save(5, &so.reusePortEnabled)
 	stateSinkObject.Save(6, &so.keepAliveEnabled)
+	stateSinkObject.Save(7, &so.multicastLoopEnabled)
+	stateSinkObject.Save(8, &so.receiveTOSEnabled)
+	stateSinkObject.Save(9, &so.receiveTClassEnabled)
+	stateSinkObject.Save(10, &so.receivePacketInfoEnabled)
+	stateSinkObject.Save(11, &so.hdrIncludedEnabled)
+	stateSinkObject.Save(12, &so.v6OnlyEnabled)
+	stateSinkObject.Save(13, &so.quickAckEnabled)
+	stateSinkObject.Save(14, &so.delayOptionEnabled)
+	stateSinkObject.Save(15, &so.corkOptionEnabled)
 }
 
 func (so *SocketOptions) afterLoad() {}
@@ -45,6 +63,15 @@ func (so *SocketOptions) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &so.reuseAddressEnabled)
 	stateSourceObject.Load(5, &so.reusePortEnabled)
 	stateSourceObject.Load(6, &so.keepAliveEnabled)
+	stateSourceObject.Load(7, &so.multicastLoopEnabled)
+	stateSourceObject.Load(8, &so.receiveTOSEnabled)
+	stateSourceObject.Load(9, &so.receiveTClassEnabled)
+	stateSourceObject.Load(10, &so.receivePacketInfoEnabled)
+	stateSourceObject.Load(11, &so.hdrIncludedEnabled)
+	stateSourceObject.Load(12, &so.v6OnlyEnabled)
+	stateSourceObject.Load(13, &so.quickAckEnabled)
+	stateSourceObject.Load(14, &so.delayOptionEnabled)
+	stateSourceObject.Load(15, &so.corkOptionEnabled)
 }
 
 func (f *FullAddress) StateTypeName() string {

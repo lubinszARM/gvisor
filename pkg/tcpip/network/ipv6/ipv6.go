@@ -86,6 +86,8 @@ type endpoint struct {
 		addressableEndpointState stack.AddressableEndpointState
 		ndp                      ndpState
 	}
+
+	mld mldState
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,
@@ -226,6 +228,12 @@ func (e *endpoint) Enable() *tcpip.Error {
 		return nil
 	}
 
+	// Groups may have been joined when the endpoint was disabled, or the
+	// endpoint may have left groups from the perspective of MLD when the
+	// endpoint was disabled. Either way, we need to let routers know to
+	// send us multicast traffic.
+	e.mld.initializeAll()
+
 	// Join the IPv6 All-Nodes Multicast group if the stack is configured to
 	// use IPv6. This is required to ensure that this node properly receives
 	// and responds to the various NDP messages that are destined to the
@@ -243,8 +251,10 @@ func (e *endpoint) Enable() *tcpip.Error {
 	// (NDP NS) messages may be sent to the All-Nodes multicast group if the
 	// source address of the NDP NS is the unspecified address, as per RFC 4861
 	// section 7.2.4.
-	if _, err := e.mu.addressableEndpointState.JoinGroup(header.IPv6AllNodesMulticastAddress); err != nil {
-		return err
+	if err := e.joinGroupLocked(header.IPv6AllNodesMulticastAddress); err != nil {
+		// joinGroupLocked only returns an error if the group address is not a valid
+		// IPv6 multicast address.
+		panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", header.IPv6AllNodesMulticastAddress, err))
 	}
 
 	// Perform DAD on the all the unicast IPv6 endpoints that are in the permanent
@@ -253,7 +263,7 @@ func (e *endpoint) Enable() *tcpip.Error {
 	// Addresses may have aleady completed DAD but in the time since the endpoint
 	// was last enabled, other devices may have acquired the same addresses.
 	var err *tcpip.Error
-	e.mu.addressableEndpointState.ReadOnly().ForEach(func(addressEndpoint stack.AddressEndpoint) bool {
+	e.mu.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
 		addr := addressEndpoint.AddressWithPrefix().Address
 		if !header.IsV6UnicastAddress(addr) {
 			return true
@@ -333,9 +343,13 @@ func (e *endpoint) disableLocked() {
 	e.stopDADForPermanentAddressesLocked()
 
 	// The endpoint may have already left the multicast group.
-	if _, err := e.mu.addressableEndpointState.LeaveGroup(header.IPv6AllNodesMulticastAddress); err != nil && err != tcpip.ErrBadLocalAddress {
+	if err := e.leaveGroupLocked(header.IPv6AllNodesMulticastAddress); err != nil && err != tcpip.ErrBadLocalAddress {
 		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv6AllNodesMulticastAddress, err))
 	}
+
+	// Leave groups from the perspective of MLD so that routers know that
+	// we are no longer interested in the group.
+	e.mld.softLeaveAll()
 }
 
 // stopDADForPermanentAddressesLocked stops DAD for all permaneent addresses.
@@ -343,7 +357,7 @@ func (e *endpoint) disableLocked() {
 // Precondition: e.mu must be write locked.
 func (e *endpoint) stopDADForPermanentAddressesLocked() {
 	// Stop DAD for all the tentative unicast addresses.
-	e.mu.addressableEndpointState.ReadOnly().ForEach(func(addressEndpoint stack.AddressEndpoint) bool {
+	e.mu.addressableEndpointState.ForEachEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
 		if addressEndpoint.GetKind() != stack.PermanentTentative {
 			return true
 		}
@@ -378,7 +392,7 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 	return e.nic.MaxHeaderLength() + header.IPv6MinimumSize
 }
 
-func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
+func (e *endpoint) addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
 	length := uint16(pkt.Size())
 	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
 	ip.Encode(&header.IPv6Fields{
@@ -386,8 +400,8 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 		NextHeader:    uint8(params.Protocol),
 		HopLimit:      params.TTL,
 		TrafficClass:  params.TOS,
-		SrcAddr:       r.LocalAddress,
-		DstAddr:       r.RemoteAddress,
+		SrcAddr:       srcAddr,
+		DstAddr:       dstAddr,
 	})
 	pkt.NetworkProtocolNumber = ProtocolNumber
 }
@@ -442,7 +456,7 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU ui
 
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.addIPHeader(r, pkt, params)
+	e.addIPHeader(r.LocalAddress, r.RemoteAddress, pkt, params)
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
@@ -531,7 +545,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 
 	linkMTU := e.nic.MTU()
 	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
-		e.addIPHeader(r, pb, params)
+		e.addIPHeader(r.LocalAddress, r.RemoteAddress, pb, params)
 
 		networkMTU, err := calculateNetworkMTU(linkMTU, uint32(pb.NetworkHeader().View().Size()))
 		if err != nil {
@@ -1164,8 +1178,10 @@ func (e *endpoint) addAndAcquirePermanentAddressLocked(addr tcpip.AddressWithPre
 	}
 
 	snmc := header.SolicitedNodeAddr(addr.Address)
-	if _, err := e.mu.addressableEndpointState.JoinGroup(snmc); err != nil {
-		return nil, err
+	if err := e.joinGroupLocked(snmc); err != nil {
+		// joinGroupLocked only returns an error if the group address is not a valid
+		// IPv6 multicast address.
+		panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", snmc, err))
 	}
 
 	addressEndpoint.SetKind(stack.PermanentTentative)
@@ -1221,7 +1237,8 @@ func (e *endpoint) removePermanentEndpointLocked(addressEndpoint stack.AddressEn
 	}
 
 	snmc := header.SolicitedNodeAddr(addr.Address)
-	if _, err := e.mu.addressableEndpointState.LeaveGroup(snmc); err != nil && err != tcpip.ErrBadLocalAddress {
+	// The endpoint may have already left the multicast group.
+	if err := e.leaveGroupLocked(snmc); err != nil && err != tcpip.ErrBadLocalAddress {
 		return err
 	}
 
@@ -1244,7 +1261,7 @@ func (e *endpoint) hasPermanentAddressRLocked(addr tcpip.Address) bool {
 //
 // Precondition: e.mu must be read or write locked.
 func (e *endpoint) getAddressRLocked(localAddr tcpip.Address) stack.AddressEndpoint {
-	return e.mu.addressableEndpointState.ReadOnly().Lookup(localAddr)
+	return e.mu.addressableEndpointState.GetAddress(localAddr)
 }
 
 // MainAddress implements stack.AddressableEndpoint.
@@ -1295,7 +1312,7 @@ func (e *endpoint) acquireOutgoingPrimaryAddressRLocked(remoteAddr tcpip.Address
 	// Create a candidate set of available addresses we can potentially use as a
 	// source address.
 	var cs []addrCandidate
-	e.mu.addressableEndpointState.ReadOnly().ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) {
+	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) {
 		// If r is not valid for outgoing connections, it is not a valid endpoint.
 		if !addressEndpoint.IsAssigned(allowExpired) {
 			return
@@ -1386,28 +1403,43 @@ func (e *endpoint) PermanentAddresses() []tcpip.AddressWithPrefix {
 }
 
 // JoinGroup implements stack.GroupAddressableEndpoint.
-func (e *endpoint) JoinGroup(addr tcpip.Address) (bool, *tcpip.Error) {
-	if !header.IsV6MulticastAddress(addr) {
-		return false, tcpip.ErrBadAddress
-	}
-
+func (e *endpoint) JoinGroup(addr tcpip.Address) *tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.mu.addressableEndpointState.JoinGroup(addr)
+	return e.joinGroupLocked(addr)
+}
+
+// joinGroupLocked is like JoinGroup but with locking requirements.
+//
+// Precondition: e.mu must be locked.
+func (e *endpoint) joinGroupLocked(addr tcpip.Address) *tcpip.Error {
+	if !header.IsV6MulticastAddress(addr) {
+		return tcpip.ErrBadAddress
+	}
+
+	e.mld.joinGroup(addr)
+	return nil
 }
 
 // LeaveGroup implements stack.GroupAddressableEndpoint.
-func (e *endpoint) LeaveGroup(addr tcpip.Address) (bool, *tcpip.Error) {
+func (e *endpoint) LeaveGroup(addr tcpip.Address) *tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.mu.addressableEndpointState.LeaveGroup(addr)
+	return e.leaveGroupLocked(addr)
+}
+
+// leaveGroupLocked is like LeaveGroup but with locking requirements.
+//
+// Precondition: e.mu must be locked.
+func (e *endpoint) leaveGroupLocked(addr tcpip.Address) *tcpip.Error {
+	return e.mld.leaveGroup(addr)
 }
 
 // IsInGroup implements stack.GroupAddressableEndpoint.
 func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.mu.addressableEndpointState.IsInGroup(addr)
+	return e.mld.isInGroup(addr)
 }
 
 var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
@@ -1482,6 +1514,7 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, linkAddrCache stack.L
 		slaacPrefixes:  make(map[tcpip.Subnet]slaacPrefixState),
 	}
 	e.mu.ndp.initializeTempAddrState()
+	e.mld.init(e, p.options.MLD)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1638,6 +1671,9 @@ type Options struct {
 	// seed that is too small would reduce randomness and increase predictability,
 	// defeating the purpose of temporary SLAAC addresses.
 	TempIIDSeed []byte
+
+	// MLD holds options for MLD.
+	MLD MLDOptions
 }
 
 // NewProtocolWithOptions returns an IPv6 network protocol.
