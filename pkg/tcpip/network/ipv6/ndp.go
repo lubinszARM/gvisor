@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -459,6 +460,9 @@ func (c *NDPConfigurations) validate() {
 
 // ndpState is the per-interface NDP state.
 type ndpState struct {
+	// Do not allow overwriting this state.
+	_ sync.NoCopy
+
 	// The IPv6 endpoint this ndpState is for.
 	ep *endpoint
 
@@ -643,6 +647,7 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 			ndpDisp.OnDuplicateAddressDetectionStatus(ndp.ep.nic.ID(), addr, true, nil)
 		}
 
+		ndp.ep.onAddressAssignedLocked(addr)
 		return nil
 	}
 
@@ -686,12 +691,14 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 				ndpDisp.OnDuplicateAddressDetectionStatus(ndp.ep.nic.ID(), addr, dadDone, err)
 			}
 
-			// If DAD resolved for a stable SLAAC address, attempt generation of a
-			// temporary SLAAC address.
-			if dadDone && addressEndpoint.ConfigType() == stack.AddressConfigSlaac {
-				// Reset the generation attempts counter as we are starting the generation
-				// of a new address for the SLAAC prefix.
-				ndp.regenerateTempSLAACAddr(addressEndpoint.AddressWithPrefix().Subnet(), true /* resetGenAttempts */)
+			if dadDone {
+				if addressEndpoint.ConfigType() == stack.AddressConfigSlaac {
+					// Reset the generation attempts counter as we are starting the
+					// generation of a new address for the SLAAC prefix.
+					ndp.regenerateTempSLAACAddr(addressEndpoint.AddressWithPrefix().Subnet(), true /* resetGenAttempts */)
+				}
+
+				ndp.ep.onAddressAssignedLocked(addr)
 			}
 		}),
 	}
@@ -728,7 +735,7 @@ func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.Add
 	ndp.ep.addIPHeader(header.IPv6Any, snmc, pkt, stack.NetworkHeaderParams{
 		Protocol: header.ICMPv6ProtocolNumber,
 		TTL:      header.NDPHopLimit,
-	})
+	}, nil /* extensionHeaders */)
 
 	if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(snmc), nil /* gso */, ProtocolNumber, pkt); err != nil {
 		sent.Dropped.Increment()
@@ -1850,7 +1857,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 		ndp.ep.addIPHeader(localAddr, header.IPv6AllRoutersMulticastAddress, pkt, stack.NetworkHeaderParams{
 			Protocol: header.ICMPv6ProtocolNumber,
 			TTL:      header.NDPHopLimit,
-		})
+		}, nil /* extensionHeaders */)
 
 		if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersMulticastAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
 			sent.Dropped.Increment()
@@ -1884,11 +1891,19 @@ func (ndp *ndpState) stopSolicitingRouters() {
 	ndp.rtrSolicitJob = nil
 }
 
-// initializeTempAddrState initializes state related to temporary SLAAC
-// addresses.
-func (ndp *ndpState) initializeTempAddrState() {
-	header.InitialTempIID(ndp.temporaryIIDHistory[:], ndp.ep.protocol.options.TempIIDSeed, ndp.ep.nic.ID())
+func (ndp *ndpState) init(ep *endpoint) {
+	if ndp.dad != nil {
+		panic("attempted to initialize NDP state twice")
+	}
 
+	ndp.ep = ep
+	ndp.configs = ep.protocol.options.NDPConfigs
+	ndp.dad = make(map[tcpip.Address]dadState)
+	ndp.defaultRouters = make(map[tcpip.Address]defaultRouterState)
+	ndp.onLinkPrefixes = make(map[tcpip.Subnet]onLinkPrefixState)
+	ndp.slaacPrefixes = make(map[tcpip.Subnet]slaacPrefixState)
+
+	header.InitialTempIID(ndp.temporaryIIDHistory[:], ndp.ep.protocol.options.TempIIDSeed, ndp.ep.nic.ID())
 	if MaxDesyncFactor != 0 {
 		ndp.temporaryAddressDesyncFactor = time.Duration(rand.Int63n(int64(MaxDesyncFactor)))
 	}

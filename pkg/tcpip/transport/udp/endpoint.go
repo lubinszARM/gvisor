@@ -30,10 +30,11 @@ import (
 // +stateify savable
 type udpPacket struct {
 	udpPacketEntry
-	senderAddress tcpip.FullAddress
-	packetInfo    tcpip.IPPacketInfo
-	data          buffer.VectorisedView `state:".(buffer.VectorisedView)"`
-	timestamp     int64
+	senderAddress      tcpip.FullAddress
+	destinationAddress tcpip.FullAddress
+	packetInfo         tcpip.IPPacketInfo
+	data               buffer.VectorisedView `state:".(buffer.VectorisedView)"`
+	timestamp          int64
 	// tos stores either the receiveTOS or receiveTClass value.
 	tos uint8
 }
@@ -323,6 +324,10 @@ func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMess
 		cm.HasIPPacketInfo = true
 		cm.PacketInfo = p.packetInfo
 	}
+	if e.ops.GetReceiveOriginalDstAddress() {
+		cm.HasOriginalDstAddress = true
+		cm.OriginalDstAddress = p.destinationAddress
+	}
 	return p.data.ToView(), cm, nil
 }
 
@@ -545,8 +550,8 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 }
 
 // Peek only returns data from a single datagram, so do nothing here.
-func (e *endpoint) Peek([][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
-	return 0, tcpip.ControlMessages{}, nil
+func (e *endpoint) Peek([][]byte) (int64, *tcpip.Error) {
+	return 0, nil
 }
 
 // OnReuseAddressSet implements tcpip.SocketOptionsHandler.OnReuseAddressSet.
@@ -1267,7 +1272,6 @@ func verifyChecksum(hdr header.UDP, pkt *stack.PacketBuffer) bool {
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
 func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
-	// Get the header then trim it from the view.
 	hdr := header.UDP(pkt.TransportHeader().View())
 	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
 		// Malformed packet.
@@ -1275,6 +1279,10 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}
+
+	// TODO(gvisor.dev/issues/5033): We should mirror the Network layer and cap
+	// packets at "Parse" instead of when handling a packet.
+	pkt.Data.CapLength(int(hdr.PayloadLength()))
 
 	if !verifyChecksum(hdr, pkt) {
 		// Checksum Error.
@@ -1309,7 +1317,12 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 		senderAddress: tcpip.FullAddress{
 			NIC:  pkt.NICID,
 			Addr: id.RemoteAddress,
-			Port: header.UDP(hdr).SourcePort(),
+			Port: hdr.SourcePort(),
+		},
+		destinationAddress: tcpip.FullAddress{
+			NIC:  pkt.NICID,
+			Addr: id.LocalAddress,
+			Port: header.UDP(hdr).DestinationPort(),
 		},
 	}
 	packet.data = pkt.Data

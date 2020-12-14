@@ -22,6 +22,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -82,6 +83,7 @@ func Main(version string) {
 	subcommands.Register(new(cmd.Spec), "")
 	subcommands.Register(new(cmd.State), "")
 	subcommands.Register(new(cmd.Start), "")
+	subcommands.Register(new(cmd.Symbolize), "")
 	subcommands.Register(new(cmd.Wait), "")
 
 	// Register internal commands with the internal group name. This causes
@@ -207,6 +209,8 @@ func Main(version string) {
 	log.Infof("***************************")
 	log.Infof("Args: %s", os.Args)
 	log.Infof("Version %s", version)
+	log.Infof("GOOS: %s", runtime.GOOS)
+	log.Infof("GOARCH: %s", runtime.GOARCH)
 	log.Infof("PID: %d", os.Getpid())
 	log.Infof("UID: %d, GID: %d", os.Getuid(), os.Getgid())
 	log.Infof("Configuration:")

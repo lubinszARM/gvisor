@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -85,9 +86,8 @@ type endpoint struct {
 
 		addressableEndpointState stack.AddressableEndpointState
 		ndp                      ndpState
+		mld                      mldState
 	}
-
-	mld mldState
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,
@@ -120,6 +120,45 @@ type OpaqueInterfaceIdentifierOptions struct {
 	// May be nil, but a nil value is highly discouraged to maintain
 	// some level of randomness between nodes.
 	SecretKey []byte
+}
+
+// onAddressAssignedLocked handles an address being assigned.
+//
+// Precondition: e.mu must be exclusively locked.
+func (e *endpoint) onAddressAssignedLocked(addr tcpip.Address) {
+	// As per RFC 2710 section 3,
+	//
+	//   All MLD  messages described in this document are sent with a link-local
+	//   IPv6 Source Address, ...
+	//
+	// If we just completed DAD for a link-local address, then attempt to send any
+	// queued MLD reports. Note, we may have sent reports already for some of the
+	// groups before we had a valid link-local address to use as the source for
+	// the MLD messages, but that was only so that MLD snooping switches are aware
+	// of our membership to groups - routers would not have handled those reports.
+	//
+	// As per RFC 3590 section 4,
+	//
+	//   MLD Report and Done messages are sent with a link-local address as
+	//   the IPv6 source address, if a valid address is available on the
+	//   interface. If a valid link-local address is not available (e.g., one
+	//   has not been configured), the message is sent with the unspecified
+	//   address (::) as the IPv6 source address.
+	//
+	//   Once a valid link-local address is available, a node SHOULD generate
+	//   new MLD Report messages for all multicast addresses joined on the
+	//   interface.
+	//
+	//   Routers receiving an MLD Report or Done message with the unspecified
+	//   address as the IPv6 source address MUST silently discard the packet
+	//   without taking any action on the packets contents.
+	//
+	//   Snooping switches MUST manage multicast forwarding state based on MLD
+	//   Report and Done messages sent with the unspecified address as the
+	//   IPv6 source address.
+	if header.IsV6LinkLocalAddress(addr) {
+		e.mu.mld.sendQueuedReports()
+	}
 }
 
 // InvalidateDefaultRouter implements stack.NDPEndpoint.
@@ -232,7 +271,7 @@ func (e *endpoint) Enable() *tcpip.Error {
 	// endpoint may have left groups from the perspective of MLD when the
 	// endpoint was disabled. Either way, we need to let routers know to
 	// send us multicast traffic.
-	e.mld.initializeAll()
+	e.mu.mld.initializeAll()
 
 	// Join the IPv6 All-Nodes Multicast group if the stack is configured to
 	// use IPv6. This is required to ensure that this node properly receives
@@ -334,7 +373,7 @@ func (e *endpoint) Disable() {
 }
 
 func (e *endpoint) disableLocked() {
-	if !e.setEnabled(false) {
+	if !e.Enabled() {
 		return
 	}
 
@@ -349,7 +388,11 @@ func (e *endpoint) disableLocked() {
 
 	// Leave groups from the perspective of MLD so that routers know that
 	// we are no longer interested in the group.
-	e.mld.softLeaveAll()
+	e.mu.mld.softLeaveAll()
+
+	if !e.setEnabled(false) {
+		panic("should have only done work to disable the endpoint if it was enabled")
+	}
 }
 
 // stopDADForPermanentAddressesLocked stops DAD for all permaneent addresses.
@@ -389,19 +432,27 @@ func (e *endpoint) MTU() uint32 {
 // MaxHeaderLength returns the maximum length needed by ipv6 headers (and
 // underlying protocols).
 func (e *endpoint) MaxHeaderLength() uint16 {
+	// TODO(gvisor.dev/issues/5035): The maximum header length returned here does
+	// not open the possibility for the caller to know about size required for
+	// extension headers.
 	return e.nic.MaxHeaderLength() + header.IPv6MinimumSize
 }
 
-func (e *endpoint) addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
-	length := uint16(pkt.Size())
-	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
+func (e *endpoint) addIPHeader(srcAddr, dstAddr tcpip.Address, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams, extensionHeaders header.IPv6ExtHdrSerializer) {
+	extHdrsLen := extensionHeaders.Length()
+	length := pkt.Size() + extensionHeaders.Length()
+	if length > math.MaxUint16 {
+		panic(fmt.Sprintf("IPv6 payload too large: %d, must be <= %d", length, math.MaxUint16))
+	}
+	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize + extHdrsLen))
 	ip.Encode(&header.IPv6Fields{
-		PayloadLength: length,
-		NextHeader:    uint8(params.Protocol),
-		HopLimit:      params.TTL,
-		TrafficClass:  params.TOS,
-		SrcAddr:       srcAddr,
-		DstAddr:       dstAddr,
+		PayloadLength:     uint16(length),
+		TransportProtocol: params.Protocol,
+		HopLimit:          params.TTL,
+		TrafficClass:      params.TOS,
+		SrcAddr:           srcAddr,
+		DstAddr:           dstAddr,
+		ExtensionHeaders:  extensionHeaders,
 	})
 	pkt.NetworkProtocolNumber = ProtocolNumber
 }
@@ -456,7 +507,7 @@ func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, networkMTU ui
 
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.addIPHeader(r.LocalAddress, r.RemoteAddress, pkt, params)
+	e.addIPHeader(r.LocalAddress, r.RemoteAddress, pkt, params, nil /* extensionHeaders */)
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
@@ -545,7 +596,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 
 	linkMTU := e.nic.MTU()
 	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
-		e.addIPHeader(r.LocalAddress, r.RemoteAddress, pb, params)
+		e.addIPHeader(r.LocalAddress, r.RemoteAddress, pb, params, nil /* extensionHeaders */)
 
 		networkMTU, err := calculateNetworkMTU(linkMTU, uint32(pb.NetworkHeader().View().Size()))
 		if err != nil {
@@ -1177,19 +1228,19 @@ func (e *endpoint) addAndAcquirePermanentAddressLocked(addr tcpip.AddressWithPre
 		return addressEndpoint, nil
 	}
 
-	snmc := header.SolicitedNodeAddr(addr.Address)
-	if err := e.joinGroupLocked(snmc); err != nil {
-		// joinGroupLocked only returns an error if the group address is not a valid
-		// IPv6 multicast address.
-		panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", snmc, err))
-	}
-
 	addressEndpoint.SetKind(stack.PermanentTentative)
 
 	if e.Enabled() {
 		if err := e.mu.ndp.startDuplicateAddressDetection(addr.Address, addressEndpoint); err != nil {
 			return nil, err
 		}
+	}
+
+	snmc := header.SolicitedNodeAddr(addr.Address)
+	if err := e.joinGroupLocked(snmc); err != nil {
+		// joinGroupLocked only returns an error if the group address is not a valid
+		// IPv6 multicast address.
+		panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", snmc, err))
 	}
 
 	return addressEndpoint, nil
@@ -1293,6 +1344,26 @@ func (e *endpoint) AcquireOutgoingPrimaryAddress(remoteAddr tcpip.Address, allow
 	return e.acquireOutgoingPrimaryAddressRLocked(remoteAddr, allowExpired)
 }
 
+// getLinkLocalAddressRLocked returns a link-local address from the primary list
+// of addresses, if one is available.
+//
+// See stack.PrimaryEndpointBehavior for more details about the primary list.
+//
+// Precondition: e.mu must be read locked.
+func (e *endpoint) getLinkLocalAddressRLocked() tcpip.Address {
+	var linkLocalAddr tcpip.Address
+	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+		if addressEndpoint.IsAssigned(false /* allowExpired */) {
+			if addr := addressEndpoint.AddressWithPrefix().Address; header.IsV6LinkLocalAddress(addr) {
+				linkLocalAddr = addr
+				return false
+			}
+		}
+		return true
+	})
+	return linkLocalAddr
+}
+
 // acquireOutgoingPrimaryAddressRLocked is like AcquireOutgoingPrimaryAddress
 // but with locking requirements.
 //
@@ -1312,10 +1383,10 @@ func (e *endpoint) acquireOutgoingPrimaryAddressRLocked(remoteAddr tcpip.Address
 	// Create a candidate set of available addresses we can potentially use as a
 	// source address.
 	var cs []addrCandidate
-	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) {
+	e.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
 		// If r is not valid for outgoing connections, it is not a valid endpoint.
 		if !addressEndpoint.IsAssigned(allowExpired) {
-			return
+			return true
 		}
 
 		addr := addressEndpoint.AddressWithPrefix().Address
@@ -1331,6 +1402,8 @@ func (e *endpoint) acquireOutgoingPrimaryAddressRLocked(remoteAddr tcpip.Address
 			addressEndpoint: addressEndpoint,
 			scope:           scope,
 		})
+
+		return true
 	})
 
 	remoteScope, err := header.ScopeForIPv6Address(remoteAddr)
@@ -1417,7 +1490,7 @@ func (e *endpoint) joinGroupLocked(addr tcpip.Address) *tcpip.Error {
 		return tcpip.ErrBadAddress
 	}
 
-	e.mld.joinGroup(addr)
+	e.mu.mld.joinGroup(addr)
 	return nil
 }
 
@@ -1432,14 +1505,14 @@ func (e *endpoint) LeaveGroup(addr tcpip.Address) *tcpip.Error {
 //
 // Precondition: e.mu must be locked.
 func (e *endpoint) leaveGroupLocked(addr tcpip.Address) *tcpip.Error {
-	return e.mld.leaveGroup(addr)
+	return e.mu.mld.leaveGroup(addr)
 }
 
 // IsInGroup implements stack.GroupAddressableEndpoint.
 func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.mld.isInGroup(addr)
+	return e.mu.mld.isInGroup(addr)
 }
 
 var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
@@ -1504,17 +1577,11 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, linkAddrCache stack.L
 		dispatcher:    dispatcher,
 		protocol:      p,
 	}
+	e.mu.Lock()
 	e.mu.addressableEndpointState.Init(e)
-	e.mu.ndp = ndpState{
-		ep:             e,
-		configs:        p.options.NDPConfigs,
-		dad:            make(map[tcpip.Address]dadState),
-		defaultRouters: make(map[tcpip.Address]defaultRouterState),
-		onLinkPrefixes: make(map[tcpip.Subnet]onLinkPrefixState),
-		slaacPrefixes:  make(map[tcpip.Subnet]slaacPrefixState),
-	}
-	e.mu.ndp.initializeTempAddrState()
-	e.mld.init(e, p.options.MLD)
+	e.mu.ndp.init(e)
+	e.mu.mld.init(e)
+	e.mu.Unlock()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1735,24 +1802,25 @@ func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeaders hea
 	fragPkt.NetworkProtocolNumber = ProtocolNumber
 
 	originalIPHeadersLength := len(originalIPHeaders)
-	fragmentIPHeadersLength := originalIPHeadersLength + header.IPv6FragmentHeaderSize
+
+	s := header.IPv6ExtHdrSerializer{&header.IPv6SerializableFragmentExtHdr{
+		FragmentOffset: uint16(offset / header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit),
+		M:              more,
+		Identification: id,
+	}}
+
+	fragmentIPHeadersLength := originalIPHeadersLength + s.Length()
 	fragmentIPHeaders := header.IPv6(fragPkt.NetworkHeader().Push(fragmentIPHeadersLength))
-	fragPkt.NetworkProtocolNumber = ProtocolNumber
 
 	// Copy the IPv6 header and any extension headers already populated.
 	if copied := copy(fragmentIPHeaders, originalIPHeaders); copied != originalIPHeadersLength {
 		panic(fmt.Sprintf("wrong number of bytes copied into fragmentIPHeaders: got %d, want %d", copied, originalIPHeadersLength))
 	}
-	fragmentIPHeaders.SetNextHeader(header.IPv6FragmentHeader)
-	fragmentIPHeaders.SetPayloadLength(uint16(copied + fragmentIPHeadersLength - header.IPv6MinimumSize))
 
-	fragmentHeader := header.IPv6Fragment(fragmentIPHeaders[originalIPHeadersLength:])
-	fragmentHeader.Encode(&header.IPv6FragmentFields{
-		M:              more,
-		FragmentOffset: uint16(offset / header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit),
-		Identification: id,
-		NextHeader:     uint8(transportProto),
-	})
+	nextHeader, _ := s.Serialize(transportProto, fragmentIPHeaders[originalIPHeadersLength:])
+
+	fragmentIPHeaders.SetNextHeader(nextHeader)
+	fragmentIPHeaders.SetPayloadLength(uint16(copied + fragmentIPHeadersLength - header.IPv6MinimumSize))
 
 	return fragPkt, more
 }

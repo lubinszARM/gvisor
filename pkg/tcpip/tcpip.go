@@ -49,8 +49,9 @@ const ipv4AddressSize = 4
 // Error represents an error in the netstack error space. Using a special type
 // ensures that errors outside of this space are not accidentally introduced.
 //
-// Note: to support save / restore, it is important that all tcpip errors have
-// distinct error messages.
+// All errors must have unique msg strings.
+//
+// +stateify savable
 type Error struct {
 	msg string
 
@@ -491,6 +492,14 @@ type ControlMessages struct {
 
 	// PacketInfo holds interface and address data on an incoming packet.
 	PacketInfo IPPacketInfo
+
+	// HasOriginalDestinationAddress indicates whether OriginalDstAddress is
+	// set.
+	HasOriginalDstAddress bool
+
+	// OriginalDestinationAddress holds the original destination address
+	// and port of the incoming packet.
+	OriginalDstAddress FullAddress
 }
 
 // PacketOwner is used to get UID and GID of the packet.
@@ -545,7 +554,7 @@ type Endpoint interface {
 	// Peek reads data without consuming it from the endpoint.
 	//
 	// This method does not block if there is no data pending.
-	Peek([][]byte) (int64, ControlMessages, *Error)
+	Peek([][]byte) (int64, *Error)
 
 	// Connect connects the endpoint to its peer. Specifying a NIC is
 	// optional.
