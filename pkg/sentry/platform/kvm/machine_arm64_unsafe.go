@@ -73,7 +73,8 @@ func (c *vCPU) initArchState() error {
 	// cpacr_el1
 	reg.id = _KVM_ARM64_REGS_CPACR_EL1
 	// It is off by default, and it is turned on only when in use.
-	data = 0 // Disable fpsimd.
+	data = (0x3 << 20) // Disable fpsimd.
+
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
@@ -103,7 +104,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -181,10 +182,48 @@ func (c *vCPU) setTSC(value uint64) error {
 	return nil
 }
 
+// getTSCFreq gets the TSC frequency.
+//
+// If mustSucceed is true, then this function panics on error.
+func (c *vCPU) getTSCFreq() (uintptr, error) {
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_CNTFRQ_EL0
+
+	if err := c.getOneRegister(&reg); err != nil {
+		return 0, err
+	}
+
+	return uintptr(data), nil
+}
+
+// setTSCFreq sets the TSC frequency.
+func (c *vCPU) setTSCFreq(freq uintptr) error {
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_CNTFRQ_EL0
+	data = uint64(freq)
+
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // setSystemTime sets the vCPU to the system time.
-func (c *vCPU) setSystemTime() error {
+/*func (c *vCPU) setSystemTime() error {
 	return c.setSystemTimeLegacy()
 }
+*/
 
 //go:nosplit
 func (c *vCPU) loadSegments(tid uint64) {
@@ -222,6 +261,8 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
 		return nonCanonical(regs.Sp, int32(syscall.SIGSEGV), info)
+	} else if !ring0.IsCanonical(regs.TPIDR_EL0) {
+		return nonCanonical(regs.TPIDR_EL0, int32(syscall.SIGSEGV), info)
 	}
 
 	// Assign PCIDs.
@@ -262,7 +303,36 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	case ring0.Vector(bounce): // ring0.VirtualizationException
 		return usermem.NoAccess, platform.ErrContextInterrupt
 	case ring0.El0SyncUndef:
+		var p uintptr = uintptr(switchOpts.Registers.Pc)
+		var insp uint32 = *(*uint32)(unsafe.Pointer(p))
+		var funcId uint32 = getFunc(insp)
+		if funcId == _AARCH64_INSN_FUNCS_MRS {
+			var sysReg uint32 = getSysReg(insp)
+			if sysReg == _AARCH64_INSN_SYSREG_MIDR ||
+				sysReg == _AARCH64_INSN_SYSREG_MPIDR ||
+				sysReg == _AARCH64_INSN_SYSREG_REVIDR {
+				// Got CPUID:MIDR/MPIDR/REVIDR.
+				fmt.Printf("BBLU got CPUID.\n")
+				return usermem.AccessType{}, platform.ErrContextSignalCPUID
+			}
+		}
 		return c.fault(int32(syscall.SIGILL), info)
+	case ring0.El0SyncDbg:
+		*info = arch.SignalInfo{
+			Signo: int32(syscall.SIGTRAP),
+			Code:  1, // TRAP_BRKPT (breakpoint).
+		}
+		info.SetAddr(switchOpts.Registers.Pc) // Include address.
+		return usermem.AccessType{}, platform.ErrContextSignal
+	case ring0.El0SyncSpPc:
+		*info = arch.SignalInfo{
+			Signo: int32(syscall.SIGBUS),
+			Code:  2, // BUS_ADRERR (physical address does not exist).
+		}
+		return usermem.NoAccess, platform.ErrContextSignal
+	case ring0.El0SyncSys,
+		ring0.El0SyncWfx:
+		return usermem.NoAccess, nil // skip for now.
 	default:
 		panic(fmt.Sprintf("unexpected vector: 0x%x", vector))
 	}

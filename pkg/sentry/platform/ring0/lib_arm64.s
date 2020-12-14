@@ -35,7 +35,7 @@ TEXT ·CPACREL1(SB),NOSPLIT,$0-8
 	RET
 
 TEXT ·GetFPCR(SB),NOSPLIT,$0-8
-	MOVD FPCR, R1
+	MOVD $0x0, R1 //FPCR, R1
 	MOVD R1, ret+0(FP)
 	RET
 
@@ -46,7 +46,7 @@ TEXT ·GetFPSR(SB),NOSPLIT,$0-8
 
 TEXT ·SetFPCR(SB),NOSPLIT,$0-8
 	MOVD addr+0(FP), R1
-	MOVD R1, FPCR
+//	MOVD R1, FPCR
 	RET
 
 TEXT ·SetFPSR(SB),NOSPLIT,$0-8
@@ -109,8 +109,8 @@ TEXT ·LoadFloatingPoint(SB),NOSPLIT,$0-8
 
 	MOVD 0(R0), R1
 	MOVD R1, FPSR
-	MOVD 8(R0), R1
-	MOVD R1, FPCR
+//	MOVD 8(R0), R1
+//	MOVD R1, FPCR
 
 	ADD $16, R0, R0
 
@@ -130,6 +130,8 @@ TEXT ·LoadFloatingPoint(SB),NOSPLIT,$0-8
 	WORD $0xad4d6c1a 	// ldp	q26, q27, [x0, #416]
 	WORD $0xad4e741c 	// ldp	q28, q29, [x0, #448]
 	WORD $0xad4f7c1e 	// ldp	q30, q31, [x0, #480]
+	DSB $15
+	ISB $15
 
 	RET
 
@@ -138,8 +140,8 @@ TEXT ·SaveFloatingPoint(SB),NOSPLIT,$0-8
 
 	MOVD FPSR, R1
 	MOVD R1, 0(R0)
-	MOVD FPCR, R1
-	MOVD R1, 8(R0)
+	//MOVD FPCR, R1
+	//MOVD R1, 8(R0)
 
 	ADD $16, R0, R0
 
@@ -159,5 +161,7 @@ TEXT ·SaveFloatingPoint(SB),NOSPLIT,$0-8
 	WORD $0xad0d6c1a       //  stp	q26, q27, [x0, #416]
 	WORD $0xad0e741c       //  stp	q28, q29, [x0, #448]
 	WORD $0xad0f7c1e       //  stp	q30, q31, [x0, #480]
+	DSB $15
+	ISB $15
 
 	RET

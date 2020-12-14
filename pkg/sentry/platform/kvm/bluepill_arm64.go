@@ -27,28 +27,30 @@ var (
 	// The action for bluepillSignal is changed by sigaction().
 	bluepillSignal = syscall.SIGILL
 
-	// vcpuSErrBounce is the event of system error for bouncing KVM.
-	vcpuSErrBounce = kvmVcpuEvents{
-		exception: exception{
-			sErrPending: 1,
-		},
-	}
+	/*
+		// vcpuSErrBounce is the event of system error for bouncing KVM.
+		vcpuSErrBounce = kvmVcpuEvents{
+			exception: exception{
+				sErrPending: 1,
+			},
+		}
 
-	// vcpuSErrNMI is the event of system error to trigger sigbus.
-	vcpuSErrNMI = kvmVcpuEvents{
-		exception: exception{
-			sErrPending: 1,
-			sErrHasEsr:  1,
-			sErrEsr:     _ESR_ELx_SERR_NMI,
-		},
-	}
+		// vcpuSErrNMI is the event of system error to trigger sigbus.
+		vcpuSErrNMI = kvmVcpuEvents{
+			exception: exception{
+				sErrPending: 1,
+				sErrHasEsr:  1,
+				sErrEsr:     _ESR_ELx_SERR_NMI,
+			},
+		}
 
-	// vcpuExtDabt is the event of ext_dabt.
-	vcpuExtDabt = kvmVcpuEvents{
-		exception: exception{
-			extDabtPending: 1,
-		},
-	}
+		// vcpuExtDabt is the event of ext_dabt.
+		vcpuExtDabt = kvmVcpuEvents{
+			exception: exception{
+				extDabtPending: 1,
+			},
+		}
+	*/
 )
 
 // getTLS returns the value of TPIDR_EL0 register.
@@ -91,13 +93,13 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	context.Pstate |= ring0.UserFlagsSet
 	setTLS(regs.TPIDR_EL0)
 
-	lazyVfp := c.GetLazyVFP()
-	if lazyVfp != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
-		context.Fpsimd64.Fpsr = fpsimd.Fpsr
-		context.Fpsimd64.Fpcr = fpsimd.Fpcr
-		context.Fpsimd64.Vregs = fpsimd.Vregs
-	}
+	//	lazyVfp := c.GetLazyVFP()
+	//	if lazyVfp != 0 {
+	fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	context.Fpsimd64.Fpsr = fpsimd.Fpsr
+	context.Fpsimd64.Fpcr = fpsimd.Fpcr
+	context.Fpsimd64.Vregs = fpsimd.Vregs
+	//	}
 }
 
 // KernelSyscall handles kernel syscalls.
@@ -111,15 +113,15 @@ func (c *vCPU) KernelSyscall() {
 		regs.Pc -= 4 // Rewind.
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
-		fpcr := ring0.GetFPCR()
-		fpsr := ring0.GetFPSR()
-		fpsimd.Fpcr = uint32(fpcr)
-		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
-	}
+	//	vfpEnable := ring0.CPACREL1() // escapes: no.
+	//	if vfpEnable != 0 {
+	fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpcr := ring0.GetFPCR() // escapes: no.
+	fpsr := ring0.GetFPSR() // escapes: no.
+	fpsimd.Fpcr = uint32(fpcr)
+	fpsimd.Fpsr = uint32(fpsr)
+	ring0.SaveVRegs((*byte)(c.floatingPointState)) // escapes: no.
+	//	}
 
 	ring0.Halt()
 }
@@ -135,15 +137,15 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 		regs.Pc = 0
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
-		fpcr := ring0.GetFPCR()
-		fpsr := ring0.GetFPSR()
-		fpsimd.Fpcr = uint32(fpcr)
-		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
-	}
+	//	vfpEnable := ring0.CPACREL1() // escapes: no.
+	//	if vfpEnable != 0 {
+	fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpcr := ring0.GetFPCR() // escapes: no.
+	fpsr := ring0.GetFPSR() // escapes: no.
+	fpsimd.Fpcr = uint32(fpcr)
+	fpsimd.Fpsr = uint32(fpsr)
+	ring0.SaveVRegs((*byte)(c.floatingPointState)) // escapes: no.
+	//	}
 
 	ring0.Halt()
 }

@@ -181,3 +181,24 @@ func (c *vCPU) fault(signal int32, info *arch.SignalInfo) (usermem.AccessType, e
 
 	return accessType, platform.ErrContextSignal
 }
+
+// getFunc returns function id by decoding instruction value.
+//
+//go:nosplit
+func getFunc(insn uint32) uint32 {
+	return (insn & _AARCH64_INSN_FUNCS_MASK)
+}
+
+// getSysReg returns sysreg id by decoding instruction value.
+//
+//go:nosplit
+func getSysReg(insn uint32) uint32 {
+	return ((insn >> _AARCH64_INSN_SYSREG_SHIFT) & _AARCH64_INSN_SYSREG_MASK) << _AARCH64_INSN_SYSREG_SHIFT
+}
+
+// getReg returns common register id by decoding instruction value.
+//
+//go:nosplit
+func getReg(insn uint32) uint32 {
+	return (insn & _AARCH64_INSN_COMMONREG_MASK)
+}

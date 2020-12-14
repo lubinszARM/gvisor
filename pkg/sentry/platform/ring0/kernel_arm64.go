@@ -53,6 +53,27 @@ func IsCanonical(addr uint64) bool {
 	return addr <= 0x0000ffffffffffff || addr > 0xffff000000000000
 }
 
+// SwitchToUser performs either a sysret or an iret.
+//
+// The return value is the vector that interrupted execution.
+//
+// This function will not split the stack. Callers will probably want to call
+// runtime.entersyscall (and pair with a call to runtime.exitsyscall) prior to
+// calling this function.
+//
+// When this is done, this region is quite sensitive to things like system
+// calls. After calling entersyscall, any memory used must have been allocated
+// and no function calls without go:nosplit are permitted. Any calls made here
+// are protected appropriately (e.g. IsCanonical and CR3).
+//
+// Also note that this function transitively depends on the compiler generating
+// code that uses IP-relative addressing inside of absolute addresses. That's
+// the case for amd64, but may not be the case for other architectures.
+//
+// Precondition: the Rip, Rsp, Fs and Gs registers must be canonical.
+//
+// +checkescape:all
+//
 //go:nosplit
 func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	storeAppASID(uintptr(switchOpts.UserASID))
@@ -65,15 +86,13 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	regs.Pstate &= ^uint64(PsrFlagsClear)
 	regs.Pstate |= UserFlagsSet
 
-	EnableVFP()
+	//	EnableVFP()
 	LoadFloatingPoint(switchOpts.FloatingPointState)
 
 	kernelExitToEl0()
 
 	SaveFloatingPoint(switchOpts.FloatingPointState)
-	DisableVFP()
+	//	DisableVFP()
 
-	vector = c.vecCode
-
-	return
+	return c.vecCode
 }

@@ -52,6 +52,69 @@
 
 #define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT | SCTLR_UCI | SCTLR_DZE)
 
+// Position the attr at the correct index
+#define MAIR_ATTRIDX(attr, idx)     ((attr) << ((idx) * 8))
+
+// MAIR_ELx memory attributes
+#define MT_DEVICE_nGnRnE       0
+#define MT_DEVICE_nGnRE        1
+#define MT_DEVICE_GRE          2
+#define MT_NORMAL_NC           3
+#define MT_NORMAL              4
+#define MT_NORMAL_WT           5
+#define MT_ATTR_DEVICE_nGnRnE  0x00
+#define MT_ATTR_DEVICE_nGnRE   0x04
+#define MT_ATTR_DEVICE_GRE     0x0c
+#define MT_ATTR_NORMAL_NC      0x44
+#define MT_ATTR_NORMAL_WT      0xbb
+#define MT_ATTR_NORMAL         0xff
+#define MT_ATTR_MASK           0xff
+#define MT_EL1_INIT            (MT_ATTR_DEVICE_nGnRnE << (MT_DEVICE_nGnRnE * 8)) | (MT_ATTR_DEVICE_nGnRE << (MT_DEVICE_nGnRE * 8)) | (MT_ATTR_DEVICE_GRE << (MT_DEVICE_GRE * 8)) | (MT_ATTR_NORMAL_NC << (MT_NORMAL_NC * 8)) | (MT_ATTR_NORMAL << (MT_NORMAL * 8)) | (MT_ATTR_NORMAL_WT << (MT_NORMAL_WT * 8))
+
+#define TCR_IPS_40BITS  (2 << 32) // PA=40
+#define TCR_IPS_48BITS  (5 << 32) // PA=48
+
+#define TCR_T0SZ_OFFSET  0
+#define TCR_T1SZ_OFFSET  16
+#define TCR_IRGN0_SHIFT  8
+#define TCR_IRGN1_SHIFT  24
+#define TCR_ORGN0_SHIFT  10
+#define TCR_ORGN1_SHIFT  26
+#define TCR_SH0_SHIFT    12
+#define TCR_SH1_SHIFT    28
+#define TCR_TG0_SHIFT    14
+#define TCR_TG1_SHIFT    30
+
+#define TCR_T0SZ_VA48  (64 - 48) // VA=48
+#define TCR_T1SZ_VA48  (64 - 48) // VA=48
+
+#define TCR_A1      (1 << 22)
+#define TCR_ASID16  (1 << 36)
+#define TCR_TBI0    (1 << 37)
+
+#define TCR_TXSZ_VA48  (TCR_T0SZ_VA48 << TCR_T0SZ_OFFSET) | (TCR_T1SZ_VA48 << TCR_T1SZ_OFFSET)
+
+#define TCR_TG0_4K   (0 << TCR_TG0_SHIFT) // 4K
+#define TCR_TG0_64K  (1 << TCR_TG0_SHIFT) // 64K
+
+#define TCR_TG1_4K  (2 << TCR_TG1_SHIFT)
+
+#define TCR_TG_FLAGS (TCR_TG0_4K | TCR_TG1_4K)
+
+#define TCR_IRGN0_WBWA  (1 << TCR_IRGN0_SHIFT)
+#define TCR_IRGN1_WBWA  (1 << TCR_IRGN1_SHIFT)
+#define TCR_IRGN_WBWA   (TCR_IRGN0_WBWA | TCR_IRGN1_WBWA)
+
+#define TCR_ORGN0_WBWA  (1 << TCR_ORGN0_SHIFT)
+#define TCR_ORGN1_WBWA  (1 << TCR_ORGN1_SHIFT)
+
+#define TCR_ORGN_WBWA  (TCR_ORGN0_WBWA | TCR_ORGN1_WBWA)
+
+#define TCR_SHARED  (3 << TCR_SH0_SHIFT) | (3 << TCR_SH1_SHIFT)
+#define TCR_CACHE_FLAGS  (TCR_IRGN_WBWA | TCR_ORGN_WBWA)
+
+#define TCR_DEFAULT TCR_TXSZ_VA48 | TCR_CACHE_FLAGS | TCR_SHARED | TCR_TG_FLAGS | TCR_ASID16 | TCR_IPS_40BITS | TCR_A1
+
 // cntkctl_el1: counter-timer kernel control register el1.
 #define CNTKCTL_EL0PCTEN 	1 << 0
 #define CNTKCTL_EL0VCTEN 	1 << 1
@@ -93,7 +156,8 @@
   MOVD R27, offset+PTRACE_R27(reg); \
   MOVD g,   offset+PTRACE_R28(reg); \
   MOVD R29, offset+PTRACE_R29(reg); \
-  MOVD R30, offset+PTRACE_R30(reg);
+  MOVD R30, offset+PTRACE_R30(reg);	\
+  DSB $15;
 
 // Loads a register set.
 //
@@ -130,7 +194,9 @@
   MOVD offset+PTRACE_R27(reg), R27; \
   MOVD offset+PTRACE_R28(reg), g; \
   MOVD offset+PTRACE_R29(reg), R29; \
-  MOVD offset+PTRACE_R30(reg), R30;
+  MOVD offset+PTRACE_R30(reg), R30; \
+  DSB $15; \
+  ISB $15;
 
 #define ESR_ELx_EC_UNKNOWN	(0x00)
 #define ESR_ELx_EC_WFx		(0x01)
@@ -268,27 +334,42 @@
 	LOAD_KERNEL_ADDRESS(CPU_SELF(from), RSV_REG); \
 	MOVD $CPU_STACK_TOP(RSV_REG), RSV_REG; \
 	MOVD RSV_REG, RSP; \
+	ISB $15; \
 	WORD $0xd538d092;   //MRS   TPIDR_EL1, R18
+
+#define POST_TTBR() \
+    NOP; \
+    NOP; \
+    NOP; \
+    WORD $0xd508751f; \
+    DSB $7; \
+    ISB $15;
 
 // SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
 #define SWITCH_TO_APP_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD CPU_APP_ASID(from), R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
+	MOVD CPU_APP_ASID(RSV_REG), RSV_REG_APP; \
+	MRS TTBR1_EL1, RSV_REG; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
 	ISB $15; \
-	MOVD CPU_TTBR0_APP(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+	MRS TPIDR_EL1, RSV_REG; \
+	MOVD CPU_TTBR0_APP(RSV_REG), RSV_REG; \
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15; \
+	POST_TTBR();
 
 // SWITCH_TO_KVM_PAGETABLE sets the kvm pagetable.
 #define SWITCH_TO_KVM_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD $1, R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \
+	MRS TTBR1_EL1, RSV_REG; \
+	MOVD $1, RSV_REG_APP; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR1_EL1; \
 	ISB $15; \
-	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+	MRS TPIDR_EL1, RSV_REG; \
+	MOVD CPU_TTBR0_KVM(RSV_REG), RSV_REG; \
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15; \
+	POST_TTBR();
 
 TEXT ·EnableVFP(SB),NOSPLIT,$0
 	MOVD $FPEN_ENABLE, R0
@@ -316,6 +397,13 @@ TEXT ·DisableVFP(SB),NOSPLIT,$0
 #define KERNEL_ENTRY_FROM_EL0 \
 	SUB $16, RSP, RSP; \		// step1, save r18, r9 into kernel temporary stack.
 	STP (RSV_REG, RSV_REG_APP), 16*0(RSP); \
+	MRS TTBR1_EL1, RSV_REG; \
+	MOVD $0, RSV_REG_APP; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR1_EL1; \
+	ISB $15; \	
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15; \
 	WORD $0xd538d092; \    // MRS   TPIDR_EL1, R18
 	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP; \ // step2, load app context pointer.
 	REGISTERS_SAVE(RSV_REG_APP, 0); \          // step3, save app context.
@@ -331,12 +419,25 @@ TEXT ·DisableVFP(SB),NOSPLIT,$0
 	MRS ELR_EL1, R3; \
 	MOVD R3, PTRACE_PC(R20); \
 	WORD $0xd5384103; \      //  MRS SP_EL0, R3
-	MOVD R3, PTRACE_SP(R20);
+	MOVD R3, PTRACE_SP(R20); \
+	DSB $15; \
+	ISB $15;
 
 // KERNEL_ENTRY_FROM_EL1 is the entry code of the vcpu from el1 to el1.
 #define KERNEL_ENTRY_FROM_EL1 \
+	SUB $16, RSP, RSP; \        // step1, save r18, r9 into kernel temporary stack.
+	STP (RSV_REG, RSV_REG_APP), 16*0(RSP); \
+	MRS TTBR1_EL1, RSV_REG; \
+	MOVD $0, RSV_REG_APP; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR1_EL1; \
+	ISB $15; \
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15; \
+	LDP 16*0(RSP), (RSV_REG, RSV_REG_APP); \
+	ADD $16, RSP, RSP; \
 	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
-	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \	// Save sentry context.
+	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \   // Save sentry context.
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG); \
 	MRS TPIDR_EL0, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_TLS(RSV_REG); \
@@ -346,7 +447,9 @@ TEXT ·DisableVFP(SB),NOSPLIT,$0
 	MOVD R4, CPU_REGISTERS+PTRACE_PC(RSV_REG); \
 	MOVD RSP, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG); \
-	LOAD_KERNEL_STACK(RSV_REG);  // Load the temporary stack.
+	LOAD_KERNEL_STACK(RSV_REG); \ // Load the temporary stack.
+	DSB $15; \
+	ISB $15;
 
 // EXCEPTION_EL0 is a common el0 exception handler function.
 #define EXCEPTION_EL0(vector) \
@@ -377,16 +480,16 @@ TEXT ·storeAppASID(SB),NOSPLIT,$0-8
 // Halt halts execution.
 TEXT ·Halt(SB),NOSPLIT,$0
 	// Clear bluepill.
-	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
-	CMP RSV_REG, R9
-	BNE mmio_exit
-	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
+//	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
+//	CMP RSV_REG, R9
+//	BNE mmio_exit
+//	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
 
-mmio_exit:
+//mmio_exit:
 	// Disable fpsimd.
-	WORD $0xd5381041 // MRS CPACR_EL1, R1
-	MOVD R1, CPU_LAZY_VFP(RSV_REG)
-	VFP_DISABLE
+//	WORD $0xd5381041 // MRS CPACR_EL1, R1
+//	MOVD R1, CPU_LAZY_VFP(RSV_REG)
+	//VFP_DISABLE
 
 	// Trigger MMIO_EXIT/_KVM_HYPERCALL_VMEXIT.
 	//
@@ -396,6 +499,8 @@ mmio_exit:
 	// Also, the length is engough to match a sufficient number of hypercall ID.
 	// Then, in host user space, I can calculate this address to find out
 	// which hypercall.
+	DSB $15
+	ISB $15
 	MRS VBAR_EL1, R9
 	MOVD R0, 0x0(R9)
 
@@ -472,7 +577,7 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	// set pstate.
 	MOVD PTRACE_PSTATE(RSV_REG_APP), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
-
+	
 	// need use kernel space address to excute below code, since
 	// after SWITCH_TO_APP_PAGETABLE the ASID is changed to app's
 	// ASID.
@@ -521,10 +626,17 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R1
 	MOVD R1, RSP
 
+	WORD $0x10000061    //adr x1, 4005d0 <do_exit_to_el1>
+    ORR $0xffff000000000000, R1, R1
+    JMP (R1)
+
+do_exit_to_el1:
+	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
+
 	SWITCH_TO_KVM_PAGETABLE(RSV_REG)
 	MRS TPIDR_EL1, RSV_REG
 
-	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
+	//REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
 	MOVD CPU_REGISTERS+PTRACE_R9(RSV_REG), RSV_REG_APP
 
 	ERET()
@@ -532,8 +644,32 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 // Start is the CPU entrypoint.
 TEXT ·Start(SB),NOSPLIT,$0
 	// Init.
+    WORD $0xd508871f    // __tlbi(vmalle1)
+    DSB $7          // dsb(nsh)
+
+    MOVD $1<<12, R1         // Reset mdscr_el1 and disable
+    MSR R1, MDSCR_EL1       // access to the DCC from EL0
+    ISB $15
+
+// Memory region attributes
+    MOVD $MT_EL1_INIT, R1
+    MSR R1, MAIR_EL1
+
+    // Set/prepare TCR.
+    MOVD $TCR_DEFAULT, R1
+    MSR R1, TCR_EL1
+
+	MRS TTBR1_EL1, R1
+	MSR R1, TTBR0_EL1
+	ISB $15
+
 	MOVD $SCTLR_EL1_DEFAULT, R1
 	MSR R1, SCTLR_EL1
+    ISB $15
+    WORD $0xd508751f // ic iallu
+
+    DSB $7          // dsb(nsh)
+    ISB $15
 
 	MOVD $CNTKCTL_EL1_DEFAULT, R1
 	MSR R1, CNTKCTL_EL1
@@ -541,6 +677,11 @@ TEXT ·Start(SB),NOSPLIT,$0
 	MOVD R8, RSV_REG
 	ORR $0xffff000000000000, RSV_REG, RSV_REG
 	WORD $0xd518d092        //MSR R18, TPIDR_EL1
+
+    DSB $6          // dsb(nshst)
+    WORD $0xd508871f    // __tlbi(vmalle1)
+    DSB $7          // dsb(nsh)
+    ISB $15
 
 	B ·kernelExitToEl1(SB)
 
@@ -562,6 +703,11 @@ TEXT ·El1_error_invalid(SB),NOSPLIT,$0
 
 // El1_sync is the handler for El1_sync.
 TEXT ·El1_sync(SB),NOSPLIT,$0
+//	WORD $0x0000072 //   adr x18, 4005d0 <do_exit_to_el11>
+//	ORR $0xffff000000000000, RSV_REG, RSV_REG
+//    JMP (RSV_REG)
+
+//do_exit_to_el11:
 	KERNEL_ENTRY_FROM_EL1
 	WORD $0xd5385219        // MRS ESR_EL1, R25
 	LSR  $ESR_ELx_EC_SHIFT, R25, R24
@@ -580,7 +726,7 @@ TEXT ·El1_sync(SB),NOSPLIT,$0
 	CMP $ESR_ELx_EC_SVC64, R24
 	BEQ el1_svc
 	CMP $ESR_ELx_EC_BREAKPT_CUR, R24
-	BGE el1_dbg
+	BEQ el1_dbg
 	CMP $ESR_ELx_EC_FP_ASIMD, R24
 	BEQ el1_fpsimd_acc
 	B el1_invalid
@@ -639,7 +785,11 @@ TEXT ·El0_sync(SB),NOSPLIT,$0
 	CMP $ESR_ELx_EC_UNKNOWN, R24
 	BEQ el0_undef
 	CMP $ESR_ELx_EC_BREAKPT_LOW, R24
-	BGE el0_dbg
+	BEQ el0_dbg
+	CMP $ESR_ELx_EC_SYS64, R24
+	BEQ el0_sys                       
+	CMP $ESR_ELx_EC_WFx, R24
+	BEQ el0_wfx                       
 	B   el0_invalid
 
 el0_svc:
@@ -672,6 +822,10 @@ el0_dbg:
 	EXCEPTION_EL0(El0SyncDbg)
 el0_invalid:
 	EXCEPTION_EL0(El0SyncInv)
+el0_sys:
+	EXCEPTION_EL0(El0SyncSys)
+el0_wfx:
+	EXCEPTION_EL0(El0SyncWfx)
 
 TEXT ·El0_irq(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
@@ -687,35 +841,10 @@ TEXT ·El0_error(SB),NOSPLIT,$0
 	BEQ el0_nmi
 	B el0_bounce
 el0_nmi:
-        WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-        WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-        MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-        MOVD $1, R3
-        MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-        MOVD $El0ErrNMI, R3
-        MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-        MRS ESR_EL1, R3
-        MOVD R3, CPU_ERROR_CODE(RSV_REG)
-
-        B ·kernelExitToEl1(SB)
+	EXCEPTION_EL0(El0ErrNMI)
 
 el0_bounce:
-	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-	WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-	MOVD $1, R3
-	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-	MOVD $VirtualizationException, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_EL0(VirtualizationException)
 
 TEXT ·El0_sync_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
