@@ -125,6 +125,18 @@ func nonCanonical(addr uint64, signal int32, info *arch.SignalInfo) (usermem.Acc
 	return usermem.NoAccess, platform.ErrContextSignal
 }
 
+// bitsForScaling returns the bits available for storing the fraction component
+// of the TSC scaling ratio. This allows us to replicate the (bad) math done by
+// the kernel below in scaledTSC, and ensure we can compute an exact zero
+// offset in setSystemTime.
+//
+// CNTFRQ_EL0:
+// Bits [63:32]:Reserved
+// Bits [31:0]: Clock frequency. Indicates the system counter clock frequency, in Hz.
+var bitsForScaling = func() int64 {
+	return 31
+}()
+
 // isInstructionAbort returns true if it is an instruction abort.
 //
 //go:nosplit
