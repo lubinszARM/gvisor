@@ -132,3 +132,9 @@ TEXT ·TwiddleRegsFault(SB),NOSPLIT,$0
 	// Branch to Register branches unconditionally to an address in <Rn>.
 	JMP (R6) // <=> br x6, must fault
 	RET // never reached
+
+TEXT ·TwiddleSegments(SB),NOSPLIT,$0
+	MRS TPIDR_EL0, R2
+	MOVD (R2), R1
+	SVC
+	RET // never reached

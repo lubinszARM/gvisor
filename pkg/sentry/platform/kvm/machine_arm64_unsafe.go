@@ -186,10 +186,24 @@ func (c *vCPU) setSystemTime() error {
 	return c.setSystemTimeLegacy()
 }
 
+// loadSegments copies the current tls.
+//
+// This may be called from within the signal context and throws on error.
+//
 //go:nosplit
 func (c *vCPU) loadSegments(tid uint64) {
-	// TODO(gvisor.dev/issue/1238):  TLS is not supported.
 	// Get TLS from tpidr_el0.
+	var (
+		reg kvmOneReg
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&c.CPU.Registers().TPIDR_EL0).Pointer())
+	reg.id = _KVM_ARM64_REGS_TPIDR_EL0
+
+	if err := c.getOneRegister(&reg); err != nil {
+		throw("getting TLS")
+	}
+
 	atomic.StoreUint64(&c.tid, tid)
 }
 
@@ -235,7 +249,6 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	ttbr0App := switchOpts.PageTables.TTBR0_EL1(false, 0)
 	c.SetTtbr0App(uintptr(ttbr0App))
 
-	// TODO(gvisor.dev/issue/1238): full context-switch supporting for Arm64.
 	// The Arm64 user-mode execution state consists of:
 	// x0-x30
 	// PC, SP, PSTATE

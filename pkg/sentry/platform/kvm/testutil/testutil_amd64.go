@@ -22,9 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
-// TwiddleSegments reads segments into known registers.
-func TwiddleSegments()
-
 // SetTestTarget sets the rip appropriately.
 func SetTestTarget(regs *arch.Registers, fn func()) {
 	regs.Rip = uint64(reflect.ValueOf(fn).Pointer())

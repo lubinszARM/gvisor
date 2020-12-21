@@ -67,3 +67,18 @@ func CheckTestRegs(regs *arch.Registers, full bool) (err error) {
 	}
 	return
 }
+
+var tls uint64 = 0x55
+
+// SetTestSegments initializes segments to known values.
+func SetTestSegments(regs *arch.Registers) {
+	regs.TPIDR_EL0 = uint64(reflect.ValueOf(&tls).Pointer())
+}
+
+// CheckTestSegments checks that registers were twiddled per TwiddleSegments.
+func CheckTestSegments(regs *arch.Registers) (err error) {
+	if regs.Regs[1] != tls {
+		err = addRegisterMismatch(err, "tls", regs.TPIDR_EL0, tls)
+	}
+	return
+}
