@@ -20,7 +20,6 @@ import (
 	"reflect"
 	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -54,9 +53,9 @@ type NIC struct {
 		sync.RWMutex
 		spoofing    bool
 		promiscuous bool
-		// packetEPs is protected by mu, but the contained PacketEndpoint
-		// values are not.
-		packetEPs map[tcpip.NetworkProtocolNumber][]PacketEndpoint
+		// packetEPs is protected by mu, but the contained packetEndpointList are
+		// not.
+		packetEPs map[tcpip.NetworkProtocolNumber]*packetEndpointList
 	}
 }
 
@@ -82,6 +81,39 @@ type DirectionStats struct {
 	Bytes   *tcpip.StatCounter
 }
 
+type packetEndpointList struct {
+	mu sync.RWMutex
+
+	// eps is protected by mu, but the contained PacketEndpoint values are not.
+	eps []PacketEndpoint
+}
+
+func (p *packetEndpointList) add(ep PacketEndpoint) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.eps = append(p.eps, ep)
+}
+
+func (p *packetEndpointList) remove(ep PacketEndpoint) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, epOther := range p.eps {
+		if epOther == ep {
+			p.eps = append(p.eps[:i], p.eps[i+1:]...)
+			break
+		}
+	}
+}
+
+// forEach calls fn with each endpoints in p while holding the read lock on p.
+func (p *packetEndpointList) forEach(fn func(PacketEndpoint)) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, ep := range p.eps {
+		fn(ep)
+	}
+}
+
 // newNIC returns a new NIC using the default NDP configurations from stack.
 func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICContext) *NIC {
 	// TODO(b/141011931): Validate a LinkEndpoint (ep) is valid. For
@@ -102,7 +134,7 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 		stats:            makeNICStats(),
 		networkEndpoints: make(map[tcpip.NetworkProtocolNumber]NetworkEndpoint),
 	}
-	nic.mu.packetEPs = make(map[tcpip.NetworkProtocolNumber][]PacketEndpoint)
+	nic.mu.packetEPs = make(map[tcpip.NetworkProtocolNumber]*packetEndpointList)
 
 	// Check for Neighbor Unreachability Detection support.
 	var nud NUDHandler
@@ -125,11 +157,11 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 
 	// Register supported packet and network endpoint protocols.
 	for _, netProto := range header.Ethertypes {
-		nic.mu.packetEPs[netProto] = []PacketEndpoint{}
+		nic.mu.packetEPs[netProto] = new(packetEndpointList)
 	}
 	for _, netProto := range stack.networkProtocols {
 		netNum := netProto.Number()
-		nic.mu.packetEPs[netNum] = nil
+		nic.mu.packetEPs[netNum] = new(packetEndpointList)
 		nic.networkEndpoints[netNum] = netProto.NewEndpoint(nic, stack, nud, nic)
 	}
 
@@ -262,15 +294,17 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 	//   the same unresolved IP address, and transmit the saved
 	//   packet when the address has been resolved.
 	//
-	// RFC 4861 section 5.2 (for IPv6):
-	//   Once the IP address of the next-hop node is known, the sender
-	//   examines the Neighbor Cache for link-layer information about that
-	//   neighbor.  If no entry exists, the sender creates one, sets its state
-	//   to INCOMPLETE, initiates Address Resolution, and then queues the data
-	//   packet pending completion of address resolution.
+	// RFC 4861 section 7.2.2 (for IPv6):
+	//   While waiting for address resolution to complete, the sender MUST, for
+	//   each neighbor, retain a small queue of packets waiting for address
+	//   resolution to complete. The queue MUST hold at least one packet, and MAY
+	//   contain more. However, the number of queued packets per neighbor SHOULD
+	//   be limited to some small value. When a queue overflows, the new arrival
+	//   SHOULD replace the oldest entry. Once address resolution completes, the
+	//   node transmits any queued packets.
 	if ch, err := r.Resolve(nil); err != nil {
 		if err == tcpip.ErrWouldBlock {
-			r := r.Clone()
+			r.Acquire()
 			n.stack.linkResQueue.enqueue(ch, r, protocol, pkt)
 			return nil
 		}
@@ -283,7 +317,9 @@ func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumb
 // WritePacketToRemote implements NetworkInterface.
 func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
 	r := Route{
-		NetProto: protocol,
+		routeInfo: routeInfo{
+			NetProto: protocol,
+		},
 	}
 	r.ResolveWith(remoteLinkAddr)
 	return n.writePacket(&r, gso, protocol, pkt)
@@ -512,14 +548,6 @@ func (n *NIC) neighbors() ([]NeighborEntry, *tcpip.Error) {
 	return n.neigh.entries(), nil
 }
 
-func (n *NIC) removeWaker(addr tcpip.Address, w *sleep.Waker) {
-	if n.neigh == nil {
-		return
-	}
-
-	n.neigh.removeWaker(addr, w)
-}
-
 func (n *NIC) addStaticNeighbor(addr tcpip.Address, linkAddress tcpip.LinkAddress) *tcpip.Error {
 	if n.neigh == nil {
 		return tcpip.ErrNotSupported
@@ -638,14 +666,22 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	pkt.RXTransportChecksumValidated = n.LinkEndpoint.Capabilities()&CapabilityRXChecksumOffload != 0
 
 	// Are any packet type sockets listening for this network protocol?
-	packetEPs := n.mu.packetEPs[protocol]
-	// Add any other packet type sockets that may be listening for all protocols.
-	packetEPs = append(packetEPs, n.mu.packetEPs[header.EthernetProtocolAll]...)
+	protoEPs := n.mu.packetEPs[protocol]
+	// Other packet type sockets that are listening for all protocols.
+	anyEPs := n.mu.packetEPs[header.EthernetProtocolAll]
 	n.mu.RUnlock()
-	for _, ep := range packetEPs {
+
+	// Deliver to interested packet endpoints without holding NIC lock.
+	deliverPacketEPs := func(ep PacketEndpoint) {
 		p := pkt.Clone()
 		p.PktType = tcpip.PacketHost
 		ep.HandlePacket(n.id, local, protocol, p)
+	}
+	if protoEPs != nil {
+		protoEPs.forEach(deliverPacketEPs)
+	}
+	if anyEPs != nil {
+		anyEPs.forEach(deliverPacketEPs)
 	}
 
 	// Parse headers.
@@ -687,16 +723,17 @@ func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tc
 	// We do not deliver to protocol specific packet endpoints as on Linux
 	// only ETH_P_ALL endpoints get outbound packets.
 	// Add any other packet sockets that maybe listening for all protocols.
-	packetEPs := n.mu.packetEPs[header.EthernetProtocolAll]
+	eps := n.mu.packetEPs[header.EthernetProtocolAll]
 	n.mu.RUnlock()
-	for _, ep := range packetEPs {
+
+	eps.forEach(func(ep PacketEndpoint) {
 		p := pkt.Clone()
 		p.PktType = tcpip.PacketOutgoing
 		// Add the link layer header as outgoing packets are intercepted
 		// before the link layer header is created.
 		n.LinkEndpoint.AddHeader(local, remote, protocol, p)
 		ep.HandlePacket(n.id, local, protocol, p)
-	}
+	})
 }
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
@@ -849,7 +886,7 @@ func (n *NIC) registerPacketEndpoint(netProto tcpip.NetworkProtocolNumber, ep Pa
 	if !ok {
 		return tcpip.ErrNotSupported
 	}
-	n.mu.packetEPs[netProto] = append(eps, ep)
+	eps.add(ep)
 
 	return nil
 }
@@ -862,13 +899,7 @@ func (n *NIC) unregisterPacketEndpoint(netProto tcpip.NetworkProtocolNumber, ep 
 	if !ok {
 		return
 	}
-
-	for i, epOther := range eps {
-		if epOther == ep {
-			n.mu.packetEPs[netProto] = append(eps[:i], eps[i+1:]...)
-			return
-		}
-	}
+	eps.remove(ep)
 }
 
 // isValidForOutgoing returns true if the endpoint can be used to send out a

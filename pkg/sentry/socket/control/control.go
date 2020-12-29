@@ -371,6 +371,17 @@ func PackOriginalDstAddress(t *kernel.Task, originalDstAddress linux.SockAddr, b
 		buf, level, optType, t.Arch().Width(), originalDstAddress)
 }
 
+// PackSockExtendedErr packs an IP*_RECVERR socket control message.
+func PackSockExtendedErr(t *kernel.Task, sockErr linux.SockErrCMsg, buf []byte) []byte {
+	return putCmsgStruct(
+		buf,
+		sockErr.CMsgLevel(),
+		sockErr.CMsgType(),
+		t.Arch().Width(),
+		sockErr,
+	)
+}
+
 // PackControlMessages packs control messages into the given buffer.
 //
 // We skip control messages specific to Unix domain sockets.
@@ -401,6 +412,10 @@ func PackControlMessages(t *kernel.Task, cmsgs socket.ControlMessages, buf []byt
 
 	if cmsgs.IP.OriginalDstAddress != nil {
 		buf = PackOriginalDstAddress(t, cmsgs.IP.OriginalDstAddress, buf)
+	}
+
+	if cmsgs.IP.SockErr != nil {
+		buf = PackSockExtendedErr(t, cmsgs.IP.SockErr, buf)
 	}
 
 	return buf
@@ -438,6 +453,10 @@ func CmsgsSpace(t *kernel.Task, cmsgs socket.ControlMessages) int {
 
 	if cmsgs.IP.OriginalDstAddress != nil {
 		space += cmsgSpace(t, cmsgs.IP.OriginalDstAddress.SizeBytes())
+	}
+
+	if cmsgs.IP.SockErr != nil {
+		space += cmsgSpace(t, cmsgs.IP.SockErr.SizeBytes())
 	}
 
 	return space
@@ -503,6 +522,14 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 				cmsgs.Unix.Credentials = scmCreds
 				i += binary.AlignUp(length, width)
 
+			case linux.SO_TIMESTAMP:
+				if length < linux.SizeOfTimeval {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+				cmsgs.IP.HasTimestamp = true
+				binary.Unmarshal(buf[i:i+linux.SizeOfTimeval], usermem.ByteOrder, &cmsgs.IP.Timestamp)
+				i += binary.AlignUp(length, width)
+
 			default:
 				// Unknown message type.
 				return socket.ControlMessages{}, syserror.EINVAL
@@ -529,6 +556,25 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 				cmsgs.IP.PacketInfo = packetInfo
 				i += binary.AlignUp(length, width)
 
+			case linux.IP_RECVORIGDSTADDR:
+				var addr linux.SockAddrInet
+				if length < addr.SizeBytes() {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+				binary.Unmarshal(buf[i:i+addr.SizeBytes()], usermem.ByteOrder, &addr)
+				cmsgs.IP.OriginalDstAddress = &addr
+				i += binary.AlignUp(length, width)
+
+			case linux.IP_RECVERR:
+				var errCmsg linux.SockErrCMsgIPv4
+				if length < errCmsg.SizeBytes() {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+
+				errCmsg.UnmarshalBytes(buf[i : i+errCmsg.SizeBytes()])
+				cmsgs.IP.SockErr = &errCmsg
+				i += binary.AlignUp(length, width)
+
 			default:
 				return socket.ControlMessages{}, syserror.EINVAL
 			}
@@ -540,6 +586,25 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte) (socket.Con
 				}
 				cmsgs.IP.HasTClass = true
 				binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageTClass], usermem.ByteOrder, &cmsgs.IP.TClass)
+				i += binary.AlignUp(length, width)
+
+			case linux.IPV6_RECVORIGDSTADDR:
+				var addr linux.SockAddrInet6
+				if length < addr.SizeBytes() {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+				binary.Unmarshal(buf[i:i+addr.SizeBytes()], usermem.ByteOrder, &addr)
+				cmsgs.IP.OriginalDstAddress = &addr
+				i += binary.AlignUp(length, width)
+
+			case linux.IPV6_RECVERR:
+				var errCmsg linux.SockErrCMsgIPv6
+				if length < errCmsg.SizeBytes() {
+					return socket.ControlMessages{}, syserror.EINVAL
+				}
+
+				errCmsg.UnmarshalBytes(buf[i : i+errCmsg.SizeBytes()])
+				cmsgs.IP.SockErr = &errCmsg
 				i += binary.AlignUp(length, width)
 
 			default:

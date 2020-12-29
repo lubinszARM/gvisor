@@ -502,9 +502,6 @@ type endpoint struct {
 	// sack holds TCP SACK related information for this endpoint.
 	sack SACKInfo
 
-	// bindToDevice is set to the NIC on which to bind or disabled if 0.
-	bindToDevice tcpip.NICID
-
 	// delay enables Nagle's algorithm.
 	//
 	// delay is a boolean (0 is false) and must be accessed atomically.
@@ -673,9 +670,6 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
-
-	// linger is used for SO_LINGER socket option.
-	linger tcpip.LingerOption
 
 	// ops is used to get socket level options.
 	ops tcpip.SocketOptions
@@ -1040,7 +1034,8 @@ func (e *endpoint) Close() {
 		return
 	}
 
-	if e.linger.Enabled && e.linger.Timeout == 0 {
+	linger := e.SocketOptions().GetLinger()
+	if linger.Enabled && linger.Timeout == 0 {
 		s := e.EndpointState()
 		isResetState := s == StateEstablished || s == StateCloseWait || s == StateFinWait1 || s == StateFinWait2 || s == StateSynRecv
 		if isResetState {
@@ -1303,6 +1298,15 @@ func (e *endpoint) LastError() *tcpip.Error {
 		return err
 	}
 	return e.lastErrorLocked()
+}
+
+// UpdateLastError implements tcpip.SocketOptionsHandler.UpdateLastError.
+func (e *endpoint) UpdateLastError(err *tcpip.Error) {
+	e.LockUser()
+	e.lastErrorMu.Lock()
+	e.lastError = err
+	e.lastErrorMu.Unlock()
+	e.UnlockUser()
 }
 
 // Read reads data from the endpoint.
@@ -1814,18 +1818,13 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	return nil
 }
 
+func (e *endpoint) HasNIC(id int32) bool {
+	return id == 0 || e.stack.HasNIC(tcpip.NICID(id))
+}
+
 // SetSockOpt sets a socket option.
 func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	switch v := opt.(type) {
-	case *tcpip.BindToDeviceOption:
-		id := tcpip.NICID(*v)
-		if id != 0 && !e.stack.HasNIC(id) {
-			return tcpip.ErrUnknownDevice
-		}
-		e.LockUser()
-		e.bindToDevice = id
-		e.UnlockUser()
-
 	case *tcpip.KeepaliveIdleOption:
 		e.keepalive.Lock()
 		e.keepalive.idle = time.Duration(*v)
@@ -1837,9 +1836,6 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 		e.keepalive.interval = time.Duration(*v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
-
-	case *tcpip.OutOfBandInlineOption:
-		// We don't currently support disabling this option.
 
 	case *tcpip.TCPUserTimeoutOption:
 		e.LockUser()
@@ -1908,11 +1904,6 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 
 	case *tcpip.SocketDetachFilterOption:
 		return nil
-
-	case *tcpip.LingerOption:
-		e.LockUser()
-		e.linger = *v
-		e.UnlockUser()
 
 	default:
 		return nil
@@ -2014,11 +2005,6 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
 func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 	switch o := opt.(type) {
-	case *tcpip.BindToDeviceOption:
-		e.LockUser()
-		*o = tcpip.BindToDeviceOption(e.bindToDevice)
-		e.UnlockUser()
-
 	case *tcpip.TCPInfoOption:
 		*o = tcpip.TCPInfoOption{}
 		e.LockUser()
@@ -2045,10 +2031,6 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 		e.LockUser()
 		*o = tcpip.TCPUserTimeoutOption(e.userTimeout)
 		e.UnlockUser()
-
-	case *tcpip.OutOfBandInlineOption:
-		// We don't currently support disabling this option.
-		*o = 1
 
 	case *tcpip.CongestionControlOption:
 		e.LockUser()
@@ -2077,11 +2059,6 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 			Addr: addr,
 			Port: port,
 		}
-
-	case *tcpip.LingerOption:
-		e.LockUser()
-		*o = e.linger
-		e.UnlockUser()
 
 	default:
 		return tcpip.ErrUnknownProtocolOption
@@ -2230,11 +2207,12 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 			}
 		}
 
+		bindToDevice := tcpip.NICID(e.ops.GetBindToDevice())
 		if _, err := e.stack.PickEphemeralPortStable(portOffset, func(p uint16) (bool, *tcpip.Error) {
 			if sameAddr && p == e.ID.RemotePort {
 				return false, nil
 			}
-			if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, e.bindToDevice, addr, nil /* testPort */); err != nil {
+			if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr, nil /* testPort */); err != nil {
 				if err != tcpip.ErrPortInUse || !reuse {
 					return false, nil
 				}
@@ -2272,15 +2250,15 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 				tcpEP.notifyProtocolGoroutine(notifyAbort)
 				tcpEP.UnlockUser()
 				// Now try and Reserve again if it fails then we skip.
-				if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, e.bindToDevice, addr, nil /* testPort */); err != nil {
+				if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr, nil /* testPort */); err != nil {
 					return false, nil
 				}
 			}
 
 			id := e.ID
 			id.LocalPort = p
-			if err := e.stack.RegisterTransportEndpoint(nicID, netProtos, ProtocolNumber, id, e, e.portFlags, e.bindToDevice); err != nil {
-				e.stack.ReleasePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, e.bindToDevice, addr)
+			if err := e.stack.RegisterTransportEndpoint(nicID, netProtos, ProtocolNumber, id, e, e.portFlags, bindToDevice); err != nil {
+				e.stack.ReleasePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr)
 				if err == tcpip.ErrPortInUse {
 					return false, nil
 				}
@@ -2291,7 +2269,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 			// the selected port.
 			e.ID = id
 			e.isPortReserved = true
-			e.boundBindToDevice = e.bindToDevice
+			e.boundBindToDevice = bindToDevice
 			e.boundPortFlags = e.portFlags
 			e.boundDest = addr
 			return true, nil
@@ -2302,7 +2280,8 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 
 	e.isRegistered = true
 	e.setEndpointState(StateConnecting)
-	e.route = r.Clone()
+	r.Acquire()
+	e.route = r
 	e.boundNICID = nicID
 	e.effectiveNetProtos = netProtos
 	e.connectingAddress = connectingAddr
@@ -2643,7 +2622,8 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err *tcpip.Error) {
 		e.ID.LocalAddress = addr.Addr
 	}
 
-	port, err := e.stack.ReservePort(netProtos, ProtocolNumber, addr.Addr, addr.Port, e.portFlags, e.bindToDevice, tcpip.FullAddress{}, func(p uint16) bool {
+	bindToDevice := tcpip.NICID(e.ops.GetBindToDevice())
+	port, err := e.stack.ReservePort(netProtos, ProtocolNumber, addr.Addr, addr.Port, e.portFlags, bindToDevice, tcpip.FullAddress{}, func(p uint16) bool {
 		id := e.ID
 		id.LocalPort = p
 		// CheckRegisterTransportEndpoint should only return an error if there is a
@@ -2654,7 +2634,7 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err *tcpip.Error) {
 		// demuxer. Further connected endpoints always have a remote
 		// address/port. Hence this will only return an error if there is a matching
 		// listening endpoint.
-		if err := e.stack.CheckRegisterTransportEndpoint(nic, netProtos, ProtocolNumber, id, e.portFlags, e.bindToDevice); err != nil {
+		if err := e.stack.CheckRegisterTransportEndpoint(nic, netProtos, ProtocolNumber, id, e.portFlags, bindToDevice); err != nil {
 			return false
 		}
 		return true
@@ -2663,7 +2643,7 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err *tcpip.Error) {
 		return err
 	}
 
-	e.boundBindToDevice = e.bindToDevice
+	e.boundBindToDevice = bindToDevice
 	e.boundPortFlags = e.portFlags
 	// TODO(gvisor.dev/issue/3691): Add test to verify boundNICID is correct.
 	e.boundNICID = nic
@@ -2727,6 +2707,41 @@ func (e *endpoint) enqueueSegment(s *segment) bool {
 	return true
 }
 
+func (e *endpoint) onICMPError(err *tcpip.Error, id stack.TransportEndpointID, errType byte, errCode byte, extra uint32, pkt *stack.PacketBuffer) {
+	// Update last error first.
+	e.lastErrorMu.Lock()
+	e.lastError = err
+	e.lastErrorMu.Unlock()
+
+	// Update the error queue if IP_RECVERR is enabled.
+	if e.SocketOptions().GetRecvError() {
+		e.SocketOptions().QueueErr(&tcpip.SockError{
+			Err:       err,
+			ErrOrigin: header.ICMPOriginFromNetProto(pkt.NetworkProtocolNumber),
+			ErrType:   errType,
+			ErrCode:   errCode,
+			ErrInfo:   extra,
+			// Linux passes the payload with the TCP header. We don't know if the TCP
+			// header even exists, it may not for fragmented packets.
+			Payload: pkt.Data.ToView(),
+			Dst: tcpip.FullAddress{
+				NIC:  pkt.NICID,
+				Addr: id.RemoteAddress,
+				Port: id.RemotePort,
+			},
+			Offender: tcpip.FullAddress{
+				NIC:  pkt.NICID,
+				Addr: id.LocalAddress,
+				Port: id.LocalPort,
+			},
+			NetProto: pkt.NetworkProtocolNumber,
+		})
+	}
+
+	// Notify of the error.
+	e.notifyProtocolGoroutine(notifyError)
+}
+
 // HandleControlPacket implements stack.TransportEndpoint.HandleControlPacket.
 func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, pkt *stack.PacketBuffer) {
 	switch typ {
@@ -2741,16 +2756,10 @@ func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.C
 		e.notifyProtocolGoroutine(notifyMTUChanged)
 
 	case stack.ControlNoRoute:
-		e.lastErrorMu.Lock()
-		e.lastError = tcpip.ErrNoRoute
-		e.lastErrorMu.Unlock()
-		e.notifyProtocolGoroutine(notifyError)
+		e.onICMPError(tcpip.ErrNoRoute, id, byte(header.ICMPv4DstUnreachable), byte(header.ICMPv4HostUnreachable), extra, pkt)
 
 	case stack.ControlNetworkUnreachable:
-		e.lastErrorMu.Lock()
-		e.lastError = tcpip.ErrNetworkUnreachable
-		e.lastErrorMu.Unlock()
-		e.notifyProtocolGoroutine(notifyError)
+		e.onICMPError(tcpip.ErrNetworkUnreachable, id, byte(header.ICMPv6DstUnreachable), byte(header.ICMPv6NetworkUnreachable), extra, pkt)
 	}
 }
 
@@ -3008,6 +3017,7 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 		Ssthresh:         e.snd.sndSsthresh,
 		SndCAAckCount:    e.snd.sndCAAckCount,
 		Outstanding:      e.snd.outstanding,
+		SackedOut:        e.snd.sackedOut,
 		SndWnd:           e.snd.sndWnd,
 		SndUna:           e.snd.sndUna,
 		SndNxt:           e.snd.sndNxt,
