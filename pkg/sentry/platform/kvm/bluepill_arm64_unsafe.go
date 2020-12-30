@@ -80,11 +80,16 @@ func getHypercallID(addr uintptr) int {
 //
 //go:nosplit
 func bluepillStopGuest(c *vCPU) {
+	vcpuSErrBounce := &kvmVcpuEvents{
+		exception: exception{
+			sErrPending: 1,
+		},
+	}
 	if _, _, errno := syscall.RawSyscall( // escapes: no.
 		syscall.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_VCPU_EVENTS,
-		uintptr(unsafe.Pointer(&vcpuSErrBounce))); errno != 0 {
+		uintptr(unsafe.Pointer(vcpuSErrBounce))); errno != 0 {
 		throw("bounce sErr injection failed")
 	}
 }
@@ -93,12 +98,19 @@ func bluepillStopGuest(c *vCPU) {
 //
 //go:nosplit
 func bluepillSigBus(c *vCPU) {
+	vcpuSErrNMI := &kvmVcpuEvents{
+		exception: exception{
+			sErrPending: 1,
+			sErrHasEsr:  1,
+			sErrEsr:     _ESR_ELx_SERR_NMI,
+		},
+	}
 	// Host must support ARM64_HAS_RAS_EXTN.
 	if _, _, errno := syscall.RawSyscall( // escapes: no.
 		syscall.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_VCPU_EVENTS,
-		uintptr(unsafe.Pointer(&vcpuSErrNMI))); errno != 0 {
+		uintptr(unsafe.Pointer(vcpuSErrNMI))); errno != 0 {
 		if errno == syscall.EINVAL {
 			throw("No ARM64_HAS_RAS_EXTN feature in host.")
 		}
@@ -110,11 +122,16 @@ func bluepillSigBus(c *vCPU) {
 //
 //go:nosplit
 func bluepillExtDabt(c *vCPU) {
+	vcpuExtDabt := &kvmVcpuEvents{
+		exception: exception{
+			extDabtPending: 1,
+		},
+	}
 	if _, _, errno := syscall.RawSyscall( // escapes: no.
 		syscall.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_VCPU_EVENTS,
-		uintptr(unsafe.Pointer(&vcpuExtDabt))); errno != 0 {
+		uintptr(unsafe.Pointer(vcpuExtDabt))); errno != 0 {
 		throw("ext_dabt injection failed")
 	}
 }
