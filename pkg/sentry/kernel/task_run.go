@@ -16,10 +16,16 @@ package kernel
 
 import (
 	"bytes"
+	//	"flag"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"reflect"
 	"runtime"
 	"runtime/trace"
 	"sync/atomic"
+	"syscall"
+	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/goid"
@@ -30,7 +36,82 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
+
+	"gate.computer/wag"
+	"gate.computer/wag/buffer"
+	"gate.computer/wag/compile"
+	"gate.computer/wag/object/debug/dump"
+	"gate.computer/wag/wa"
 )
+
+const linearMemoryAddressSpace = 8 * 1024 * 1024 * 1024
+
+var (
+	verbose = false
+)
+
+var (
+	importFuncs  = make(map[string]int)
+	importVector []byte
+)
+
+type sysResolver struct{}
+
+func (sysResolver) ResolveFunc(module, field string, sig wa.FuncType) (index int, err error) {
+	index = importFuncs[field]
+	return
+}
+
+type libResolver struct {
+	lib compile.Library
+}
+
+func (r libResolver) ResolveFunc(module, field string, sig wa.FuncType) (index uint32, err error) {
+	if verbose {
+		fmt.Printf("import %s%s", field, sig)
+	}
+
+	if module != "env" {
+		err = fmt.Errorf("import function's module is unknown: %s %s", module, field)
+		return
+	}
+
+	name := field + "_"
+	for _, t := range sig.Params {
+		name += t.String()
+	}
+	if sig.Result != wa.Void {
+		name += "_" + sig.Result.String()
+	}
+
+	index, sig, found := r.lib.ExportFunc(name)
+	if !found {
+		err = fmt.Errorf("import function not supported: %s%s", field, sig)
+		return
+	}
+
+	return
+}
+
+func (libResolver) ResolveGlobal(module, field string, t wa.Type) (init uint64, err error) {
+	err = fmt.Errorf("imported global not supported: %s %s", module, field)
+	return
+}
+
+func makeMem(size int, prot, extraFlags int) (mem []byte, err error) {
+	if size > 0 {
+		mem, err = syscall.Mmap(-1, 0, size, prot, syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|extraFlags)
+	}
+	return
+}
+
+func memAddr(mem []byte) uintptr {
+	return (*reflect.SliceHeader)(unsafe.Pointer(&mem)).Data
+}
+
+func alignSize(size, alignment int) int {
+	return (size + (alignment - 1)) &^ (alignment - 1)
+}
 
 // A taskRunState is a reified state in the task state machine. See README.md
 // for details. The canonical list of all run states, as well as transitions
@@ -82,35 +163,149 @@ func (t *Task) run(threadID uintptr) {
 	// interrupted.
 	t.interruptSelf()
 
-	for {
-		// Explanation for this ordering:
-		//
-		// - A freshly-started task that is stopped should not do anything
-		// before it enters the stop.
-		//
-		// - If taskRunState.execute returns nil, the task goroutine should
-		// exit without checking for a stop.
-		//
-		// - Task.Start won't start Task.run if t.runState is nil, so this
-		// ordering is safe.
-		t.doStop()
-		t.runState = t.runState.execute(t)
-		if t.runState == nil {
-			t.accountTaskGoroutineEnter(TaskGoroutineNonexistent)
-			t.goroutineStopped.Done()
-			t.tg.liveGoroutines.Done()
-			t.tg.pidns.owner.liveGoroutines.Done()
-			t.tg.pidns.owner.runningGoroutines.Done()
-			t.p.Release()
+	/*
+		for {
+			// Explanation for this ordering:
+			//
+			// - A freshly-started task that is stopped should not do anything
+			// before it enters the stop.
+			//
+			// - If taskRunState.execute returns nil, the task goroutine should
+			// exit without checking for a stop.
+			//
+			// - Task.Start won't start Task.run if t.runState is nil, so this
+			// ordering is safe.
+			t.doStop()
+			t.runState = t.runState.execute(t)
+			if t.runState == nil {
+				t.accountTaskGoroutineEnter(TaskGoroutineNonexistent)
+				t.goroutineStopped.Done()
+				t.tg.liveGoroutines.Done()
+				t.tg.pidns.owner.liveGoroutines.Done()
+				t.tg.pidns.owner.runningGoroutines.Done()
+				t.p.Release()
 
-			// Deferring this store triggers a false positive in the race
-			// detector (https://github.com/golang/go/issues/42599).
-			atomic.StoreInt64(&t.goid, 0)
-			// Keep argument alive because stack trace for dead variables may not be correct.
-			runtime.KeepAlive(threadID)
-			return
+				// Deferring this store triggers a false positive in the race
+				// detector (https://github.com/golang/go/issues/42599).
+				atomic.StoreInt64(&t.goid, 0)
+				// Keep argument alive because stack trace for dead variables may not be correct.
+				runtime.KeepAlive(threadID)
+				return
+			}
+		}
+	*/
+
+	var (
+		textSize  = compile.MaxTextSize
+		stackSize = wa.PageSize
+		entry     = "main"
+		dumpText  = false
+	)
+	/*
+		flag.BoolVar(&verbose, "v", verbose, "verbose logging")
+		flag.IntVar(&textSize, "textsize", textSize, "maximum program text size")
+		flag.IntVar(&stackSize, "stacksize", stackSize, "call stack size")
+		flag.StringVar(&entry, "entry", entry, "function to run")
+		flag.BoolVar(&dumpText, "dumptext", dumpText, "disassemble the generated code to stdout")
+		flag.Parse()
+
+		if flag.NArg() != 1 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		filename := flag.Arg(0)
+	*/
+	prog, err := ioutil.ReadFile("/tmp/hello.wasm") //filename)
+	if err != nil {
+		fmt.Printf("BBLU FAILED READ..\n")
+		return
+	}
+	progReader := bytes.NewReader(prog)
+
+	vecSize := alignSize(len(importVector), os.Getpagesize())
+
+	vecTextMem, err := makeMem(vecSize+textSize, syscall.PROT_READ|syscall.PROT_WRITE, 0)
+	if err != nil {
+		fmt.Printf("BBLU make memory failed..\n")
+		return
+	}
+
+	vecMem := vecTextMem[:vecSize]
+	vec := vecMem[vecSize-len(importVector):]
+	copy(vec, importVector)
+
+	textMem := vecTextMem[vecSize:]
+	textAddr := memAddr(textMem)
+	textBuf := buffer.NewStatic(textMem[:0:len(textMem)])
+
+	lib, err := wag.CompileLibrary(bytes.NewReader(libWASM), sysResolver{})
+	if err != nil {
+		panic(err)
+	}
+
+	config := &wag.Config{
+		ImportResolver:  libResolver{lib},
+		Text:            textBuf,
+		MemoryAlignment: os.Getpagesize(),
+		Entry:           entry,
+	}
+
+	obj, err := wag.Compile(config, progReader, lib)
+	if dumpText && len(obj.Text) > 0 {
+		e := dump.Text(os.Stdout, obj.Text, textAddr, obj.FuncAddrs, &obj.Names)
+		if err == nil {
+			err = e
 		}
 	}
+	if err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	globalsMemory, err := makeMem(obj.MemoryOffset+linearMemoryAddressSpace, syscall.PROT_NONE, 0)
+	if err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	err = syscall.Mprotect(globalsMemory[:obj.MemoryOffset+obj.InitialMemorySize], syscall.PROT_READ|syscall.PROT_WRITE)
+	if err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	copy(globalsMemory, obj.GlobalsMemory)
+
+	setImportVectorMemoryAddr(vec, memAddr(globalsMemory)+uintptr(obj.MemoryOffset))
+
+	if err := syscall.Mprotect(vecMem, syscall.PROT_READ); err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	if err := syscall.Mprotect(textMem, syscall.PROT_READ|syscall.PROT_EXEC); err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	stackMem, err := makeMem(stackSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_STACK)
+	if err != nil {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+	stackOffset := stackSize - len(obj.StackFrame)
+	copy(stackMem[stackOffset:], obj.StackFrame)
+
+	stackAddr := memAddr(stackMem)
+	stackLimit := stackAddr + 256 + 8192 + 240 + 8 + 8
+	stackPtr := stackAddr + uintptr(stackOffset)
+
+	if stackLimit >= stackPtr {
+		fmt.Printf("BBLU 11..\n")
+		return
+	}
+
+	exec(textAddr, stackLimit, stackPtr)
 }
 
 // doStop is called by Task.run to block until the task is not stopped.
