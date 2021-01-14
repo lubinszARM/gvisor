@@ -70,14 +70,6 @@ func (c *vCPU) initArchState() error {
 		panic(fmt.Sprintf("error setting KVM_ARM_VCPU_INIT failed: %v", errno))
 	}
 
-	// cpacr_el1
-	reg.id = _KVM_ARM64_REGS_CPACR_EL1
-	// It is off by default, and it is turned on only when in use.
-	data = 0 // Disable fpsimd.
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
 	// tcr_el1
 	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
@@ -134,21 +126,15 @@ func (c *vCPU) initArchState() error {
 	// vbar_el1
 	reg.id = _KVM_ARM64_REGS_VBAR_EL1
 
-	fromLocation := reflect.ValueOf(ring0.Vectors).Pointer()
-	offset := fromLocation & (1<<11 - 1)
-	if offset != 0 {
-		offset = 1<<11 - offset
-	}
-
-	toLocation := fromLocation + offset
-	data = uint64(ring0.KernelStartAddress | toLocation)
+	location := reflect.ValueOf(ring0.Vectors).Pointer()
+	data = uint64(ring0.KernelStartAddress | location)
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
 
 	// Use the address of the exception vector table as
 	// the MMIO address base.
-	arm64HypercallMMIOBase = toLocation
+	arm64HypercallMMIOBase = location
 
 	// Initialize the PCID database.
 	if hasGuestPCID {

@@ -132,6 +132,32 @@
   MOVD offset+PTRACE_R29(reg), R29; \
   MOVD offset+PTRACE_R30(reg), R30;
 
+// Loads the application's fpstate.
+#define FPSTATE_EL0_LOAD() \
+  MRS TPIDR_EL1, RSV_REG; \
+  MOVD CPU_FPSTATE_EL0(RSV_REG), RSV_REG; \
+  MOVD 0(RSV_REG), RSV_REG_APP; \
+  MOVD RSV_REG_APP, FPSR; \
+  MOVD 8(RSV_REG), RSV_REG_APP; \
+  MOVD RSV_REG_APP, FPCR; \
+  ADD $16, RSV_REG, RSV_REG; \
+  WORD $0xad400640; \ // ldp q0, q1, [x18]
+  WORD $0xad410e42; \
+  WORD $0xad421644; \
+  WORD $0xad431e46; \
+  WORD $0xad442648; \
+  WORD $0xad452e4a; \
+  WORD $0xad46364c; \
+  WORD $0xad473e4e; \
+  WORD $0xad484650; \
+  WORD $0xad494e52; \
+  WORD $0xad4a5654; \
+  WORD $0xad4b5e56; \
+  WORD $0xad4c6658; \
+  WORD $0xad4d6e5a; \
+  WORD $0xad4e765c; \
+  WORD $0xad4f7e5e;
+
 #define ESR_ELx_EC_UNKNOWN	(0x00)
 #define ESR_ELx_EC_WFx		(0x01)
 /* Unallocated EC: 0x02 */
@@ -286,26 +312,28 @@
 	MSR RSV_REG, TTBR0_EL1; \
 	ISB $15;
 
-TEXT ·EnableVFP(SB),NOSPLIT,$0
+// FPSIMDDisableTrap disables the trap for accessing fpsimd. 
+TEXT ·FPSIMDDisableTrap(SB),NOSPLIT,$0
 	MOVD $FPEN_ENABLE, R0
-	WORD $0xd5181040 //MSR R0, CPACR_EL1
+	MSR R0, CPACR_EL1
 	ISB $15
 	RET
 
-TEXT ·DisableVFP(SB),NOSPLIT,$0
-	MOVD $0, R0
-	WORD $0xd5181040 //MSR R0, CPACR_EL1
+// FPSIMDDisableTrap enables the trap for accessing fpsimd.
+TEXT ·FPSIMDEnableTrap(SB),NOSPLIT,$0
+	MSR $0, CPACR_EL1
 	ISB $15
 	RET
 
-#define VFP_ENABLE \
-	MOVD $FPEN_ENABLE, R0; \
-	WORD $0xd5181040; \ //MSR R0, CPACR_EL1
+// FPSIMD_DISABLE_TRAP disables the trap for accessing fpsimd.
+#define FPSIMD_DISABLE_TRAP(reg) \
+	MOVD $FPEN_ENABLE, reg; \
+	MSR reg, CPACR_EL1; \
 	ISB $15;
 
-#define VFP_DISABLE \
-	MOVD $0x0, R0; \
-	WORD $0xd5181040; \ //MSR R0, CPACR_EL1
+// FPSIMD_ENABLE_TRAP enables the trap for accessing fpsimd.
+#define FPSIMD_ENABLE_TRAP(reg) \
+	MSR $0, CPACR_EL1; \
 	ISB $15;
 
 // KERNEL_ENTRY_FROM_EL0 is the entry code of the vcpu from el0 to el1.
@@ -363,6 +391,14 @@ TEXT ·DisableVFP(SB),NOSPLIT,$0
 	MOVD R3, 8(RSP); \
 	B ·HaltEl1ExceptionAndResume(SB);
 
+// storeEl0Fpstate writes the address of application's fpstate.
+TEXT ·storeEl0Fpstate(SB),NOSPLIT,$0-8
+	MOVD value+0(FP), R1
+	ORR $0xffff000000000000, R1, R1
+	MRS  TPIDR_EL1, RSV_REG
+	MOVD R1, CPU_FPSTATE_EL0(RSV_REG)
+	RET
+
 // storeAppASID writes the application's asid value.
 TEXT ·storeAppASID(SB),NOSPLIT,$0-8
 	MOVD asid+0(FP), R1
@@ -372,17 +408,11 @@ TEXT ·storeAppASID(SB),NOSPLIT,$0-8
 
 // Halt halts execution.
 TEXT ·Halt(SB),NOSPLIT,$0
-	// Clear bluepill.
-	WORD $0xd538d092   //MRS   TPIDR_EL1, R18
-	CMP RSV_REG, R9
-	BNE mmio_exit
-	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
-
-mmio_exit:
 	// Disable fpsimd.
 	WORD $0xd5381041 // MRS CPACR_EL1, R1
 	MOVD R1, CPU_LAZY_VFP(RSV_REG)
-	VFP_DISABLE
+	DSB $7	// dsb(nsh)
+	FPSIMD_ENABLE_TRAP(RSV_REG)	
 
 	// Trigger MMIO_EXIT/_KVM_HYPERCALL_VMEXIT.
 	//
@@ -612,7 +642,7 @@ el1_dbg:
 	EXCEPTION_EL1(El1SyncDbg)
 el1_fpsimd_acc:
 el1_sve_acc:
-	VFP_ENABLE
+	FPSIMD_DISABLE_TRAP(RSV_REG)	
 	B ·kernelExitToEl1(SB)  // Resume.
 el1_invalid:
 	EXCEPTION_EL1(El1SyncInv)
@@ -677,7 +707,19 @@ el0_da:
 el0_ia:
 	EXCEPTION_EL0(PageFault)
 el0_fpsimd_acc:
-	EXCEPTION_EL0(El0SyncFpsimdAcc)
+	FPSIMD_DISABLE_TRAP(RSV_REG)
+	FPSTATE_EL0_LOAD()
+
+	MRS TPIDR_EL1, RSV_REG
+	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP
+
+	// Restore R0-R30
+	REGISTERS_LOAD(RSV_REG_APP, 0)
+	MOVD PTRACE_R18(RSV_REG_APP), RSV_REG
+	MOVD PTRACE_R19(RSV_REG_APP), RSV_REG_APP
+
+	ERET()  // return to el0.
+
 el0_sve_acc:
 	EXCEPTION_EL0(El0SyncSveAcc)
 el0_fpsimd_exc:
