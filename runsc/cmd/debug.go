@@ -17,8 +17,10 @@ package cmd
 import (
 	"context"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +45,7 @@ type Debug struct {
 	strace       string
 	logLevel     string
 	logPackets   string
+	delay        time.Duration
 	duration     time.Duration
 	ps           bool
 }
@@ -70,10 +73,11 @@ func (d *Debug) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&d.profileCPU, "profile-cpu", "", "writes CPU profile to the given file.")
 	f.StringVar(&d.profileBlock, "profile-block", "", "writes block profile to the given file.")
 	f.StringVar(&d.profileMutex, "profile-mutex", "", "writes mutex profile to the given file.")
-	f.DurationVar(&d.duration, "duration", time.Second, "amount of time to wait for CPU and trace profiles")
+	f.DurationVar(&d.delay, "delay", time.Hour, "amount of time to delay for collecting heap and goroutine profiles.")
+	f.DurationVar(&d.duration, "duration", time.Hour, "amount of time to wait for CPU and trace profiles.")
 	f.StringVar(&d.trace, "trace", "", "writes an execution trace to the given file.")
 	f.IntVar(&d.signal, "signal", -1, "sends signal to the sandbox")
-	f.StringVar(&d.strace, "strace", "", `A comma separated list of syscalls to trace. "all" enables all traces, "off" disables all`)
+	f.StringVar(&d.strace, "strace", "", `A comma separated list of syscalls to trace. "all" enables all traces, "off" disables all.`)
 	f.StringVar(&d.logLevel, "log-level", "", "The log level to set: warning (0), info (1), or debug (2).")
 	f.StringVar(&d.logPackets, "log-packets", "", "A boolean value to enable or disable packet logging: true or false.")
 	f.BoolVar(&d.ps, "ps", false, "lists processes")
@@ -123,11 +127,12 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		}
 	}
 
-	if c.IsSandboxRunning() {
+	if !c.IsSandboxRunning() {
 		return Errorf("container sandbox is not running")
 	}
 	log.Infof("Found sandbox %q, PID: %d", c.Sandbox.ID, c.Sandbox.Pid)
 
+	// Perform synchronous actions.
 	if d.signal > 0 {
 		log.Infof("Sending signal %d to process: %d", d.signal, c.Sandbox.Pid)
 		if err := syscall.Kill(c.Sandbox.Pid, syscall.Signal(d.signal)); err != nil {
@@ -142,81 +147,6 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		}
 		log.Infof("     *** Stack dump ***\n%s", stacks)
 	}
-	if d.profileHeap != "" {
-		f, err := os.Create(d.profileHeap)
-		if err != nil {
-			return Errorf(err.Error())
-		}
-		defer f.Close()
-
-		if err := c.Sandbox.HeapProfile(f); err != nil {
-			return Errorf(err.Error())
-		}
-		log.Infof("Heap profile written to %q", d.profileHeap)
-	}
-	if d.profileBlock != "" {
-		f, err := os.Create(d.profileBlock)
-		if err != nil {
-			return Errorf(err.Error())
-		}
-		defer f.Close()
-
-		if err := c.Sandbox.BlockProfile(f); err != nil {
-			return Errorf(err.Error())
-		}
-		log.Infof("Block profile written to %q", d.profileBlock)
-	}
-	if d.profileMutex != "" {
-		f, err := os.Create(d.profileMutex)
-		if err != nil {
-			return Errorf(err.Error())
-		}
-		defer f.Close()
-
-		if err := c.Sandbox.MutexProfile(f); err != nil {
-			return Errorf(err.Error())
-		}
-		log.Infof("Mutex profile written to %q", d.profileMutex)
-	}
-
-	delay := false
-	if d.profileCPU != "" {
-		delay = true
-		f, err := os.Create(d.profileCPU)
-		if err != nil {
-			return Errorf(err.Error())
-		}
-		defer func() {
-			f.Close()
-			if err := c.Sandbox.StopCPUProfile(); err != nil {
-				Fatalf(err.Error())
-			}
-			log.Infof("CPU profile written to %q", d.profileCPU)
-		}()
-		if err := c.Sandbox.StartCPUProfile(f); err != nil {
-			return Errorf(err.Error())
-		}
-		log.Infof("CPU profile started for %v, writing to %q", d.duration, d.profileCPU)
-	}
-	if d.trace != "" {
-		delay = true
-		f, err := os.Create(d.trace)
-		if err != nil {
-			return Errorf(err.Error())
-		}
-		defer func() {
-			f.Close()
-			if err := c.Sandbox.StopTrace(); err != nil {
-				Fatalf(err.Error())
-			}
-			log.Infof("Trace written to %q", d.trace)
-		}()
-		if err := c.Sandbox.StartTrace(f); err != nil {
-			return Errorf(err.Error())
-		}
-		log.Infof("Tracing started for %v, writing to %q", d.duration, d.trace)
-	}
-
 	if d.strace != "" || len(d.logLevel) != 0 || len(d.logPackets) != 0 {
 		args := control.LoggingArgs{}
 		switch strings.ToLower(d.strace) {
@@ -285,8 +215,156 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		log.Infof(o)
 	}
 
-	if delay {
-		time.Sleep(d.duration)
+	// Open profiling files.
+	var (
+		heapFile  *os.File
+		cpuFile   *os.File
+		traceFile *os.File
+		blockFile *os.File
+		mutexFile *os.File
+	)
+	if d.profileHeap != "" {
+		f, err := os.OpenFile(d.profileHeap, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return Errorf("error opening heap profile output: %v", err)
+		}
+		defer f.Close()
+		heapFile = f
+	}
+	if d.profileCPU != "" {
+		f, err := os.OpenFile(d.profileCPU, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return Errorf("error opening cpu profile output: %v", err)
+		}
+		defer f.Close()
+		cpuFile = f
+	}
+	if d.trace != "" {
+		f, err := os.OpenFile(d.trace, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return Errorf("error opening trace profile output: %v", err)
+		}
+		traceFile = f
+	}
+	if d.profileBlock != "" {
+		f, err := os.OpenFile(d.profileBlock, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return Errorf("error opening blocking profile output: %v", err)
+		}
+		defer f.Close()
+		blockFile = f
+	}
+	if d.profileMutex != "" {
+		f, err := os.OpenFile(d.profileMutex, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return Errorf("error opening mutex profile output: %v", err)
+		}
+		defer f.Close()
+		mutexFile = f
+	}
+
+	// Collect profiles.
+	var (
+		wg       sync.WaitGroup
+		heapErr  error
+		cpuErr   error
+		traceErr error
+		blockErr error
+		mutexErr error
+	)
+	if heapFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			heapErr = c.Sandbox.HeapProfile(heapFile, d.delay)
+		}()
+	}
+	if cpuFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cpuErr = c.Sandbox.CPUProfile(cpuFile, d.duration)
+		}()
+	}
+	if traceFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			traceErr = c.Sandbox.Trace(traceFile, d.duration)
+		}()
+	}
+	if blockFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			blockErr = c.Sandbox.BlockProfile(blockFile, d.duration)
+		}()
+	}
+	if mutexFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mutexErr = c.Sandbox.MutexProfile(mutexFile, d.duration)
+		}()
+	}
+
+	// Before sleeping, allow us to catch signals and try to exit
+	// gracefully before just exiting. If we can't wait for wg, then
+	// we will not be able to read the errors below safely.
+	readyChan := make(chan struct{})
+	go func() {
+		defer close(readyChan)
+		wg.Wait()
+	}()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	select {
+	case <-readyChan:
+		break // Safe to proceed.
+	case <-signals:
+		log.Infof("caught signal, waiting at most one more second.")
+		select {
+		case <-signals:
+			log.Infof("caught second signal, exiting immediately.")
+			os.Exit(1) // Not finished.
+		case <-time.After(time.Second):
+			log.Infof("timeout, exiting.")
+			os.Exit(1) // Not finished.
+		case <-readyChan:
+			break // Safe to proceed.
+		}
+	}
+
+	// Collect all errors.
+	errorCount := 0
+	if heapErr != nil {
+		errorCount++
+		log.Infof("error collecting heap profile: %v", heapErr)
+		os.Remove(heapFile.Name())
+	}
+	if cpuErr != nil {
+		errorCount++
+		log.Infof("error collecting cpu profile: %v", cpuErr)
+		os.Remove(cpuFile.Name())
+	}
+	if traceErr != nil {
+		errorCount++
+		log.Infof("error collecting trace profile: %v", traceErr)
+		os.Remove(traceFile.Name())
+	}
+	if blockErr != nil {
+		errorCount++
+		log.Infof("error collecting block profile: %v", blockErr)
+		os.Remove(blockFile.Name())
+	}
+	if mutexErr != nil {
+		errorCount++
+		log.Infof("error collecting mutex profile: %v", mutexErr)
+		os.Remove(mutexFile.Name())
+	}
+
+	if errorCount > 0 {
+		return subcommands.ExitFailure
 	}
 
 	return subcommands.ExitSuccess

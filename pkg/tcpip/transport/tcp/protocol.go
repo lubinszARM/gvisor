@@ -222,7 +222,6 @@ func replyWithReset(stack *stack.Stack, s *segment, tos, ttl uint8) *tcpip.Error
 		return err
 	}
 	defer route.Release()
-	route.ResolveWith(s.remoteLinkAddr)
 
 	// Get the seqnum from the packet if the ack flag is set.
 	seq := seqnum.Value(0)
@@ -405,7 +404,7 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) *tcpip.E
 
 	case *tcpip.TCPRecovery:
 		p.mu.RLock()
-		*v = tcpip.TCPRecovery(p.recovery)
+		*v = p.recovery
 		p.mu.RUnlock()
 		return nil
 
@@ -543,7 +542,8 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 		minRTO:                     MinRTO,
 		maxRTO:                     MaxRTO,
 		maxRetries:                 MaxRetries,
-		recovery:                   tcpip.TCPRACKLossDetection,
+		// TODO(gvisor.dev/issue/5243): Set recovery to tcpip.TCPRACKLossDetection.
+		recovery: 0,
 	}
 	p.dispatcher.init(runtime.GOMAXPROCS(0))
 	return &p

@@ -75,12 +75,14 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/specutils/seccomp"
 
-	// Include supported socket providers.
+	// Top-level inet providers.
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
+
+	// Include other supported socket providers.
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 )
 
@@ -440,6 +442,10 @@ func createProcessArgs(id string, spec *specs.Spec, creds *auth.Credentials, k *
 	if err != nil {
 		return kernel.CreateProcessArgs{}, fmt.Errorf("creating limits: %v", err)
 	}
+	env, err := specutils.ResolveEnvs(spec.Process.Env)
+	if err != nil {
+		return kernel.CreateProcessArgs{}, fmt.Errorf("resolving env: %w", err)
+	}
 
 	wd := spec.Process.Cwd
 	if wd == "" {
@@ -449,7 +455,7 @@ func createProcessArgs(id string, spec *specs.Spec, creds *auth.Credentials, k *
 	// Create the process arguments.
 	procArgs := kernel.CreateProcessArgs{
 		Argv:                    spec.Process.Args,
-		Envv:                    spec.Process.Env,
+		Envv:                    env,
 		WorkingDirectory:        wd,
 		Credentials:             creds,
 		Umask:                   0022,
@@ -598,7 +604,6 @@ func (l *Loader) run() error {
 		if err != nil {
 			return err
 		}
-
 	}
 
 	ep.tg = l.k.GlobalInit()
@@ -934,6 +939,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		}
 	}
 
+	args.Envv, err = specutils.ResolveEnvs(args.Envv)
+	if err != nil {
+		return 0, fmt.Errorf("resolving env: %w", err)
+	}
+
 	// Add the HOME environment variable if it is not already set.
 	if kernel.VFS2Enabled {
 		root := args.MountNamespaceVFS2.Root()
@@ -1045,9 +1055,10 @@ func (l *Loader) WaitExit() kernel.ExitStatus {
 	// Wait for container.
 	l.k.WaitExited()
 
-	// Cleanup
+	// Stop the control server.
 	l.ctrl.stop()
 
+	// Check all references.
 	refs.OnExit()
 
 	return l.k.GlobalInit().ExitStatus()

@@ -104,13 +104,11 @@ const (
 
 // Profiling related commands (see pprof.go for more details).
 const (
-	StartCPUProfile = "Profile.StartCPUProfile"
-	StopCPUProfile  = "Profile.StopCPUProfile"
-	HeapProfile     = "Profile.HeapProfile"
-	BlockProfile    = "Profile.BlockProfile"
-	MutexProfile    = "Profile.MutexProfile"
-	StartTrace      = "Profile.StartTrace"
-	StopTrace       = "Profile.StopTrace"
+	CPUProfile   = "Profile.CPU"
+	HeapProfile  = "Profile.Heap"
+	BlockProfile = "Profile.Block"
+	MutexProfile = "Profile.Mutex"
+	Trace        = "Profile.Trace"
 )
 
 // Logging related commands (see logging.go for more details).
@@ -131,9 +129,6 @@ type controller struct {
 
 	// manager holds the containerManager methods.
 	manager *containerManager
-
-	// pprop holds the profile instance if enabled. It may be nil.
-	pprof *control.Profile
 }
 
 // newController creates a new controller. The caller must call
@@ -164,19 +159,14 @@ func newController(fd int, l *Loader) (*controller, error) {
 	ctrl.srv.Register(&control.Logging{})
 
 	if l.root.conf.ProfileEnable {
-		ctrl.pprof = &control.Profile{Kernel: l.k}
-		ctrl.srv.Register(ctrl.pprof)
+		ctrl.srv.Register(control.NewProfile(l.k))
 	}
 
 	return ctrl, nil
 }
 
 func (c *controller) stop() {
-	if c.pprof != nil {
-		// These are noop if there is nothing being profiled.
-		_ = c.pprof.StopCPUProfile(nil, nil)
-		_ = c.pprof.StopTrace(nil, nil)
-	}
+	c.srv.Stop()
 }
 
 // containerManager manages sandbox containers.

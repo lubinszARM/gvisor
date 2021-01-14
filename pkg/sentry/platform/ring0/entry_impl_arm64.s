@@ -3,71 +3,90 @@
 // Automatically generated, do not edit.
 
 // CPU offsets.
-#define CPU_REGISTERS        0x28
-#define CPU_ERROR_CODE       0x10
-#define CPU_ERROR_TYPE       0x18
-#define CPU_ENTRY            0x20
-
-// CPU entry offsets.
-#define ENTRY_SCRATCH0       0x100
-#define ENTRY_STACK_TOP      0x108
-#define ENTRY_CPU_SELF       0x110
-#define ENTRY_KERNEL_CR3     0x118
+#define CPU_SELF             0x00
+#define CPU_REGISTERS        0x258
+#define CPU_STACK_TOP        0x210
+#define CPU_ERROR_CODE       0x210
+#define CPU_ERROR_TYPE       0x218
+#define CPU_FAULT_ADDR       0x220
+#define CPU_TTBR0_KVM	     0x228
+#define CPU_TTBR0_APP        0x230
+#define CPU_VECTOR_CODE      0x238
+#define CPU_APP_ADDR         0x240
+#define CPU_LAZY_VFP         0x248
+#define CPU_APP_ASID         0x250
 
 // Bits.
-#define _RFLAGS_IF           0x200
-#define _RFLAGS_IOPL0         0x1000
-#define _KERNEL_FLAGS        0x02
+#define _KERNEL_FLAGS        0x3c5
 
 // Vectors.
-#define DivideByZero               0x00
-#define Debug                      0x01
-#define NMI                        0x02
-#define Breakpoint                 0x03
-#define Overflow                   0x04
-#define BoundRangeExceeded         0x05
-#define InvalidOpcode              0x06
-#define DeviceNotAvailable         0x07
-#define DoubleFault                0x08
-#define CoprocessorSegmentOverrun  0x09
-#define InvalidTSS                 0x0a
-#define SegmentNotPresent          0x0b
-#define StackSegmentFault          0x0c
-#define GeneralProtectionFault     0x0d
-#define PageFault                  0x0e
-#define X87FloatingPointException  0x10
-#define AlignmentCheck             0x11
-#define MachineCheck               0x12
-#define SIMDFloatingPointException 0x13
-#define VirtualizationException    0x14
-#define SecurityException          0x1e
-#define SyscallInt80               0x80
-#define Syscall                    0x100
+#define El1Sync 0x04
+#define El1Irq 0x05
+#define El1Fiq 0x06
+#define El1Err 0x07
+#define El0Sync 0x08
+#define El0Irq 0x09
+#define El0Fiq 0x0a
+#define El0Err 0x0b
+#define El1SyncDa 0x10
+#define El1SyncIa 0x11
+#define El1SyncSpPc 0x12
+#define El1SyncUndef 0x13
+#define El1SyncDbg 0x14
+#define El1SyncInv 0x15
+#define El0SyncSVC 0x16
+#define El0SyncDa 0x17
+#define El0SyncIa 0x18
+#define El0SyncFpsimdAcc 0x19
+#define El0SyncSveAcc 0x1a
+#define El0SyncFpsimdExc 0x1b
+#define El0SyncSys 0x1c
+#define El0SyncSpPc 0x1d
+#define El0SyncUndef 0x1e
+#define El0SyncDbg 0x1f
+#define El0SyncWfx 0x20
+#define El0SyncInv 0x21
+#define El0ErrNMI 0x22
+#define PageFault 0x17
+#define Syscall 0x16
+#define VirtualizationException 0x23
 
 // Ptrace registers.
-#define PTRACE_R15      0x00
-#define PTRACE_R14      0x08
-#define PTRACE_R13      0x10
-#define PTRACE_R12      0x18
-#define PTRACE_RBP      0x20
-#define PTRACE_RBX      0x28
-#define PTRACE_R11      0x30
-#define PTRACE_R10      0x38
-#define PTRACE_R9       0x40
-#define PTRACE_R8       0x48
-#define PTRACE_RAX      0x50
-#define PTRACE_RCX      0x58
-#define PTRACE_RDX      0x60
-#define PTRACE_RSI      0x68
-#define PTRACE_RDI      0x70
-#define PTRACE_ORIGRAX  0x78
-#define PTRACE_RIP      0x80
-#define PTRACE_CS       0x88
-#define PTRACE_FLAGS    0x90
-#define PTRACE_RSP      0x98
-#define PTRACE_SS       0xa0
-#define PTRACE_FS       0xa8
-#define PTRACE_GS       0xb0
+#define PTRACE_R0       0x00
+#define PTRACE_R1       0x08
+#define PTRACE_R2       0x10
+#define PTRACE_R3       0x18
+#define PTRACE_R4       0x20
+#define PTRACE_R5       0x28
+#define PTRACE_R6       0x30
+#define PTRACE_R7       0x38
+#define PTRACE_R8       0x40
+#define PTRACE_R9       0x48
+#define PTRACE_R10      0x50
+#define PTRACE_R11      0x58
+#define PTRACE_R12      0x60
+#define PTRACE_R13      0x68
+#define PTRACE_R14      0x70
+#define PTRACE_R15      0x78
+#define PTRACE_R16      0x80
+#define PTRACE_R17      0x88
+#define PTRACE_R18      0x90
+#define PTRACE_R19      0x98
+#define PTRACE_R20      0xa0
+#define PTRACE_R21      0xa8
+#define PTRACE_R22      0xb0
+#define PTRACE_R23      0xb8
+#define PTRACE_R24      0xc0
+#define PTRACE_R25      0xc8
+#define PTRACE_R26      0xd0
+#define PTRACE_R27      0xd8
+#define PTRACE_R28      0xe0
+#define PTRACE_R29      0xe8
+#define PTRACE_R30      0xf0
+#define PTRACE_SP       0xf8
+#define PTRACE_PC       0x100
+#define PTRACE_PSTATE   0x108
+#define PTRACE_TLS      0x110
 // Copyright 2019 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -341,24 +360,20 @@
 	WORD $0xd538d092;   //MRS   TPIDR_EL1, R18
 
 // SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
-#define SWITCH_TO_APP_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD CPU_APP_ASID(from), R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \ // set the ASID in TTBR1_EL1 (since TCR.A1 is set)
-	ISB $15; \
-	MOVD CPU_TTBR0_APP(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+#define SWITCH_TO_APP_PAGETABLE() \
+	MOVD CPU_APP_ASID(RSV_REG), RSV_REG_APP; \
+	MOVD CPU_TTBR0_APP(RSV_REG), RSV_REG; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15;
 
 // SWITCH_TO_KVM_PAGETABLE sets the kvm pagetable.
-#define SWITCH_TO_KVM_PAGETABLE(from) \
-	MRS TTBR1_EL1, R0; \
-	MOVD $1, R1; \
-	BFI $48, R1, $16, R0; \
-	MSR R0, TTBR1_EL1; \
-	ISB $15; \
-	MOVD CPU_TTBR0_KVM(from), RSV_REG; \
-	MSR RSV_REG, TTBR0_EL1;
+#define SWITCH_TO_KVM_PAGETABLE() \
+	MOVD CPU_TTBR0_KVM(RSV_REG), RSV_REG; \
+	MOVD $1, RSV_REG_APP; \
+	BFI $48, RSV_REG_APP, $16, RSV_REG; \
+	MSR RSV_REG, TTBR0_EL1; \
+	ISB $15;
 
 TEXT ·EnableVFP(SB),NOSPLIT,$0
 	MOVD $FPEN_ENABLE, R0
@@ -566,7 +581,7 @@ do_exit_to_el0:
 
 	WORD $0xd538d092    //MRS   TPIDR_EL1, R18
 
-	SWITCH_TO_APP_PAGETABLE(RSV_REG)
+	SWITCH_TO_APP_PAGETABLE()
 
 	LDP 16*1(RSP), (R0, R1)
 	LDP 16*0(RSP), (RSV_REG, RSV_REG_APP)
@@ -591,10 +606,10 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R1
 	MOVD R1, RSP
 
-	SWITCH_TO_KVM_PAGETABLE(RSV_REG)
+	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
+	SWITCH_TO_KVM_PAGETABLE()
 	MRS TPIDR_EL1, RSV_REG
 
-	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
 	MOVD CPU_REGISTERS+PTRACE_R9(RSV_REG), RSV_REG_APP
 
 	ERET()
@@ -602,8 +617,16 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 // Start is the CPU entrypoint.
 TEXT ·Start(SB),NOSPLIT,$0
 	// Init.
-	MOVD $SCTLR_EL1_DEFAULT, R1
-	MSR R1, SCTLR_EL1
+	WORD $0xd508871f    // __tlbi(vmalle1)
+	DSB $7          // dsb(nsh)
+
+	MOVD $1<<12, R1         // Reset mdscr_el1 and disable
+	MSR R1, MDSCR_EL1       // access to the DCC from EL0
+	ISB $15
+
+	MRS TTBR1_EL1, R1
+	MSR R1, TTBR0_EL1
+	ISB $15
 
 	MOVD $CNTKCTL_EL1_DEFAULT, R1
 	MSR R1, CNTKCTL_EL1
@@ -611,6 +634,15 @@ TEXT ·Start(SB),NOSPLIT,$0
 	MOVD R8, RSV_REG
 	ORR $0xffff000000000000, RSV_REG, RSV_REG
 	WORD $0xd518d092        //MSR R18, TPIDR_EL1
+
+	// Init.
+	MOVD $SCTLR_EL1_DEFAULT, R1 // re-enable the mmu.
+	MSR R1, SCTLR_EL1
+	ISB $15
+	WORD $0xd508751f // ic iallu
+
+	DSB $7          // dsb(nsh)
+	ISB $15
 
 	B ·kernelExitToEl1(SB)
 
@@ -633,26 +665,26 @@ TEXT ·El1_error_invalid(SB),NOSPLIT,$0
 // El1_sync is the handler for El1_sync.
 TEXT ·El1_sync(SB),NOSPLIT,$0
 	KERNEL_ENTRY_FROM_EL1
-	WORD $0xd5385219        // MRS ESR_EL1, R25
-	LSR  $ESR_ELx_EC_SHIFT, R25, R24
+	MRS ESR_EL1, R25                  // read the syndrome register
+	LSR  $ESR_ELx_EC_SHIFT, R25, R24  // exception class
 	CMP $ESR_ELx_EC_DABT_CUR, R24
-	BEQ el1_da
+	BEQ el1_da                        // data abort in EL1
 	CMP $ESR_ELx_EC_IABT_CUR, R24
-	BEQ el1_ia
-	CMP $ESR_ELx_EC_SYS64, R24
-	BEQ el1_undef
+	BEQ el1_ia                        // instruction abort in EL1
 	CMP $ESR_ELx_EC_SP_ALIGN, R24
-	BEQ el1_sp_pc
+	BEQ el1_sp_pc                     // stack alignment exception
 	CMP $ESR_ELx_EC_PC_ALIGN, R24
-	BEQ el1_sp_pc
+	BEQ el1_sp_pc                     // pc alignment exception
 	CMP $ESR_ELx_EC_UNKNOWN, R24
-	BEQ el1_undef
+	BEQ el1_undef                     // unknown exception in EL1
 	CMP $ESR_ELx_EC_SVC64, R24
-	BEQ el1_svc
+	BEQ el1_svc                       // SVC in 64-bit state
 	CMP $ESR_ELx_EC_BREAKPT_CUR, R24
-	BGE el1_dbg
+	BEQ el1_dbg                       // debug exception in EL1
 	CMP $ESR_ELx_EC_FP_ASIMD, R24
-	BEQ el1_fpsimd_acc
+	BEQ el1_fpsimd_acc                // FP/ASIMD access
+	CMP $ESR_ELx_EC_SVE, R24
+	BEQ el1_sve_acc                   // SVE access
 	B el1_invalid
 
 el1_da:
@@ -668,6 +700,7 @@ el1_svc:
 el1_dbg:
 	EXCEPTION_EL1(El1SyncDbg)
 el1_fpsimd_acc:
+el1_sve_acc:
 	VFP_ENABLE
 	B ·kernelExitToEl1(SB)  // Resume.
 el1_invalid:
@@ -688,28 +721,32 @@ TEXT ·El1_error(SB),NOSPLIT,$0
 // El0_sync is the handler for El0_sync.
 TEXT ·El0_sync(SB),NOSPLIT,$0
 	KERNEL_ENTRY_FROM_EL0
-	WORD $0xd5385219	// MRS ESR_EL1, R25
-	LSR  $ESR_ELx_EC_SHIFT, R25, R24
+	MRS ESR_EL1, R25                  // read the syndrome register
+	LSR  $ESR_ELx_EC_SHIFT, R25, R24  // exception class
 	CMP $ESR_ELx_EC_SVC64, R24
-	BEQ el0_svc
+	BEQ el0_svc                       // SVC in 64-bit state
 	CMP $ESR_ELx_EC_DABT_LOW, R24
-	BEQ el0_da
+	BEQ el0_da                        // data abort in EL0
 	CMP $ESR_ELx_EC_IABT_LOW, R24
-	BEQ el0_ia
+	BEQ el0_ia                        // instruction abort in EL0
 	CMP $ESR_ELx_EC_FP_ASIMD, R24
-	BEQ el0_fpsimd_acc
+	BEQ el0_fpsimd_acc                // FP/ASIMD access
 	CMP $ESR_ELx_EC_SVE, R24
-	BEQ el0_sve_acc
+	BEQ el0_sve_acc                   // SVE access
 	CMP $ESR_ELx_EC_FP_EXC64, R24
-	BEQ el0_fpsimd_exc
+	BEQ el0_fpsimd_exc                // FP/ASIMD exception
 	CMP $ESR_ELx_EC_SP_ALIGN, R24
-	BEQ el0_sp_pc
+	BEQ el0_sp_pc                     // stack alignment exception
 	CMP $ESR_ELx_EC_PC_ALIGN, R24
-	BEQ el0_sp_pc
+	BEQ el0_sp_pc                     // pc alignment exception
 	CMP $ESR_ELx_EC_UNKNOWN, R24
-	BEQ el0_undef
+	BEQ el0_undef                     // unknown exception in EL0
 	CMP $ESR_ELx_EC_BREAKPT_LOW, R24
-	BGE el0_dbg
+	BEQ el0_dbg                       // debug exception in EL0
+	CMP $ESR_ELx_EC_SYS64, R24
+	BEQ el0_sys                       // configurable trap
+	CMP $ESR_ELx_EC_WFx, R24
+	BEQ el0_wfx                       // WFX trap
 	B   el0_invalid
 
 el0_svc:
@@ -740,6 +777,10 @@ el0_undef:
 	EXCEPTION_EL0(El0SyncUndef)
 el0_dbg:
 	EXCEPTION_EL0(El0SyncDbg)
+el0_sys:
+	EXCEPTION_EL0(El0SyncSys)
+el0_wfx:
+	EXCEPTION_EL0(El0SyncWfx)
 el0_invalid:
 	EXCEPTION_EL0(El0SyncInv)
 
@@ -756,36 +797,11 @@ TEXT ·El0_error(SB),NOSPLIT,$0
 	CMP $ESR_ELx_SERR_NMI, R24
 	BEQ el0_nmi
 	B el0_bounce
+
 el0_nmi:
-        WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-        WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-        MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-        MOVD $1, R3
-        MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-        MOVD $El0ErrNMI, R3
-        MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-        MRS ESR_EL1, R3
-        MOVD R3, CPU_ERROR_CODE(RSV_REG)
-
-        B ·kernelExitToEl1(SB)
-
+	EXCEPTION_EL0(El0ErrNMI)
 el0_bounce:
-	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-	WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-	MOVD $1, R3
-	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-	MOVD $VirtualizationException, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_EL0(VirtualizationException)
 
 TEXT ·El0_sync_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)

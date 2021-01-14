@@ -28,22 +28,20 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
 	"reflect"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/amutex"
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
@@ -308,21 +306,8 @@ type socketOpsCommon struct {
 	skType   linux.SockType
 	protocol int
 
-	// readViewHasData is 1 iff readView has data to be read, 0 otherwise.
-	// Must be accessed using atomic operations. It must only be written
-	// with readMu held but can be read without holding readMu. The latter
-	// is required to avoid deadlocks in epoll Readiness checks.
-	readViewHasData uint32
-
 	// readMu protects access to the below fields.
 	readMu sync.Mutex `state:"nosave"`
-	// readView contains the remaining payload from the last packet.
-	readView buffer.View
-	// readCM holds control message information for the last packet read
-	// from Endpoint.
-	readCM         socket.IPControlMessages
-	sender         tcpip.FullAddress
-	linkPacketInfo tcpip.LinkPacketInfo
 
 	// sockOptTimestamp corresponds to SO_TIMESTAMP. When true, timestamps
 	// of returned messages can be returned via control messages. When
@@ -336,8 +321,8 @@ type socketOpsCommon struct {
 	// valid when timestampValid is true. It is protected by readMu.
 	timestampNS int64
 
-	// sockOptInq corresponds to TCP_INQ. It is implemented at this level
-	// because it takes into account data from readView.
+	// TODO(b/153685824): Move this to SocketOptions.
+	// sockOptInq corresponds to TCP_INQ.
 	sockOptInq bool
 }
 
@@ -375,43 +360,6 @@ func bytesToIPAddress(addr []byte) tcpip.Address {
 
 func (s *socketOpsCommon) isPacketBased() bool {
 	return s.skType == linux.SOCK_DGRAM || s.skType == linux.SOCK_SEQPACKET || s.skType == linux.SOCK_RDM || s.skType == linux.SOCK_RAW
-}
-
-// fetchReadView updates the readView field of the socket if it's currently
-// empty. It assumes that the socket is locked.
-//
-// Precondition: s.readMu must be held.
-func (s *socketOpsCommon) fetchReadView() *syserr.Error {
-	if len(s.readView) > 0 {
-		return nil
-	}
-	s.readView = nil
-	s.sender = tcpip.FullAddress{}
-	s.linkPacketInfo = tcpip.LinkPacketInfo{}
-
-	var v buffer.View
-	var cms tcpip.ControlMessages
-	var err *tcpip.Error
-
-	switch e := s.Endpoint.(type) {
-	// The ordering of these interfaces matters. The most specific
-	// interfaces must be specified before the more generic Endpoint
-	// interface.
-	case tcpip.PacketEndpoint:
-		v, cms, err = e.ReadPacket(&s.sender, &s.linkPacketInfo)
-	case tcpip.Endpoint:
-		v, cms, err = e.Read(&s.sender)
-	}
-	if err != nil {
-		atomic.StoreUint32(&s.readViewHasData, 0)
-		return syserr.TranslateNetstackError(err)
-	}
-
-	s.readView = v
-	s.readCM = socket.NewIPControlMessages(s.family, cms)
-	atomic.StoreUint32(&s.readViewHasData, 1)
-
-	return nil
 }
 
 // Release implements fs.FileOperations.Release.
@@ -460,38 +408,16 @@ func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 // WriteTo implements fs.FileOperations.WriteTo.
 func (s *SocketOperations) WriteTo(ctx context.Context, _ *fs.File, dst io.Writer, count int64, dup bool) (int64, error) {
 	s.readMu.Lock()
+	defer s.readMu.Unlock()
 
-	// Copy as much data as possible.
-	done := int64(0)
-	for count > 0 {
-		// This may return a blocking error.
-		if err := s.fetchReadView(); err != nil {
-			s.readMu.Unlock()
-			return done, err.ToError()
-		}
-
-		// Write to the underlying file.
-		n, err := dst.Write(s.readView)
-		done += int64(n)
-		count -= int64(n)
-		if dup {
-			// That's all we support for dup. This is generally
-			// supported by any Linux system calls, but the
-			// expectation is that now a caller will call read to
-			// actually remove these bytes from the socket.
-			break
-		}
-
-		// Drop that part of the view.
-		s.readView.TrimFront(n)
-		if err != nil {
-			s.readMu.Unlock()
-			return done, err
-		}
+	// This may return a blocking error.
+	res, err := s.Endpoint.Read(dst, int(count), tcpip.ReadOptions{
+		Peek: dup,
+	})
+	if err != nil {
+		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
-
-	s.readMu.Unlock()
-	return done, nil
+	return int64(res.Count), nil
 }
 
 // ioSequencePayload implements tcpip.Payload.
@@ -532,18 +458,10 @@ func (i *ioSequencePayload) DropFirst(n int) {
 // Write implements fs.FileOperations.Write.
 func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
 	f := &ioSequencePayload{ctx: ctx, src: src}
-	n, resCh, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
+	n, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
 	if err == tcpip.ErrWouldBlock {
 		return 0, syserror.ErrWouldBlock
 	}
-
-	if resCh != nil {
-		if err := amutex.Block(ctx, resCh); err != nil {
-			return 0, err
-		}
-		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
-	}
-
 	if err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
@@ -599,23 +517,11 @@ func (r *readerPayload) Payload(size int) ([]byte, *tcpip.Error) {
 // ReadFrom implements fs.FileOperations.ReadFrom.
 func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader, count int64) (int64, error) {
 	f := &readerPayload{ctx: ctx, r: r, count: count}
-	n, resCh, err := s.Endpoint.Write(f, tcpip.WriteOptions{
+	n, err := s.Endpoint.Write(f, tcpip.WriteOptions{
 		// Reads may be destructive but should be very fast,
 		// so we can't release the lock while copying data.
 		Atomic: true,
 	})
-	if err == tcpip.ErrWouldBlock {
-		return 0, syserror.ErrWouldBlock
-	}
-
-	if resCh != nil {
-		if err := amutex.Block(ctx, resCh); err != nil {
-			return 0, err
-		}
-		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{
-			Atomic: true, // See above.
-		})
-	}
 	if err == tcpip.ErrWouldBlock {
 		return n, syserror.ErrWouldBlock
 	} else if err != nil {
@@ -627,17 +533,7 @@ func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader
 
 // Readiness returns a mask of ready events for socket s.
 func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
-	r := s.Endpoint.Readiness(mask)
-
-	// Check our cached value iff the caller asked for readability and the
-	// endpoint itself is currently not readable.
-	if (mask & ^r & waiter.EventIn) != 0 {
-		if atomic.LoadUint32(&s.readViewHasData) == 1 {
-			r |= waiter.EventIn
-		}
-	}
-
-	return r
+	return s.Endpoint.Readiness(mask)
 }
 
 func (s *socketOpsCommon) checkFamily(family uint16, exact bool) *syserr.Error {
@@ -2091,9 +1987,29 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		ep.SocketOptions().SetV6Only(v != 0)
 		return nil
 
-	case linux.IPV6_ADD_MEMBERSHIP,
-		linux.IPV6_DROP_MEMBERSHIP,
-		linux.IPV6_IPSEC_POLICY,
+	case linux.IPV6_ADD_MEMBERSHIP:
+		req, err := copyInMulticastV6Request(optVal)
+		if err != nil {
+			return err
+		}
+
+		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.AddMembershipOption{
+			NIC:           tcpip.NICID(req.InterfaceIndex),
+			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+		}))
+
+	case linux.IPV6_DROP_MEMBERSHIP:
+		req, err := copyInMulticastV6Request(optVal)
+		if err != nil {
+			return err
+		}
+
+		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.RemoveMembershipOption{
+			NIC:           tcpip.NICID(req.InterfaceIndex),
+			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+		}))
+
+	case linux.IPV6_IPSEC_POLICY,
 		linux.IPV6_JOIN_ANYCAST,
 		linux.IPV6_LEAVE_ANYCAST,
 		// TODO(b/148887420): Add support for IPV6_PKTINFO.
@@ -2181,6 +2097,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 var (
 	inetMulticastRequestSize        = int(binary.Size(linux.InetMulticastRequest{}))
 	inetMulticastRequestWithNICSize = int(binary.Size(linux.InetMulticastRequestWithNIC{}))
+	inet6MulticastRequestSize       = int(binary.Size(linux.Inet6MulticastRequest{}))
 )
 
 // copyInMulticastRequest copies in a variable-size multicast request. The
@@ -2211,6 +2128,16 @@ func copyInMulticastRequest(optVal []byte, allowAddr bool) (linux.InetMulticastR
 
 	var req linux.InetMulticastRequestWithNIC
 	binary.Unmarshal(optVal[:inetMulticastRequestSize], usermem.ByteOrder, &req.InetMulticastRequest)
+	return req, nil
+}
+
+func copyInMulticastV6Request(optVal []byte) (linux.Inet6MulticastRequest, *syserr.Error) {
+	if len(optVal) < inet6MulticastRequestSize {
+		return linux.Inet6MulticastRequest{}, syserr.ErrInvalidArgument
+	}
+
+	var req linux.Inet6MulticastRequest
+	binary.Unmarshal(optVal[:inet6MulticastRequestSize], usermem.ByteOrder, &req)
 	return req, nil
 }
 
@@ -2587,68 +2514,6 @@ func (s *socketOpsCommon) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *
 	return a, l, nil
 }
 
-// coalescingRead is the fast path for non-blocking, non-peek, stream-based
-// case. It coalesces as many packets as possible before returning to the
-// caller.
-//
-// Precondition: s.readMu must be locked.
-func (s *socketOpsCommon) coalescingRead(ctx context.Context, dst usermem.IOSequence, discard bool) (int, *syserr.Error) {
-	var err *syserr.Error
-	var copied int
-
-	// Copy as many views as possible into the user-provided buffer.
-	for {
-		// Always do at least one fetchReadView, even if the number of bytes to
-		// read is 0.
-		err = s.fetchReadView()
-		if err != nil || len(s.readView) == 0 {
-			break
-		}
-		if dst.NumBytes() == 0 {
-			break
-		}
-
-		var n int
-		var e error
-		if discard {
-			n = len(s.readView)
-			if int64(n) > dst.NumBytes() {
-				n = int(dst.NumBytes())
-			}
-		} else {
-			n, e = dst.CopyOut(ctx, s.readView)
-			// Set the control message, even if 0 bytes were read.
-			if e == nil {
-				s.updateTimestamp()
-			}
-		}
-		copied += n
-		s.readView.TrimFront(n)
-
-		dst = dst.DropFirst(n)
-		if e != nil {
-			err = syserr.FromError(e)
-			break
-		}
-		// If we are done reading requested data then stop.
-		if dst.NumBytes() == 0 {
-			break
-		}
-	}
-
-	if len(s.readView) == 0 {
-		atomic.StoreUint32(&s.readViewHasData, 0)
-	}
-
-	// If we managed to copy something, we must deliver it.
-	if copied > 0 {
-		s.Endpoint.ModerateRecvBuf(copied)
-		return copied, nil
-	}
-
-	return 0, err
-}
-
 func (s *socketOpsCommon) fillCmsgInq(cmsg *socket.ControlMessages) {
 	if !s.sockOptInq {
 		return
@@ -2658,7 +2523,7 @@ func (s *socketOpsCommon) fillCmsgInq(cmsg *socket.ControlMessages) {
 		return
 	}
 	cmsg.IP.HasInq = true
-	cmsg.IP.Inq = int32(len(s.readView) + rcvBufUsed)
+	cmsg.IP.Inq = int32(rcvBufUsed)
 }
 
 func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
@@ -2684,132 +2549,102 @@ func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek, trunc, senderRequested bool) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
 	isPacket := s.isPacketBased()
 
-	// Fast path for regular reads from stream (e.g., TCP) endpoints. Note
-	// that senderRequested is ignored for stream sockets.
-	if !peek && !isPacket {
-		// TCP sockets discard the data if MSG_TRUNC is set.
-		//
-		// This behavior is documented in man 7 tcp:
-		// Since version 2.4, Linux supports the use of MSG_TRUNC in the flags
-		// argument of recv(2) (and recvmsg(2)). This flag causes the received
-		// bytes of data to be discarded, rather than passed back in a
-		// caller-supplied  buffer.
-		s.readMu.Lock()
-		n, err := s.coalescingRead(ctx, dst, trunc)
-		cmsg := s.controlMessages()
-		s.fillCmsgInq(&cmsg)
-		s.readMu.Unlock()
-		return n, 0, nil, 0, cmsg, err
+	readOptions := tcpip.ReadOptions{
+		Peek:               peek,
+		NeedRemoteAddr:     senderRequested,
+		NeedLinkPacketInfo: isPacket,
+	}
+
+	// TCP sockets discard the data if MSG_TRUNC is set.
+	//
+	// This behavior is documented in man 7 tcp:
+	// Since version 2.4, Linux supports the use of MSG_TRUNC in the flags
+	// argument of recv(2) (and recvmsg(2)). This flag causes the received
+	// bytes of data to be discarded, rather than passed back in a
+	// caller-supplied  buffer.
+	var w io.Writer
+	if !isPacket && trunc {
+		w = ioutil.Discard
+	} else {
+		w = dst.Writer(ctx)
 	}
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	if err := s.fetchReadView(); err != nil {
-		return 0, 0, nil, 0, socket.ControlMessages{}, err
+	res, err := s.Endpoint.Read(w, int(dst.NumBytes()), readOptions)
+	if err != nil {
+		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
 	}
-
-	if !isPacket && peek && trunc {
-		// MSG_TRUNC with MSG_PEEK on a TCP socket returns the
-		// amount that could be read.
-		rql, err := s.Endpoint.GetSockOptInt(tcpip.ReceiveQueueSizeOption)
-		if err != nil {
-			return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
-		}
-		available := len(s.readView) + int(rql)
-		bufLen := int(dst.NumBytes())
-		if available < bufLen {
-			return available, 0, nil, 0, socket.ControlMessages{}, nil
-		}
-		return bufLen, 0, nil, 0, socket.ControlMessages{}, nil
-	}
-
-	n, err := dst.CopyOut(ctx, s.readView)
 	// Set the control message, even if 0 bytes were read.
-	if err == nil {
-		s.updateTimestamp()
-	}
-	var addr linux.SockAddr
-	var addrLen uint32
-	if isPacket && senderRequested {
-		addr, addrLen = socket.ConvertAddress(s.family, s.sender)
-		switch v := addr.(type) {
-		case *linux.SockAddrLink:
-			v.Protocol = socket.Htons(uint16(s.linkPacketInfo.Protocol))
-			v.PacketType = toLinuxPacketType(s.linkPacketInfo.PktType)
+	s.updateTimestamp(res.ControlMessages)
+
+	if isPacket {
+		var addr linux.SockAddr
+		var addrLen uint32
+		if senderRequested {
+			addr, addrLen = socket.ConvertAddress(s.family, res.RemoteAddr)
+			switch v := addr.(type) {
+			case *linux.SockAddrLink:
+				v.Protocol = socket.Htons(uint16(res.LinkPacketInfo.Protocol))
+				v.PacketType = toLinuxPacketType(res.LinkPacketInfo.PktType)
+			}
 		}
+
+		msgLen := res.Count
+		if trunc {
+			msgLen = res.Total
+		}
+
+		var flags int
+		if res.Total > res.Count {
+			flags |= linux.MSG_TRUNC
+		}
+
+		return msgLen, flags, addr, addrLen, s.controlMessages(res.ControlMessages), nil
 	}
 
 	if peek {
-		if l := len(s.readView); trunc && l > n {
-			// isPacket must be true.
-			return l, linux.MSG_TRUNC, addr, addrLen, s.controlMessages(), syserr.FromError(err)
-		}
-
-		if isPacket || err != nil {
-			return n, 0, addr, addrLen, s.controlMessages(), syserr.FromError(err)
-		}
-
-		// We need to peek beyond the first message.
-		dst = dst.DropFirst(n)
-		num, err := dst.CopyOutFrom(ctx, safemem.FromVecReaderFunc{func(dsts [][]byte) (int64, error) {
-			n, err := s.Endpoint.Peek(dsts)
-			// TODO(b/78348848): Handle peek timestamp.
+		// MSG_TRUNC with MSG_PEEK on a TCP socket returns the
+		// amount that could be read, and does not write to buffer.
+		if trunc {
+			// TCP endpoint does not return the total bytes in buffer as numTotal.
+			// We need to query it from socket option.
+			rql, err := s.Endpoint.GetSockOptInt(tcpip.ReceiveQueueSizeOption)
 			if err != nil {
-				return int64(n), syserr.TranslateNetstackError(err).ToError()
+				return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
 			}
-			return int64(n), nil
-		}})
-		n += int(num)
-		if err == syserror.ErrWouldBlock && n > 0 {
-			// We got some data, so no need to return an error.
-			err = nil
+			msgLen := int(dst.NumBytes())
+			if msgLen > rql {
+				msgLen = rql
+			}
+			return msgLen, 0, nil, 0, socket.ControlMessages{}, nil
 		}
-		return n, 0, nil, 0, s.controlMessages(), syserr.FromError(err)
+	} else if n := res.Count; n != 0 {
+		s.Endpoint.ModerateRecvBuf(n)
 	}
 
-	var msgLen int
-	if isPacket {
-		msgLen = len(s.readView)
-		s.readView = nil
-	} else {
-		msgLen = int(n)
-		s.readView.TrimFront(int(n))
-	}
-
-	if len(s.readView) == 0 {
-		atomic.StoreUint32(&s.readViewHasData, 0)
-	}
-
-	var flags int
-	if msgLen > int(n) {
-		flags |= linux.MSG_TRUNC
-	}
-
-	if trunc {
-		n = msgLen
-	}
-
-	cmsg := s.controlMessages()
+	cmsg := s.controlMessages(res.ControlMessages)
 	s.fillCmsgInq(&cmsg)
-	return n, flags, addr, addrLen, cmsg, syserr.FromError(err)
+	return res.Count, 0, nil, 0, cmsg, syserr.TranslateNetstackError(err)
 }
 
-func (s *socketOpsCommon) controlMessages() socket.ControlMessages {
+func (s *socketOpsCommon) controlMessages(cm tcpip.ControlMessages) socket.ControlMessages {
+	readCM := socket.NewIPControlMessages(s.family, cm)
 	return socket.ControlMessages{
 		IP: socket.IPControlMessages{
-			HasTimestamp:       s.readCM.HasTimestamp && s.sockOptTimestamp,
-			Timestamp:          s.readCM.Timestamp,
-			HasInq:             s.readCM.HasInq,
-			Inq:                s.readCM.Inq,
-			HasTOS:             s.readCM.HasTOS,
-			TOS:                s.readCM.TOS,
-			HasTClass:          s.readCM.HasTClass,
-			TClass:             s.readCM.TClass,
-			HasIPPacketInfo:    s.readCM.HasIPPacketInfo,
-			PacketInfo:         s.readCM.PacketInfo,
-			OriginalDstAddress: s.readCM.OriginalDstAddress,
-			SockErr:            s.readCM.SockErr,
+			HasTimestamp:       readCM.HasTimestamp && s.sockOptTimestamp,
+			Timestamp:          readCM.Timestamp,
+			HasInq:             readCM.HasInq,
+			Inq:                readCM.Inq,
+			HasTOS:             readCM.HasTOS,
+			TOS:                readCM.TOS,
+			HasTClass:          readCM.HasTClass,
+			TClass:             readCM.TClass,
+			HasIPPacketInfo:    readCM.HasIPPacketInfo,
+			PacketInfo:         readCM.PacketInfo,
+			OriginalDstAddress: readCM.OriginalDstAddress,
+			SockErr:            readCM.SockErr,
 		},
 	}
 }
@@ -2818,11 +2653,11 @@ func (s *socketOpsCommon) controlMessages() socket.ControlMessages {
 // successfully writing packet data out to userspace.
 //
 // Precondition: s.readMu must be locked.
-func (s *socketOpsCommon) updateTimestamp() {
+func (s *socketOpsCommon) updateTimestamp(cm tcpip.ControlMessages) {
 	// Save the SIOCGSTAMP timestamp only if SO_TIMESTAMP is disabled.
 	if !s.sockOptTimestamp {
 		s.timestampValid = true
-		s.timestampNS = s.readCM.Timestamp
+		s.timestampNS = cm.Timestamp
 	}
 }
 
@@ -2980,13 +2815,7 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 	}
 
 	v := &ioSequencePayload{t, src}
-	n, resCh, err := s.Endpoint.Write(v, opts)
-	if resCh != nil {
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err)
-		}
-		n, _, err = s.Endpoint.Write(v, opts)
-	}
+	n, err := s.Endpoint.Write(v, opts)
 	dontWait := flags&linux.MSG_DONTWAIT != 0
 	if err == nil && (n >= v.src.NumBytes() || dontWait) {
 		// Complete write.
@@ -3005,7 +2834,7 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 	v.DropFirst(int(n))
 	total := n
 	for {
-		n, _, err = s.Endpoint.Write(v, opts)
+		n, err = s.Endpoint.Write(v, opts)
 		v.DropFirst(int(n))
 		total += n
 
@@ -3058,11 +2887,6 @@ func (s *socketOpsCommon) ioctl(ctx context.Context, io usermem.IO, args arch.Sy
 		if terr != nil {
 			return 0, syserr.TranslateNetstackError(terr).ToError()
 		}
-
-		// Add bytes removed from the endpoint but not yet sent to the caller.
-		s.readMu.Lock()
-		v += len(s.readView)
-		s.readMu.Unlock()
 
 		if v > math.MaxInt32 {
 			v = math.MaxInt32
