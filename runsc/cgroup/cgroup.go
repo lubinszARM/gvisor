@@ -203,6 +203,19 @@ func LoadPaths(pid string) (map[string]string, error) {
 }
 
 func loadPathsHelper(cgroup io.Reader) (map[string]string, error) {
+	// For nested containers, in /proc/self/cgroup we see paths from host,
+	// which don't exist in container, so recover the container paths here by
+	// double-checking with /proc/pid/mountinfo
+	mountinfo, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer mountinfo.Close()
+
+	return loadPathsHelperWithMountinfo(cgroup, mountinfo)
+}
+
+func loadPathsHelperWithMountinfo(cgroup, mountinfo io.Reader) (map[string]string, error) {
 	paths := make(map[string]string)
 
 	scanner := bufio.NewScanner(cgroup)
@@ -225,6 +238,31 @@ func loadPathsHelper(cgroup io.Reader) (map[string]string, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+
+	mfScanner := bufio.NewScanner(mountinfo)
+	for mfScanner.Scan() {
+		txt := mfScanner.Text()
+		fields := strings.Fields(txt)
+		if len(fields) < 9 || fields[len(fields)-3] != "cgroup" {
+			continue
+		}
+		for _, opt := range strings.Split(fields[len(fields)-1], ",") {
+			// Remove prefix for cgroups with no controller, eg. systemd.
+			opt = strings.TrimPrefix(opt, "name=")
+			if cgroupPath, ok := paths[opt]; ok {
+				root := fields[3]
+				relCgroupPath, err := filepath.Rel(root, cgroupPath)
+				if err != nil {
+					return nil, err
+				}
+				paths[opt] = relCgroupPath
+			}
+		}
+	}
+	if err := mfScanner.Err(); err != nil {
+		return nil, err
+	}
+
 	return paths, nil
 }
 
@@ -243,8 +281,13 @@ func New(spec *specs.Spec) (*Cgroup, error) {
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil, nil
 	}
+	return NewFromPath(spec.Linux.CgroupsPath)
+}
+
+// NewFromPath creates a new Cgroup instance.
+func NewFromPath(cgroupsPath string) (*Cgroup, error) {
 	var parents map[string]string
-	if !filepath.IsAbs(spec.Linux.CgroupsPath) {
+	if !filepath.IsAbs(cgroupsPath) {
 		var err error
 		parents, err = LoadPaths("self")
 		if err != nil {
@@ -253,7 +296,7 @@ func New(spec *specs.Spec) (*Cgroup, error) {
 	}
 	own := make(map[string]bool)
 	return &Cgroup{
-		Name:    spec.Linux.CgroupsPath,
+		Name:    cgroupsPath,
 		Parents: parents,
 		Own:     own,
 	}, nil
@@ -351,6 +394,9 @@ func (c *Cgroup) Join() (func(), error) {
 	undo = func() {
 		for _, path := range undoPaths {
 			log.Debugf("Restoring cgroup %q", path)
+			// Writing the value 0 to a cgroup.procs file causes
+			// the writing process to be moved to the corresponding
+			// cgroup. - cgroups(7).
 			if err := setValue(path, "cgroup.procs", "0"); err != nil {
 				log.Warningf("Error restoring cgroup %q: %v", path, err)
 			}
@@ -361,6 +407,9 @@ func (c *Cgroup) Join() (func(), error) {
 	for key, cfg := range controllers {
 		path := c.makePath(key)
 		log.Debugf("Joining cgroup %q", path)
+		// Writing the value 0 to a cgroup.procs file causes the
+		// writing process to be moved to the corresponding cgroup.
+		// - cgroups(7).
 		if err := setValue(path, "cgroup.procs", "0"); err != nil {
 			if cfg.optional && os.IsNotExist(err) {
 				continue
@@ -386,6 +435,16 @@ func (c *Cgroup) CPUQuota() (float64, error) {
 		return -1, err
 	}
 	return float64(quota) / float64(period), nil
+}
+
+// CPUUsage returns the total CPU usage of the cgroup.
+func (c *Cgroup) CPUUsage() (uint64, error) {
+	path := c.makePath("cpuacct")
+	usage, err := getValue(path, "cpuacct.usage")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(usage), 10, 64)
 }
 
 // NumCPU returns the number of CPUs configured in 'cpuset/cpuset.cpus'.

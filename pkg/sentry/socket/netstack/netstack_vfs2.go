@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
@@ -129,20 +128,20 @@ func (s *SocketVFS2) Write(ctx context.Context, src usermem.IOSequence, opts vfs
 		return 0, syserror.EOPNOTSUPP
 	}
 
-	f := &ioSequencePayload{ctx: ctx, src: src}
-	n, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
-	if err == tcpip.ErrWouldBlock {
+	r := src.Reader(ctx)
+	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
+	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		return 0, syserror.ErrWouldBlock
 	}
 	if err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
 
-	if int64(n) < src.NumBytes() {
-		return int64(n), syserror.ErrWouldBlock
+	if n < src.NumBytes() {
+		return n, syserror.ErrWouldBlock
 	}
 
-	return int64(n), nil
+	return n, nil
 }
 
 // Accept implements the linux syscall accept(2) for sockets backed by
@@ -155,7 +154,7 @@ func (s *SocketVFS2) Accept(t *kernel.Task, peerRequested bool, flags int, block
 	}
 	ep, wq, terr := s.Endpoint.Accept(peerAddr)
 	if terr != nil {
-		if terr != tcpip.ErrWouldBlock || !blocking {
+		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
 			return 0, nil, 0, syserr.TranslateNetstackError(terr)
 		}
 
@@ -261,14 +260,4 @@ func (s *SocketVFS2) SetSockOpt(t *kernel.Task, level int, name int, optVal []by
 	}
 
 	return SetSockOpt(t, s, s.Endpoint, level, name, optVal)
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (s *SocketVFS2) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return s.Locks().LockPOSIX(ctx, &s.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (s *SocketVFS2) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return s.Locks().UnlockPOSIX(ctx, &s.vfsfd, uid, start, length, whence)
 }

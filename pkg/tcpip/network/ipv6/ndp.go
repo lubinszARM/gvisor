@@ -241,7 +241,7 @@ type NDPDispatcher interface {
 	//
 	// This function is not permitted to block indefinitely. This function
 	// is also not permitted to call into the stack.
-	OnDuplicateAddressDetectionStatus(nicID tcpip.NICID, addr tcpip.Address, resolved bool, err *tcpip.Error)
+	OnDuplicateAddressDetectionStatus(nicID tcpip.NICID, addr tcpip.Address, resolved bool, err tcpip.Error)
 
 	// OnDefaultRouterDiscovered is called when a new default router is
 	// discovered. Implementations must return true if the newly discovered
@@ -614,10 +614,10 @@ type slaacPrefixState struct {
 // tentative.
 //
 // The IPv6 endpoint that ndp belongs to MUST be locked.
-func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressEndpoint stack.AddressEndpoint) *tcpip.Error {
+func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressEndpoint stack.AddressEndpoint) tcpip.Error {
 	// addr must be a valid unicast IPv6 address.
 	if !header.IsV6UnicastAddress(addr) {
-		return tcpip.ErrAddressFamilyNotSupported
+		return &tcpip.ErrAddressFamilyNotSupported{}
 	}
 
 	if addressEndpoint.GetKind() != stack.PermanentTentative {
@@ -666,7 +666,7 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 
 			dadDone := remaining == 0
 
-			var err *tcpip.Error
+			var err tcpip.Error
 			if !dadDone {
 				err = ndp.sendDADPacket(addr, addressEndpoint)
 			}
@@ -717,7 +717,7 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 // addr.
 //
 // addr must be a tentative IPv6 address on ndp's IPv6 endpoint.
-func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.AddressEndpoint) *tcpip.Error {
+func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.AddressEndpoint) tcpip.Error {
 	snmc := header.SolicitedNodeAddr(addr)
 
 	icmp := header.ICMPv6(buffer.NewView(header.ICMPv6NeighborSolicitMinimumSize))
@@ -731,17 +731,20 @@ func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.Add
 		Data:               buffer.View(icmp).ToVectorisedView(),
 	})
 
-	sent := ndp.ep.protocol.stack.Stats().ICMP.V6.PacketsSent
-	ndp.ep.addIPHeader(header.IPv6Any, snmc, pkt, stack.NetworkHeaderParams{
+	sent := ndp.ep.stats.icmp.packetsSent
+	if err := addIPHeader(header.IPv6Any, snmc, pkt, stack.NetworkHeaderParams{
 		Protocol: header.ICMPv6ProtocolNumber,
 		TTL:      header.NDPHopLimit,
-	}, nil /* extensionHeaders */)
+	}, nil /* extensionHeaders */); err != nil {
+		panic(fmt.Sprintf("failed to add IP header: %s", err))
+	}
 
 	if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(snmc), nil /* gso */, ProtocolNumber, pkt); err != nil {
-		sent.Dropped.Increment()
+		sent.dropped.Increment()
 		return err
 	}
-	sent.NeighborSolicit.Increment()
+	sent.neighborSolicit.Increment()
+
 	return nil
 }
 
@@ -1853,19 +1856,20 @@ func (ndp *ndpState) startSolicitingRouters() {
 			Data:               buffer.View(icmpData).ToVectorisedView(),
 		})
 
-		sent := ndp.ep.protocol.stack.Stats().ICMP.V6.PacketsSent
-		ndp.ep.addIPHeader(localAddr, header.IPv6AllRoutersMulticastAddress, pkt, stack.NetworkHeaderParams{
+		sent := ndp.ep.stats.icmp.packetsSent
+		if err := addIPHeader(localAddr, header.IPv6AllRoutersMulticastAddress, pkt, stack.NetworkHeaderParams{
 			Protocol: header.ICMPv6ProtocolNumber,
 			TTL:      header.NDPHopLimit,
-		}, nil /* extensionHeaders */)
-
+		}, nil /* extensionHeaders */); err != nil {
+			panic(fmt.Sprintf("failed to add IP header: %s", err))
+		}
 		if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersMulticastAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
-			sent.Dropped.Increment()
+			sent.dropped.Increment()
 			log.Printf("startSolicitingRouters: error writing NDP router solicit message on NIC(%d); err = %s", ndp.ep.nic.ID(), err)
 			// Don't send any more messages if we had an error.
 			remaining = 0
 		} else {
-			sent.RouterSolicit.Increment()
+			sent.routerSolicit.Increment()
 			remaining--
 		}
 

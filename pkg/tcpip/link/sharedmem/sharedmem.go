@@ -203,8 +203,8 @@ func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.Net
 
 // WritePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
-func (e *endpoint) WritePacket(r *stack.Route, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress(), protocol, pkt)
+func (e *endpoint) WritePacket(r stack.RouteInfo, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+	e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
 
 	views := pkt.Views()
 	// Transmit the packet.
@@ -213,14 +213,14 @@ func (e *endpoint) WritePacket(r *stack.Route, _ *stack.GSO, protocol tcpip.Netw
 	e.mu.Unlock()
 
 	if !ok {
-		return tcpip.ErrWouldBlock
+		return &tcpip.ErrWouldBlock{}
 	}
 
 	return nil
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(r *stack.Route, _ *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (*endpoint) WritePackets(stack.RouteInfo, *stack.GSO, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	panic("not implemented")
 }
 

@@ -1284,7 +1284,7 @@ func (f *Flock) MarshalBytes(dst []byte) {
     dst = dst[8:]
     usermem.ByteOrder.PutUint64(dst[:8], uint64(f.Len))
     dst = dst[8:]
-    usermem.ByteOrder.PutUint32(dst[:4], uint32(f.Pid))
+    usermem.ByteOrder.PutUint32(dst[:4], uint32(f.PID))
     dst = dst[4:]
     // Padding: dst[:sizeof(byte)*4] ~= [4]byte{0}
     dst = dst[1*(4):]
@@ -1302,7 +1302,7 @@ func (f *Flock) UnmarshalBytes(src []byte) {
     src = src[8:]
     f.Len = int64(usermem.ByteOrder.Uint64(src[:8]))
     src = src[8:]
-    f.Pid = int32(usermem.ByteOrder.Uint32(src[:4]))
+    f.PID = int32(usermem.ByteOrder.Uint32(src[:4]))
     src = src[4:]
     // Padding: ~ copy([4]byte(f._), src[:sizeof(byte)*4])
     src = src[1*(4):]
@@ -8951,7 +8951,7 @@ func (s *SockAddrUnix) WriteTo(writer io.Writer) (int64, error) {
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
 func (t *TCPInfo) SizeBytes() int {
-    return 192
+    return 224
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
@@ -9048,6 +9048,18 @@ func (t *TCPInfo) MarshalBytes(dst []byte) {
     dst = dst[8:]
     usermem.ByteOrder.PutUint64(dst[:8], uint64(t.SndBufLimited))
     dst = dst[8:]
+    usermem.ByteOrder.PutUint32(dst[:4], uint32(t.Delivered))
+    dst = dst[4:]
+    usermem.ByteOrder.PutUint32(dst[:4], uint32(t.DeliveredCE))
+    dst = dst[4:]
+    usermem.ByteOrder.PutUint64(dst[:8], uint64(t.BytesSent))
+    dst = dst[8:]
+    usermem.ByteOrder.PutUint64(dst[:8], uint64(t.BytesRetrans))
+    dst = dst[8:]
+    usermem.ByteOrder.PutUint32(dst[:4], uint32(t.DSACKDups))
+    dst = dst[4:]
+    usermem.ByteOrder.PutUint32(dst[:4], uint32(t.ReordSeen))
+    dst = dst[4:]
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
@@ -9144,6 +9156,18 @@ func (t *TCPInfo) UnmarshalBytes(src []byte) {
     src = src[8:]
     t.SndBufLimited = uint64(usermem.ByteOrder.Uint64(src[:8]))
     src = src[8:]
+    t.Delivered = uint32(usermem.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
+    t.DeliveredCE = uint32(usermem.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
+    t.BytesSent = uint64(usermem.ByteOrder.Uint64(src[:8]))
+    src = src[8:]
+    t.BytesRetrans = uint64(usermem.ByteOrder.Uint64(src[:8]))
+    src = src[8:]
+    t.DSACKDups = uint32(usermem.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
+    t.ReordSeen = uint32(usermem.ByteOrder.Uint32(src[:4]))
+    src = src[4:]
 }
 
 // Packed implements marshal.Marshallable.Packed.

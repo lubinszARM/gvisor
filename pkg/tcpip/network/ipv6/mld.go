@@ -68,14 +68,14 @@ func (mld *mldState) Enabled() bool {
 // SendReport implements ip.MulticastGroupProtocol.
 //
 // Precondition: mld.ep.mu must be read locked.
-func (mld *mldState) SendReport(groupAddress tcpip.Address) (bool, *tcpip.Error) {
+func (mld *mldState) SendReport(groupAddress tcpip.Address) (bool, tcpip.Error) {
 	return mld.writePacket(groupAddress, groupAddress, header.ICMPv6MulticastListenerReport)
 }
 
 // SendLeave implements ip.MulticastGroupProtocol.
 //
 // Precondition: mld.ep.mu must be read locked.
-func (mld *mldState) SendLeave(groupAddress tcpip.Address) *tcpip.Error {
+func (mld *mldState) SendLeave(groupAddress tcpip.Address) tcpip.Error {
 	_, err := mld.writePacket(header.IPv6AllRoutersMulticastAddress, groupAddress, header.ICMPv6MulticastListenerDone)
 	return err
 }
@@ -112,7 +112,7 @@ func (mld *mldState) handleMulticastListenerReport(mldHdr header.MLD) {
 // joinGroup handles joining a new group and sending and scheduling the required
 // messages.
 //
-// If the group is already joined, returns tcpip.ErrDuplicateAddress.
+// If the group is already joined, returns *tcpip.ErrDuplicateAddress.
 //
 // Precondition: mld.ep.mu must be locked.
 func (mld *mldState) joinGroup(groupAddress tcpip.Address) {
@@ -131,13 +131,13 @@ func (mld *mldState) isInGroup(groupAddress tcpip.Address) bool {
 // required.
 //
 // Precondition: mld.ep.mu must be locked.
-func (mld *mldState) leaveGroup(groupAddress tcpip.Address) *tcpip.Error {
+func (mld *mldState) leaveGroup(groupAddress tcpip.Address) tcpip.Error {
 	// LeaveGroup returns false only if the group was not joined.
 	if mld.genericMulticastProtocol.LeaveGroupLocked(groupAddress) {
 		return nil
 	}
 
-	return tcpip.ErrBadLocalAddress
+	return &tcpip.ErrBadLocalAddress{}
 }
 
 // softLeaveAll leaves all groups from the perspective of MLD, but remains
@@ -166,14 +166,14 @@ func (mld *mldState) sendQueuedReports() {
 // writePacket assembles and sends an MLD packet.
 //
 // Precondition: mld.ep.mu must be read locked.
-func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldType header.ICMPv6Type) (bool, *tcpip.Error) {
-	sentStats := mld.ep.protocol.stack.Stats().ICMP.V6.PacketsSent
-	var mldStat *tcpip.StatCounter
+func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldType header.ICMPv6Type) (bool, tcpip.Error) {
+	sentStats := mld.ep.stats.icmp.packetsSent
+	var mldStat tcpip.MultiCounterStat
 	switch mldType {
 	case header.ICMPv6MulticastListenerReport:
-		mldStat = sentStats.MulticastListenerReport
+		mldStat = sentStats.multicastListenerReport
 	case header.ICMPv6MulticastListenerDone:
-		mldStat = sentStats.MulticastListenerDone
+		mldStat = sentStats.multicastListenerDone
 	default:
 		panic(fmt.Sprintf("unrecognized mld type = %d", mldType))
 	}
@@ -249,12 +249,14 @@ func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldTyp
 		Data:               buffer.View(icmp).ToVectorisedView(),
 	})
 
-	mld.ep.addIPHeader(localAddress, destAddress, pkt, stack.NetworkHeaderParams{
+	if err := addIPHeader(localAddress, destAddress, pkt, stack.NetworkHeaderParams{
 		Protocol: header.ICMPv6ProtocolNumber,
 		TTL:      header.MLDHopLimit,
-	}, extensionHeaders)
+	}, extensionHeaders); err != nil {
+		panic(fmt.Sprintf("failed to add IP header: %s", err))
+	}
 	if err := mld.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(destAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
-		sentStats.Dropped.Increment()
+		sentStats.dropped.Increment()
 		return false, err
 	}
 	mldStat.Increment()

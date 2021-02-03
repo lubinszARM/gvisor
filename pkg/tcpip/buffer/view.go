@@ -17,6 +17,7 @@ package buffer
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 )
 
@@ -147,25 +148,18 @@ func (vv *VectorisedView) ReadToVV(dstVV *VectorisedView, count int) (copied int
 
 // ReadTo reads up to count bytes from vv to dst. It also removes them from vv
 // unless peek is true.
-func (vv *VectorisedView) ReadTo(dst io.Writer, count int, peek bool) (int, error) {
+func (vv *VectorisedView) ReadTo(dst io.Writer, peek bool) (int, error) {
 	var err error
 	done := 0
 	for _, v := range vv.Views() {
-		remaining := count - done
-		if remaining <= 0 {
-			break
-		}
-		if len(v) > remaining {
-			v = v[:remaining]
-		}
-
 		var n int
 		n, err = dst.Write(v)
-		if n > 0 {
-			done += n
-		}
+		done += n
 		if err != nil {
 			break
+		}
+		if n != len(v) {
+			panic(fmt.Sprintf("io.Writer.Write succeeded with incomplete write: %d != %d", n, len(v)))
 		}
 	}
 	if !peek {
@@ -243,6 +237,16 @@ func (vv *VectorisedView) PullUp(count int) (View, bool) {
 // vectorised view.
 func (vv *VectorisedView) Size() int {
 	return vv.size
+}
+
+// MemSize returns the estimation size of the vv in memory, including backing
+// buffer data.
+func (vv *VectorisedView) MemSize() int {
+	var size int
+	for _, v := range vv.views {
+		size += cap(v)
+	}
+	return size + cap(vv.views)*viewStructSize + vectorisedViewStructSize
 }
 
 // ToView returns a single view containing the content of the vectorised view.

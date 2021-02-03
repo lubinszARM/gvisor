@@ -161,6 +161,13 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 // DecRef decrements fd's reference count.
 func (fd *FileDescription) DecRef(ctx context.Context) {
 	fd.FileDescriptionRefs.DecRef(func() {
+		// Generate inotify events.
+		ev := uint32(linux.IN_CLOSE_NOWRITE)
+		if fd.IsWritable() {
+			ev = linux.IN_CLOSE_WRITE
+		}
+		fd.Dentry().InotifyWithParent(ctx, ev, 0, PathEvent)
+
 		// Unregister fd from all epoll instances.
 		fd.epollMu.Lock()
 		epolls := fd.epolls
@@ -448,16 +455,19 @@ type FileDescriptionImpl interface {
 	RemoveXattr(ctx context.Context, name string) error
 
 	// LockBSD tries to acquire a BSD-style advisory file lock.
-	LockBSD(ctx context.Context, uid lock.UniqueID, t lock.LockType, block lock.Blocker) error
+	LockBSD(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, block lock.Blocker) error
 
 	// UnlockBSD releases a BSD-style advisory file lock.
 	UnlockBSD(ctx context.Context, uid lock.UniqueID) error
 
 	// LockPOSIX tries to acquire a POSIX-style advisory file lock.
-	LockPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, start, length uint64, whence int16, block lock.Blocker) error
+	LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block lock.Blocker) error
 
 	// UnlockPOSIX releases a POSIX-style advisory file lock.
-	UnlockPOSIX(ctx context.Context, uid lock.UniqueID, start, length uint64, whence int16) error
+	UnlockPOSIX(ctx context.Context, uid lock.UniqueID, ComputeLockRange lock.LockRange) error
+
+	// TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
+	TestPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, r lock.LockRange) (linux.Flock, error)
 }
 
 // Dirent holds the information contained in struct linux_dirent64.
@@ -556,7 +566,11 @@ func (fd *FileDescription) Allocate(ctx context.Context, mode, offset, length ui
 	if !fd.IsWritable() {
 		return syserror.EBADF
 	}
-	return fd.impl.Allocate(ctx, mode, offset, length)
+	if err := fd.impl.Allocate(ctx, mode, offset, length); err != nil {
+		return err
+	}
+	fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+	return nil
 }
 
 // Readiness implements waiter.Waitable.Readiness.
@@ -592,6 +606,9 @@ func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.PRead(ctx, dst, offset, opts)
+	if n > 0 {
+		fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
+	}
 	fsmetric.Reads.Increment()
 	fsmetric.FinishReadWait(fsmetric.ReadWait, start)
 	return n, err
@@ -604,6 +621,9 @@ func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opt
 	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.Read(ctx, dst, opts)
+	if n > 0 {
+		fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
+	}
 	fsmetric.Reads.Increment()
 	fsmetric.FinishReadWait(fsmetric.ReadWait, start)
 	return n, err
@@ -619,7 +639,11 @@ func (fd *FileDescription) PWrite(ctx context.Context, src usermem.IOSequence, o
 	if !fd.writable {
 		return 0, syserror.EBADF
 	}
-	return fd.impl.PWrite(ctx, src, offset, opts)
+	n, err := fd.impl.PWrite(ctx, src, offset, opts)
+	if n > 0 {
+		fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+	}
+	return n, err
 }
 
 // Write is similar to PWrite, but does not specify an offset.
@@ -627,7 +651,11 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 	if !fd.writable {
 		return 0, syserror.EBADF
 	}
-	return fd.impl.Write(ctx, src, opts)
+	n, err := fd.impl.Write(ctx, src, opts)
+	if n > 0 {
+		fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+	}
+	return n, err
 }
 
 // IterDirents invokes cb on each entry in the directory represented by fd. If
@@ -791,9 +819,9 @@ func (fd *FileDescription) Msync(ctx context.Context, mr memmap.MappableRange) e
 }
 
 // LockBSD tries to acquire a BSD-style advisory file lock.
-func (fd *FileDescription) LockBSD(ctx context.Context, lockType lock.LockType, blocker lock.Blocker) error {
+func (fd *FileDescription) LockBSD(ctx context.Context, ownerPID int32, lockType lock.LockType, blocker lock.Blocker) error {
 	atomic.StoreUint32(&fd.usedLockBSD, 1)
-	return fd.impl.LockBSD(ctx, fd, lockType, blocker)
+	return fd.impl.LockBSD(ctx, fd, ownerPID, lockType, blocker)
 }
 
 // UnlockBSD releases a BSD-style advisory file lock.
@@ -802,13 +830,45 @@ func (fd *FileDescription) UnlockBSD(ctx context.Context) error {
 }
 
 // LockPOSIX locks a POSIX-style file range lock.
-func (fd *FileDescription) LockPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, start, end uint64, whence int16, block lock.Blocker) error {
-	return fd.impl.LockPOSIX(ctx, uid, t, start, end, whence, block)
+func (fd *FileDescription) LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block lock.Blocker) error {
+	return fd.impl.LockPOSIX(ctx, uid, ownerPID, t, r, block)
 }
 
 // UnlockPOSIX unlocks a POSIX-style file range lock.
-func (fd *FileDescription) UnlockPOSIX(ctx context.Context, uid lock.UniqueID, start, end uint64, whence int16) error {
-	return fd.impl.UnlockPOSIX(ctx, uid, start, end, whence)
+func (fd *FileDescription) UnlockPOSIX(ctx context.Context, uid lock.UniqueID, r lock.LockRange) error {
+	return fd.impl.UnlockPOSIX(ctx, uid, r)
+}
+
+// TestPOSIX returns information about whether the specified lock can be held.
+func (fd *FileDescription) TestPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, r lock.LockRange) (linux.Flock, error) {
+	return fd.impl.TestPOSIX(ctx, uid, t, r)
+}
+
+// ComputeLockRange computes the range of a file lock based on the given values.
+func (fd *FileDescription) ComputeLockRange(ctx context.Context, start uint64, length uint64, whence int16) (lock.LockRange, error) {
+	var off int64
+	switch whence {
+	case linux.SEEK_SET:
+		off = 0
+	case linux.SEEK_CUR:
+		// Note that Linux does not hold any mutexes while retrieving the file
+		// offset, see fs/locks.c:flock_to_posix_lock and fs/locks.c:fcntl_setlk.
+		curOff, err := fd.Seek(ctx, 0, linux.SEEK_CUR)
+		if err != nil {
+			return lock.LockRange{}, err
+		}
+		off = curOff
+	case linux.SEEK_END:
+		stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_SIZE})
+		if err != nil {
+			return lock.LockRange{}, err
+		}
+		off = int64(stat.Size)
+	default:
+		return lock.LockRange{}, syserror.EINVAL
+	}
+
+	return lock.ComputeRange(int64(start), int64(length), off)
 }
 
 // A FileAsync sends signals to its owner when w is ready for IO. This is only

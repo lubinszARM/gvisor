@@ -30,6 +30,10 @@ const linkAddrCacheSize = 512 // max cache entries
 //
 // This struct is safe for concurrent use.
 type linkAddrCache struct {
+	nic *NIC
+
+	linkRes LinkAddressResolver
+
 	// ageLimit is how long a cache entry is valid for.
 	ageLimit time.Duration
 
@@ -41,9 +45,9 @@ type linkAddrCache struct {
 	// resolved before failing.
 	resolutionAttempts int
 
-	cache struct {
+	mu struct {
 		sync.Mutex
-		table map[tcpip.FullAddress]*linkAddrEntry
+		table map[tcpip.Address]*linkAddrEntry
 		lru   linkAddrEntryList
 	}
 }
@@ -77,31 +81,42 @@ type linkAddrEntry struct {
 	// linkAddrEntryEntry access is synchronized by the linkAddrCache lock.
 	linkAddrEntryEntry
 
-	// TODO(gvisor.dev/issue/5150): move these fields under mu.
-	// mu protects the fields below.
-	mu sync.RWMutex
+	cache *linkAddrCache
 
-	addr       tcpip.FullAddress
-	linkAddr   tcpip.LinkAddress
-	expiration time.Time
-	s          entryState
+	mu struct {
+		sync.RWMutex
 
-	// done is closed when address resolution is complete. It is nil iff s is
-	// incomplete and resolution is not yet in progress.
-	done chan struct{}
+		addr       tcpip.Address
+		linkAddr   tcpip.LinkAddress
+		expiration time.Time
+		s          entryState
 
-	// onResolve is called with the result of address resolution.
-	onResolve []func(tcpip.LinkAddress, bool)
+		// done is closed when address resolution is complete. It is nil iff s is
+		// incomplete and resolution is not yet in progress.
+		done chan struct{}
+
+		// onResolve is called with the result of address resolution.
+		onResolve []func(LinkResolutionResult)
+	}
 }
 
 func (e *linkAddrEntry) notifyCompletionLocked(linkAddr tcpip.LinkAddress) {
-	for _, callback := range e.onResolve {
-		callback(linkAddr, len(linkAddr) != 0)
+	res := LinkResolutionResult{LinkAddress: linkAddr, Success: len(linkAddr) != 0}
+	for _, callback := range e.mu.onResolve {
+		callback(res)
 	}
-	e.onResolve = nil
-	if ch := e.done; ch != nil {
+	e.mu.onResolve = nil
+	if ch := e.mu.done; ch != nil {
 		close(ch)
-		e.done = nil
+		e.mu.done = nil
+		// Dequeue the pending packets in a new goroutine to not hold up the current
+		// goroutine as writing packets may be a costly operation.
+		//
+		// At the time of writing, when writing packets, a neighbor's link address
+		// is resolved (which ends up obtaining the entry's lock) while holding the
+		// link resolution queue's lock. Dequeuing packets in a new goroutine avoids
+		// a lock ordering violation.
+		go e.cache.nic.linkResQueue.dequeue(ch, linkAddr, len(linkAddr) != 0)
 	}
 }
 
@@ -114,30 +129,30 @@ func (e *linkAddrEntry) notifyCompletionLocked(linkAddr tcpip.LinkAddress) {
 //
 // Precondition: e.mu must be locked
 func (e *linkAddrEntry) changeStateLocked(ns entryState, expiration time.Time) {
-	if e.s == incomplete && ns == ready {
-		e.notifyCompletionLocked(e.linkAddr)
+	if e.mu.s == incomplete && ns == ready {
+		e.notifyCompletionLocked(e.mu.linkAddr)
 	}
 
-	if expiration.IsZero() || expiration.After(e.expiration) {
-		e.expiration = expiration
+	if expiration.IsZero() || expiration.After(e.mu.expiration) {
+		e.mu.expiration = expiration
 	}
-	e.s = ns
+	e.mu.s = ns
 }
 
 // add adds a k -> v mapping to the cache.
-func (c *linkAddrCache) add(k tcpip.FullAddress, v tcpip.LinkAddress) {
+func (c *linkAddrCache) add(k tcpip.Address, v tcpip.LinkAddress) {
 	// Calculate expiration time before acquiring the lock, since expiration is
 	// relative to the time when information was learned, rather than when it
 	// happened to be inserted into the cache.
 	expiration := time.Now().Add(c.ageLimit)
 
-	c.cache.Lock()
+	c.mu.Lock()
 	entry := c.getOrCreateEntryLocked(k)
-	c.cache.Unlock()
-
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-	entry.linkAddr = v
+	c.mu.Unlock()
+
+	entry.mu.linkAddr = v
 	entry.changeStateLocked(ready, expiration)
 }
 
@@ -150,19 +165,19 @@ func (c *linkAddrCache) add(k tcpip.FullAddress, v tcpip.LinkAddress) {
 // reset to state incomplete, and returned. If no matching entry exists and the
 // cache is not full, a new entry with state incomplete is allocated and
 // returned.
-func (c *linkAddrCache) getOrCreateEntryLocked(k tcpip.FullAddress) *linkAddrEntry {
-	if entry, ok := c.cache.table[k]; ok {
-		c.cache.lru.Remove(entry)
-		c.cache.lru.PushFront(entry)
+func (c *linkAddrCache) getOrCreateEntryLocked(k tcpip.Address) *linkAddrEntry {
+	if entry, ok := c.mu.table[k]; ok {
+		c.mu.lru.Remove(entry)
+		c.mu.lru.PushFront(entry)
 		return entry
 	}
 	var entry *linkAddrEntry
-	if len(c.cache.table) == linkAddrCacheSize {
-		entry = c.cache.lru.Back()
+	if len(c.mu.table) == linkAddrCacheSize {
+		entry = c.mu.lru.Back()
 		entry.mu.Lock()
 
-		delete(c.cache.table, entry.addr)
-		c.cache.lru.Remove(entry)
+		delete(c.mu.table, entry.mu.addr)
+		c.mu.lru.Remove(entry)
 
 		// Wake waiters and mark the soon-to-be-reused entry as expired.
 		entry.notifyCompletionLocked("" /* linkAddr */)
@@ -172,62 +187,56 @@ func (c *linkAddrCache) getOrCreateEntryLocked(k tcpip.FullAddress) *linkAddrEnt
 	}
 
 	*entry = linkAddrEntry{
-		addr: k,
-		s:    incomplete,
+		cache: c,
 	}
-	c.cache.table[k] = entry
-	c.cache.lru.PushFront(entry)
+	entry.mu.Lock()
+	entry.mu.addr = k
+	entry.mu.s = incomplete
+	entry.mu.Unlock()
+	c.mu.table[k] = entry
+	c.mu.lru.PushFront(entry)
 	return entry
 }
 
-// get reports any known link address for k.
-func (c *linkAddrCache) get(k tcpip.FullAddress, linkRes LinkAddressResolver, localAddr tcpip.Address, nic NetworkInterface, onResolve func(tcpip.LinkAddress, bool)) (tcpip.LinkAddress, <-chan struct{}, *tcpip.Error) {
-	if linkRes != nil {
-		if addr, ok := linkRes.ResolveStaticAddress(k.Addr); ok {
-			if onResolve != nil {
-				onResolve(addr, true)
-			}
-			return addr, nil, nil
-		}
-	}
-
-	c.cache.Lock()
-	defer c.cache.Unlock()
-	entry := c.getOrCreateEntryLocked(k)
+// get reports any known link address for addr.
+func (c *linkAddrCache) get(addr, localAddr tcpip.Address, onResolve func(LinkResolutionResult)) (tcpip.LinkAddress, <-chan struct{}, tcpip.Error) {
+	c.mu.Lock()
+	entry := c.getOrCreateEntryLocked(addr)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	c.mu.Unlock()
 
-	switch s := entry.s; s {
+	switch s := entry.mu.s; s {
 	case ready:
-		if !time.Now().After(entry.expiration) {
+		if !time.Now().After(entry.mu.expiration) {
 			// Not expired.
 			if onResolve != nil {
-				onResolve(entry.linkAddr, true)
+				onResolve(LinkResolutionResult{LinkAddress: entry.mu.linkAddr, Success: true})
 			}
-			return entry.linkAddr, nil, nil
+			return entry.mu.linkAddr, nil, nil
 		}
 
 		entry.changeStateLocked(incomplete, time.Time{})
 		fallthrough
 	case incomplete:
 		if onResolve != nil {
-			entry.onResolve = append(entry.onResolve, onResolve)
+			entry.mu.onResolve = append(entry.mu.onResolve, onResolve)
 		}
-		if entry.done == nil {
-			entry.done = make(chan struct{})
-			go c.startAddressResolution(k, linkRes, localAddr, nic, entry.done) // S/R-SAFE: link non-savable; wakers dropped synchronously.
+		if entry.mu.done == nil {
+			entry.mu.done = make(chan struct{})
+			go c.startAddressResolution(addr, localAddr, entry.mu.done) // S/R-SAFE: link non-savable; wakers dropped synchronously.
 		}
-		return entry.linkAddr, entry.done, tcpip.ErrWouldBlock
+		return entry.mu.linkAddr, entry.mu.done, &tcpip.ErrWouldBlock{}
 	default:
 		panic(fmt.Sprintf("invalid cache entry state: %s", s))
 	}
 }
 
-func (c *linkAddrCache) startAddressResolution(k tcpip.FullAddress, linkRes LinkAddressResolver, localAddr tcpip.Address, nic NetworkInterface, done <-chan struct{}) {
+func (c *linkAddrCache) startAddressResolution(k tcpip.Address, localAddr tcpip.Address, done <-chan struct{}) {
 	for i := 0; ; i++ {
 		// Send link request, then wait for the timeout limit and check
 		// whether the request succeeded.
-		linkRes.LinkAddressRequest(k.Addr, localAddr, "" /* linkAddr */, nic)
+		c.linkRes.LinkAddressRequest(k, localAddr, "" /* linkAddr */)
 
 		select {
 		case now := <-time.After(c.resolutionTimeout):
@@ -243,10 +252,10 @@ func (c *linkAddrCache) startAddressResolution(k tcpip.FullAddress, linkRes Link
 // checkLinkRequest checks whether previous attempt to resolve address has
 // succeeded and mark the entry accordingly. Returns true if request can stop,
 // false if another request should be sent.
-func (c *linkAddrCache) checkLinkRequest(now time.Time, k tcpip.FullAddress, attempt int) bool {
-	c.cache.Lock()
-	defer c.cache.Unlock()
-	entry, ok := c.cache.table[k]
+func (c *linkAddrCache) checkLinkRequest(now time.Time, k tcpip.Address, attempt int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.mu.table[k]
 	if !ok {
 		// Entry was evicted from the cache.
 		return true
@@ -254,7 +263,7 @@ func (c *linkAddrCache) checkLinkRequest(now time.Time, k tcpip.FullAddress, att
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	switch s := entry.s; s {
+	switch s := entry.mu.s; s {
 	case ready:
 		// Entry was made ready by resolver.
 	case incomplete:
@@ -264,19 +273,87 @@ func (c *linkAddrCache) checkLinkRequest(now time.Time, k tcpip.FullAddress, att
 		}
 		// Max number of retries reached, delete entry.
 		entry.notifyCompletionLocked("" /* linkAddr */)
-		delete(c.cache.table, k)
+		delete(c.mu.table, k)
 	default:
 		panic(fmt.Sprintf("invalid cache entry state: %s", s))
 	}
 	return true
 }
 
-func newLinkAddrCache(ageLimit, resolutionTimeout time.Duration, resolutionAttempts int) *linkAddrCache {
-	c := &linkAddrCache{
+func (c *linkAddrCache) init(nic *NIC, ageLimit, resolutionTimeout time.Duration, resolutionAttempts int, linkRes LinkAddressResolver) {
+	*c = linkAddrCache{
+		nic:                nic,
+		linkRes:            linkRes,
 		ageLimit:           ageLimit,
 		resolutionTimeout:  resolutionTimeout,
 		resolutionAttempts: resolutionAttempts,
 	}
-	c.cache.table = make(map[tcpip.FullAddress]*linkAddrEntry, linkAddrCacheSize)
-	return c
+
+	c.mu.Lock()
+	c.mu.table = make(map[tcpip.Address]*linkAddrEntry, linkAddrCacheSize)
+	c.mu.Unlock()
+}
+
+var _ neighborTable = (*linkAddrCache)(nil)
+
+func (*linkAddrCache) neighbors() ([]NeighborEntry, tcpip.Error) {
+	return nil, &tcpip.ErrNotSupported{}
+}
+
+func (c *linkAddrCache) addStaticEntry(addr tcpip.Address, linkAddr tcpip.LinkAddress) {
+	c.add(addr, linkAddr)
+}
+
+func (*linkAddrCache) remove(addr tcpip.Address) tcpip.Error {
+	return &tcpip.ErrNotSupported{}
+}
+
+func (*linkAddrCache) removeAll() tcpip.Error {
+	return &tcpip.ErrNotSupported{}
+}
+
+func (c *linkAddrCache) handleProbe(addr tcpip.Address, linkAddr tcpip.LinkAddress) {
+	if len(linkAddr) != 0 {
+		// NUD allows probes without a link address but linkAddrCache
+		// is a simple neighbor table which does not implement NUD.
+		//
+		// As per RFC 4861 section 4.3,
+		//
+		//   Source link-layer address
+		//               The link-layer address for the sender. MUST NOT be
+		//               included when the source IP address is the
+		//               unspecified address. Otherwise, on link layers
+		//               that have addresses this option MUST be included in
+		//               multicast solicitations and SHOULD be included in
+		//               unicast solicitations.
+		c.add(addr, linkAddr)
+	}
+}
+
+func (c *linkAddrCache) handleConfirmation(addr tcpip.Address, linkAddr tcpip.LinkAddress, flags ReachabilityConfirmationFlags) {
+	if len(linkAddr) != 0 {
+		// NUD allows confirmations without a link address but linkAddrCache
+		// is a simple neighbor table which does not implement NUD.
+		//
+		// As per RFC 4861 section 4.4,
+		//
+		//   Target link-layer address
+		//               The link-layer address for the target, i.e., the
+		//               sender of the advertisement. This option MUST be
+		//               included on link layers that have addresses when
+		//               responding to multicast solicitations. When
+		//               responding to a unicast Neighbor Solicitation this
+		//               option SHOULD be included.
+		c.add(addr, linkAddr)
+	}
+}
+
+func (c *linkAddrCache) handleUpperLevelConfirmation(tcpip.Address) {}
+
+func (*linkAddrCache) nudConfig() (NUDConfigurations, tcpip.Error) {
+	return NUDConfigurations{}, &tcpip.ErrNotSupported{}
+}
+
+func (*linkAddrCache) setNUDConfig(NUDConfigurations) tcpip.Error {
+	return &tcpip.ErrNotSupported{}
 }

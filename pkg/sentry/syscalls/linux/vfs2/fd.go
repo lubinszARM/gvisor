@@ -123,6 +123,15 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 	defer file.DecRef(t)
 
+	if file.StatusFlags()&linux.O_PATH != 0 {
+		switch cmd {
+		case linux.F_DUPFD, linux.F_DUPFD_CLOEXEC, linux.F_GETFD, linux.F_SETFD, linux.F_GETFL:
+			// allowed
+		default:
+			return 0, nil, syserror.EBADF
+		}
+	}
+
 	switch cmd {
 	case linux.F_DUPFD, linux.F_DUPFD_CLOEXEC:
 		minfd := args[2].Int()
@@ -205,8 +214,12 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		err := tmpfs.AddSeals(file, args[2].Uint())
 		return 0, nil, err
-	case linux.F_SETLK, linux.F_SETLKW:
-		return 0, nil, posixLock(t, args, file, cmd)
+	case linux.F_SETLK:
+		return 0, nil, posixLock(t, args, file, false /* blocking */)
+	case linux.F_SETLKW:
+		return 0, nil, posixLock(t, args, file, true /* blocking */)
+	case linux.F_GETLK:
+		return 0, nil, posixTestLock(t, args, file)
 	case linux.F_GETSIG:
 		a := file.AsyncHandler()
 		if a == nil {
@@ -292,7 +305,49 @@ func setAsyncOwner(t *kernel.Task, fd int, file *vfs.FileDescription, ownerType,
 	}
 }
 
-func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription, cmd int32) error {
+func posixTestLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription) error {
+	// Copy in the lock request.
+	flockAddr := args[2].Pointer()
+	var flock linux.Flock
+	if _, err := flock.CopyIn(t, flockAddr); err != nil {
+		return err
+	}
+	var typ lock.LockType
+	switch flock.Type {
+	case linux.F_RDLCK:
+		typ = lock.ReadLock
+	case linux.F_WRLCK:
+		typ = lock.WriteLock
+	default:
+		return syserror.EINVAL
+	}
+	r, err := file.ComputeLockRange(t, uint64(flock.Start), uint64(flock.Len), flock.Whence)
+	if err != nil {
+		return err
+	}
+
+	newFlock, err := file.TestPOSIX(t, t.FDTable(), typ, r)
+	if err != nil {
+		return err
+	}
+	newFlock.PID = translatePID(t.PIDNamespace().Root(), t.PIDNamespace(), newFlock.PID)
+	if _, err = newFlock.CopyOut(t, flockAddr); err != nil {
+		return err
+	}
+	return nil
+}
+
+// translatePID translates a pid from one namespace to another. Note that this
+// may race with task termination/creation, in which case the original task
+// corresponding to pid may no longer exist. This is used to implement the
+// F_GETLK fcntl, which has the same potential race in Linux as well (i.e.,
+// there is no synchronization between retrieving the lock PID and translating
+// it). See fs/locks.c:posix_lock_to_flock.
+func translatePID(old, new *kernel.PIDNamespace, pid int32) int32 {
+	return int32(new.IDOfTask(old.TaskWithID(kernel.ThreadID(pid))))
+}
+
+func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription, blocking bool) error {
 	// Copy in the lock request.
 	flockAddr := args[2].Pointer()
 	var flock linux.Flock
@@ -301,8 +356,13 @@ func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescrip
 	}
 
 	var blocker lock.Blocker
-	if cmd == linux.F_SETLKW {
+	if blocking {
 		blocker = t
+	}
+
+	r, err := file.ComputeLockRange(t, uint64(flock.Start), uint64(flock.Len), flock.Whence)
+	if err != nil {
+		return err
 	}
 
 	switch flock.Type {
@@ -310,16 +370,16 @@ func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescrip
 		if !file.IsReadable() {
 			return syserror.EBADF
 		}
-		return file.LockPOSIX(t, t.FDTable(), lock.ReadLock, uint64(flock.Start), uint64(flock.Len), flock.Whence, blocker)
+		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.ReadLock, r, blocker)
 
 	case linux.F_WRLCK:
 		if !file.IsWritable() {
 			return syserror.EBADF
 		}
-		return file.LockPOSIX(t, t.FDTable(), lock.WriteLock, uint64(flock.Start), uint64(flock.Len), flock.Whence, blocker)
+		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.WriteLock, r, blocker)
 
 	case linux.F_UNLCK:
-		return file.UnlockPOSIX(t, t.FDTable(), uint64(flock.Start), uint64(flock.Len), flock.Whence)
+		return file.UnlockPOSIX(t, t.FDTable(), r)
 
 	default:
 		return syserror.EINVAL
@@ -343,6 +403,10 @@ func Fadvise64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 		return 0, nil, syserror.EBADF
 	}
 	defer file.DecRef(t)
+
+	if file.StatusFlags()&linux.O_PATH != 0 {
+		return 0, nil, syserror.EBADF
+	}
 
 	// If the FD refers to a pipe or FIFO, return error.
 	if _, isPipe := file.Impl().(*pipe.VFSPipeFD); isPipe {

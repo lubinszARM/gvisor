@@ -63,29 +63,11 @@ func (ep *endpoint) loadRcvBufSizeMax(max int) {
 
 // afterLoad is invoked by stateify.
 func (ep *endpoint) afterLoad() {
-	// StackFromEnv is a stack used specifically for save/restore.
 	ep.stack = stack.StackFromEnv
+	ep.ops.InitHandler(ep, ep.stack, tcpip.GetStackSendBufferLimits)
 
 	// TODO(gvisor.dev/173): Once bind is supported, choose the right NIC.
 	if err := ep.stack.RegisterPacketEndpoint(0, ep.netProto, ep); err != nil {
-		panic(*err)
+		panic(err)
 	}
-}
-
-// saveLastError is invoked by stateify.
-func (ep *endpoint) saveLastError() string {
-	if ep.lastError == nil {
-		return ""
-	}
-
-	return ep.lastError.String()
-}
-
-// loadLastError is invoked by stateify.
-func (ep *endpoint) loadLastError(s string) {
-	if s == "" {
-		return
-	}
-
-	ep.lastError = tcpip.StringToError(s)
 }

@@ -51,13 +51,9 @@ type Route struct {
 	// outgoingNIC is the interface this route uses to write packets.
 	outgoingNIC *NIC
 
-	// linkCache is set if link address resolution is enabled for this protocol on
-	// the route's NIC.
-	linkCache LinkAddressCache
-
 	// linkRes is set if link address resolution is enabled for this protocol on
 	// the route's NIC.
-	linkRes LinkAddressResolver
+	linkRes linkResolver
 }
 
 type routeInfo struct {
@@ -90,12 +86,21 @@ type RouteInfo struct {
 	RemoteLinkAddress tcpip.LinkAddress
 }
 
-// GetFields returns a RouteInfo with all of r's exported fields. This allows
-// callers to store the route's fields without retaining a reference to it.
-func (r *Route) GetFields() RouteInfo {
+// Fields returns a RouteInfo with all of the known values for the route's
+// fields.
+//
+// If any fields are unknown (e.g. remote link address when it is waiting for
+// link address resolution), they will be unset.
+func (r *Route) Fields() RouteInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fieldsLocked()
+}
+
+func (r *Route) fieldsLocked() RouteInfo {
 	return RouteInfo{
 		routeInfo:         r.routeInfo,
-		RemoteLinkAddress: r.RemoteLinkAddress(),
+		RemoteLinkAddress: r.mu.remoteLinkAddress,
 	}
 }
 
@@ -120,6 +125,7 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 
 	r := makeRoute(
 		netProto,
+		gateway,
 		localAddr,
 		remoteAddr,
 		outgoingNIC,
@@ -129,20 +135,12 @@ func constructAndValidateRoute(netProto tcpip.NetworkProtocolNumber, addressEndp
 		multicastLoop,
 	)
 
-	// If the route requires us to send a packet through some gateway, do not
-	// broadcast it.
-	if len(gateway) > 0 {
-		r.NextHop = gateway
-	} else if subnet := addressEndpoint.Subnet(); subnet.IsBroadcast(remoteAddr) {
-		r.ResolveWith(header.EthernetBroadcastAddress)
-	}
-
 	return r
 }
 
 // makeRoute initializes a new route. It takes ownership of the provided
 // AssignableAddressEndpoint.
-func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool) *Route {
+func makeRoute(netProto tcpip.NetworkProtocolNumber, gateway, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, handleLocal, multicastLoop bool) *Route {
 	if localAddressNIC.stack != outgoingNIC.stack {
 		panic(fmt.Sprintf("cannot create a route with NICs from different stacks"))
 	}
@@ -168,7 +166,44 @@ func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip
 		}
 	}
 
-	return makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop)
+	r := makeRouteInner(netProto, localAddr, remoteAddr, outgoingNIC, localAddressNIC, localAddressEndpoint, loop)
+	if r.Loop&PacketOut == 0 {
+		// Packet will not leave the stack, no need for a gateway or a remote link
+		// address.
+		return r
+	}
+
+	if r.outgoingNIC.LinkEndpoint.Capabilities()&CapabilityResolutionRequired != 0 {
+		if linkRes, ok := r.outgoingNIC.linkAddrResolvers[r.NetProto]; ok {
+			r.linkRes = linkRes
+		}
+	}
+
+	if len(gateway) > 0 {
+		r.NextHop = gateway
+		return r
+	}
+
+	if r.linkRes.resolver == nil {
+		return r
+	}
+
+	if linkAddr, ok := r.linkRes.resolver.ResolveStaticAddress(r.RemoteAddress); ok {
+		r.ResolveWith(linkAddr)
+		return r
+	}
+
+	if subnet := localAddressEndpoint.Subnet(); subnet.IsBroadcast(remoteAddr) {
+		r.ResolveWith(header.EthernetBroadcastAddress)
+		return r
+	}
+
+	if r.RemoteAddress == r.LocalAddress {
+		// Local link address is already known.
+		r.ResolveWith(r.LocalLinkAddress)
+	}
+
+	return r
 }
 
 func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, outgoingNIC, localAddressNIC *NIC, localAddressEndpoint AssignableAddressEndpoint, loop PacketLooping) *Route {
@@ -187,13 +222,6 @@ func makeRouteInner(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr 
 	r.mu.Lock()
 	r.mu.localAddressEndpoint = localAddressEndpoint
 	r.mu.Unlock()
-
-	if r.outgoingNIC.LinkEndpoint.Capabilities()&CapabilityResolutionRequired != 0 {
-		if linkRes, ok := r.outgoingNIC.stack.linkAddrResolvers[r.NetProto]; ok {
-			r.linkRes = linkRes
-			r.linkCache = r.outgoingNIC.stack
-		}
-	}
 
 	return r
 }
@@ -287,33 +315,43 @@ func (r *Route) ResolveWith(addr tcpip.LinkAddress) {
 	r.mu.remoteLinkAddress = addr
 }
 
-// Resolve attempts to resolve the link address if necessary.
+// ResolvedFieldsResult is the result of a route resolution attempt.
+type ResolvedFieldsResult struct {
+	RouteInfo RouteInfo
+	Success   bool
+}
+
+// ResolvedFields attempts to resolve the remote link address if it is not
+// known.
 //
-// Returns tcpip.ErrWouldBlock if address resolution requires blocking (e.g.
-// waiting for ARP reply). If address resolution is required, a notification
-// channel is also returned for the caller to block on. The channel is closed
-// once address resolution is complete (successful or not). If a callback is
-// provided, it will be called when address resolution is complete, regardless
+// If a callback is provided, it will be called before ResolvedFields returns
+// when address resolution is not required. If address resolution is required,
+// the callback will be called once address resolution is complete, regardless
 // of success or failure.
-func (r *Route) Resolve(afterResolve func()) (<-chan struct{}, *tcpip.Error) {
-	r.mu.Lock()
+//
+// Note, the route will not cache the remote link address when address
+// resolution completes.
+func (r *Route) ResolvedFields(afterResolve func(ResolvedFieldsResult)) tcpip.Error {
+	_, _, err := r.resolvedFields(afterResolve)
+	return err
+}
 
-	if !r.isResolutionRequiredRLocked() {
-		// Nothing to do if there is no cache (which does the resolution on cache miss) or
-		// link address is already known.
-		r.mu.Unlock()
-		return nil, nil
-	}
-
-	nextAddr := r.NextHop
-	if nextAddr == "" {
-		// Local link address is already known.
-		if r.RemoteAddress == r.LocalAddress {
-			r.mu.remoteLinkAddress = r.LocalLinkAddress
-			r.mu.Unlock()
-			return nil, nil
+// resolvedFields is like ResolvedFields but also returns a notification channel
+// when address resolution is required. This channel will become readable once
+// address resolution is complete.
+//
+// The route's fields will also be returned, regardless of whether address
+// resolution is required or not.
+func (r *Route) resolvedFields(afterResolve func(ResolvedFieldsResult)) (RouteInfo, <-chan struct{}, tcpip.Error) {
+	r.mu.RLock()
+	fields := r.fieldsLocked()
+	resolutionRequired := r.isResolutionRequiredRLocked()
+	r.mu.RUnlock()
+	if !resolutionRequired {
+		if afterResolve != nil {
+			afterResolve(ResolvedFieldsResult{RouteInfo: fields, Success: true})
 		}
-		nextAddr = r.RemoteAddress
+		return fields, nil, nil
 	}
 
 	// If specified, the local address used for link address resolution must be an
@@ -323,34 +361,27 @@ func (r *Route) Resolve(afterResolve func()) (<-chan struct{}, *tcpip.Error) {
 		linkAddressResolutionRequestLocalAddr = r.LocalAddress
 	}
 
-	// Increment the route's reference count because finishResolution retains a
-	// reference to the route and releases it when called.
-	r.acquireLocked()
-	r.mu.Unlock()
-
-	finishResolution := func(linkAddress tcpip.LinkAddress, ok bool) {
-		if ok {
-			r.ResolveWith(linkAddress)
-		}
+	afterResolveFields := fields
+	linkAddr, ch, err := r.linkRes.getNeighborLinkAddress(r.nextHop(), linkAddressResolutionRequestLocalAddr, func(r LinkResolutionResult) {
 		if afterResolve != nil {
-			afterResolve()
-		}
-		r.Release()
-	}
+			if r.Success {
+				afterResolveFields.RemoteLinkAddress = r.LinkAddress
+			}
 
-	if neigh := r.outgoingNIC.neigh; neigh != nil {
-		_, ch, err := neigh.entry(nextAddr, linkAddressResolutionRequestLocalAddr, r.linkRes, finishResolution)
-		if err != nil {
-			return ch, err
+			afterResolve(ResolvedFieldsResult{RouteInfo: afterResolveFields, Success: r.Success})
 		}
-		return nil, nil
+	})
+	if err == nil {
+		fields.RemoteLinkAddress = linkAddr
 	}
+	return fields, ch, err
+}
 
-	_, ch, err := r.linkCache.GetLinkAddress(r.outgoingNIC.ID(), nextAddr, linkAddressResolutionRequestLocalAddr, r.NetProto, finishResolution)
-	if err != nil {
-		return ch, err
+func (r *Route) nextHop() tcpip.Address {
+	if len(r.NextHop) == 0 {
+		return r.RemoteAddress
 	}
-	return nil, nil
+	return r.NextHop
 }
 
 // local returns true if the route is a local route.
@@ -369,11 +400,7 @@ func (r *Route) IsResolutionRequired() bool {
 }
 
 func (r *Route) isResolutionRequiredRLocked() bool {
-	if !r.isValidForOutgoingRLocked() || r.mu.remoteLinkAddress != "" || r.local() {
-		return false
-	}
-
-	return (r.outgoingNIC.neigh != nil && r.linkRes != nil) || r.linkCache != nil
+	return len(r.mu.remoteLinkAddress) == 0 && r.linkRes.resolver != nil && r.isValidForOutgoingRLocked() && !r.local()
 }
 
 func (r *Route) isValidForOutgoing() bool {
@@ -402,9 +429,9 @@ func (r *Route) isValidForOutgoingRLocked() bool {
 }
 
 // WritePacket writes the packet through the given route.
-func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) *tcpip.Error {
+func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error {
 	if !r.isValidForOutgoing() {
-		return tcpip.ErrInvalidEndpointState
+		return &tcpip.ErrInvalidEndpointState{}
 	}
 
 	return r.outgoingNIC.getNetworkEndpoint(r.NetProto).WritePacket(r, gso, params, pkt)
@@ -412,9 +439,9 @@ func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt *PacketBuf
 
 // WritePackets writes a list of n packets through the given route and returns
 // the number of packets written.
-func (r *Route) WritePackets(gso *GSO, pkts PacketBufferList, params NetworkHeaderParams) (int, *tcpip.Error) {
+func (r *Route) WritePackets(gso *GSO, pkts PacketBufferList, params NetworkHeaderParams) (int, tcpip.Error) {
 	if !r.isValidForOutgoing() {
-		return 0, tcpip.ErrInvalidEndpointState
+		return 0, &tcpip.ErrInvalidEndpointState{}
 	}
 
 	return r.outgoingNIC.getNetworkEndpoint(r.NetProto).WritePackets(r, gso, pkts, params)
@@ -422,9 +449,9 @@ func (r *Route) WritePackets(gso *GSO, pkts PacketBufferList, params NetworkHead
 
 // WriteHeaderIncludedPacket writes a packet already containing a network
 // header through the given route.
-func (r *Route) WriteHeaderIncludedPacket(pkt *PacketBuffer) *tcpip.Error {
+func (r *Route) WriteHeaderIncludedPacket(pkt *PacketBuffer) tcpip.Error {
 	if !r.isValidForOutgoing() {
-		return tcpip.ErrInvalidEndpointState
+		return &tcpip.ErrInvalidEndpointState{}
 	}
 
 	return r.outgoingNIC.getNetworkEndpoint(r.NetProto).WriteHeaderIncludedPacket(r, pkt)
@@ -493,4 +520,15 @@ func (r *Route) isV4Broadcast(addr tcpip.Address) bool {
 func (r *Route) IsOutboundBroadcast() bool {
 	// Only IPv4 has a notion of broadcast.
 	return r.isV4Broadcast(r.RemoteAddress)
+}
+
+// ConfirmReachable informs the network/link layer that the neighbour used for
+// the route is reachable.
+//
+// "Reachable" is defined as having full-duplex communication between the
+// local and remote ends of the route.
+func (r *Route) ConfirmReachable() {
+	if r.linkRes.resolver != nil {
+		r.linkRes.confirmReachable(r.nextHop())
+	}
 }

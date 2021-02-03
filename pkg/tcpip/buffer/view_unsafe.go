@@ -1,4 +1,4 @@
-// Copyright 2020 The gVisor Authors.
+// Copyright 2021 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,9 @@
 
 package buffer
 
-import (
-	"unsafe"
-)
+import "unsafe"
 
-// minBatch is the smallest Read or Write operation that the
-// WriteFromReader and ReadToWriter functions will use.
-//
-// This is defined as the size of a native pointer.
-const minBatch = int(unsafe.Sizeof(uintptr(0)))
+const (
+	vectorisedViewStructSize = int(unsafe.Sizeof(VectorisedView{}))
+	viewStructSize           = int(unsafe.Sizeof(View{}))
+)

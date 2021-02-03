@@ -102,7 +102,7 @@ type PacketBuffer struct {
 
 	// The following fields are only set by the qdisc layer when the packet
 	// is added to a queue.
-	EgressRoute *Route
+	EgressRoute RouteInfo
 	GSOOptions  *GSO
 
 	// NatDone indicates if the packet has been manipulated as per NAT
@@ -185,6 +185,12 @@ func (pk *PacketBuffer) HeaderSize() int {
 // Size returns the size of packet in bytes.
 func (pk *PacketBuffer) Size() int {
 	return pk.HeaderSize() + pk.Data.Size()
+}
+
+// MemSize returns the estimation size of the pk in memory, including backing
+// buffer data.
+func (pk *PacketBuffer) MemSize() int {
+	return pk.HeaderSize() + pk.Data.MemSize() + packetBufferStructSize
 }
 
 // Views returns the underlying storage of the whole packet.

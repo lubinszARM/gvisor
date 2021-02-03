@@ -19,7 +19,7 @@
 // be used to expose certain endpoints to the sentry while leaving others out,
 // for example, TCP endpoints and Unix-domain endpoints.
 //
-// Lock ordering: netstack => mm: ioSequencePayload copies user memory inside
+// Lock ordering: netstack => mm: ioSequenceReadWriter copies user memory inside
 // tcpip.Endpoint.Write(). Netstack is allowed to (and does) hold locks during
 // this operation.
 package netstack
@@ -55,7 +55,6 @@ import (
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -186,6 +185,20 @@ var Metrics = tcpip.Stats{
 		IPTablesInputDropped:                mustCreateMetric("/netstack/ip/iptables/input_dropped", "Total number of IP packets dropped in the Input chain."),
 		IPTablesOutputDropped:               mustCreateMetric("/netstack/ip/iptables/output_dropped", "Total number of IP packets dropped in the Output chain."),
 	},
+	ARP: tcpip.ARPStats{
+		PacketsReceived:                                 mustCreateMetric("/netstack/arp/packets_received", "Number of ARP packets received from the link layer."),
+		DisabledPacketsReceived:                         mustCreateMetric("/netstack/arp/disabled_packets_received", "Number of ARP packets received from the link layer when the ARP layer is disabled."),
+		MalformedPacketsReceived:                        mustCreateMetric("/netstack/arp/malformed_packets_received", "Number of ARP packets which failed ARP header validation checks."),
+		RequestsReceived:                                mustCreateMetric("/netstack/arp/requests_received", "Number of ARP requests received."),
+		RequestsReceivedUnknownTargetAddress:            mustCreateMetric("/netstack/arp/requests_received_unknown_addr", "Number of ARP requests received with an unknown target address."),
+		OutgoingRequestInterfaceHasNoLocalAddressErrors: mustCreateMetric("/netstack/arp/outgoing_requests_iface_has_no_addr", "Number of failed attempts to send an ARP request with an interface that has no network address."),
+		OutgoingRequestBadLocalAddressErrors:            mustCreateMetric("/netstack/arp/outgoing_requests_invalid_local_addr", "Number of failed attempts to send an ARP request with a provided local address that is invalid."),
+		OutgoingRequestsDropped:                         mustCreateMetric("/netstack/arp/outgoing_requests_dropped", "Number of ARP requests which failed to write to a link-layer endpoint."),
+		OutgoingRequestsSent:                            mustCreateMetric("/netstack/arp/outgoing_requests_sent", "Number of ARP requests sent."),
+		RepliesReceived:                                 mustCreateMetric("/netstack/arp/replies_received", "Number of ARP replies received."),
+		OutgoingRepliesDropped:                          mustCreateMetric("/netstack/arp/outgoing_replies_dropped", "Number of ARP replies which failed to write to a link-layer endpoint."),
+		OutgoingRepliesSent:                             mustCreateMetric("/netstack/arp/outgoing_replies_sent", "Number of ARP replies sent."),
+	},
 	TCP: tcpip.TCPStats{
 		ActiveConnectionOpenings:           mustCreateMetric("/netstack/tcp/active_connection_openings", "Number of connections opened successfully via Connect."),
 		PassiveConnectionOpenings:          mustCreateMetric("/netstack/tcp/passive_connection_openings", "Number of connections opened successfully via Listen."),
@@ -238,11 +251,11 @@ var errStackType = syserr.New("expected but did not receive a netstack.Stack", l
 type commonEndpoint interface {
 	// GetLocalAddress implements tcpip.Endpoint.GetLocalAddress and
 	// transport.Endpoint.GetLocalAddress.
-	GetLocalAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// GetRemoteAddress implements tcpip.Endpoint.GetRemoteAddress and
 	// transport.Endpoint.GetRemoteAddress.
-	GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error)
+	GetRemoteAddress() (tcpip.FullAddress, tcpip.Error)
 
 	// Readiness implements tcpip.Endpoint.Readiness and
 	// transport.Endpoint.Readiness.
@@ -250,19 +263,19 @@ type commonEndpoint interface {
 
 	// SetSockOpt implements tcpip.Endpoint.SetSockOpt and
 	// transport.Endpoint.SetSockOpt.
-	SetSockOpt(tcpip.SettableSocketOption) *tcpip.Error
+	SetSockOpt(tcpip.SettableSocketOption) tcpip.Error
 
 	// SetSockOptInt implements tcpip.Endpoint.SetSockOptInt and
 	// transport.Endpoint.SetSockOptInt.
-	SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error
+	SetSockOptInt(opt tcpip.SockOptInt, v int) tcpip.Error
 
 	// GetSockOpt implements tcpip.Endpoint.GetSockOpt and
 	// transport.Endpoint.GetSockOpt.
-	GetSockOpt(tcpip.GettableSocketOption) *tcpip.Error
+	GetSockOpt(tcpip.GettableSocketOption) tcpip.Error
 
 	// GetSockOptInt implements tcpip.Endpoint.GetSockOptInt and
 	// transport.Endpoint.GetSockOpt.
-	GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error)
+	GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error)
 
 	// State returns a socket's lifecycle state. The returned value is
 	// protocol-specific and is primarily used for diagnostics.
@@ -270,7 +283,7 @@ type commonEndpoint interface {
 
 	// LastError implements tcpip.Endpoint.LastError and
 	// transport.Endpoint.LastError.
-	LastError() *tcpip.Error
+	LastError() tcpip.Error
 
 	// SocketOptions implements tcpip.Endpoint.SocketOptions and
 	// transport.Endpoint.SocketOptions.
@@ -410,8 +423,13 @@ func (s *SocketOperations) WriteTo(ctx context.Context, _ *fs.File, dst io.Write
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
+	w := tcpip.LimitedWriter{
+		W: dst,
+		N: count,
+	}
+
 	// This may return a blocking error.
-	res, err := s.Endpoint.Read(dst, int(count), tcpip.ReadOptions{
+	res, err := s.Endpoint.Read(&w, tcpip.ReadOptions{
 		Peek: dup,
 	})
 	if err != nil {
@@ -420,115 +438,58 @@ func (s *SocketOperations) WriteTo(ctx context.Context, _ *fs.File, dst io.Write
 	return int64(res.Count), nil
 }
 
-// ioSequencePayload implements tcpip.Payload.
-//
-// t copies user memory bytes on demand based on the requested size.
-type ioSequencePayload struct {
-	ctx context.Context
-	src usermem.IOSequence
-}
-
-// FullPayload implements tcpip.Payloader.FullPayload
-func (i *ioSequencePayload) FullPayload() ([]byte, *tcpip.Error) {
-	return i.Payload(int(i.src.NumBytes()))
-}
-
-// Payload implements tcpip.Payloader.Payload.
-func (i *ioSequencePayload) Payload(size int) ([]byte, *tcpip.Error) {
-	if max := int(i.src.NumBytes()); size > max {
-		size = max
-	}
-	v := buffer.NewView(size)
-	if _, err := i.src.CopyIn(i.ctx, v); err != nil {
-		// EOF can be returned only if src is a file and this means it
-		// is in a splice syscall and the error has to be ignored.
-		if err == io.EOF {
-			return v, nil
-		}
-		return nil, tcpip.ErrBadAddress
-	}
-	return v, nil
-}
-
-// DropFirst drops the first n bytes from underlying src.
-func (i *ioSequencePayload) DropFirst(n int) {
-	i.src = i.src.DropFirst(int(n))
-}
-
 // Write implements fs.FileOperations.Write.
 func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
-	f := &ioSequencePayload{ctx: ctx, src: src}
-	n, err := s.Endpoint.Write(f, tcpip.WriteOptions{})
-	if err == tcpip.ErrWouldBlock {
+	r := src.Reader(ctx)
+	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
+	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		return 0, syserror.ErrWouldBlock
 	}
 	if err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
 
-	if int64(n) < src.NumBytes() {
-		return int64(n), syserror.ErrWouldBlock
+	if n < src.NumBytes() {
+		return n, syserror.ErrWouldBlock
 	}
 
-	return int64(n), nil
+	return n, nil
 }
 
-// readerPayload implements tcpip.Payloader.
-//
-// It allocates a view and reads from a reader on-demand, based on available
-// capacity in the endpoint.
-type readerPayload struct {
-	ctx   context.Context
-	r     io.Reader
-	count int64
+var _ tcpip.Payloader = (*limitedPayloader)(nil)
+
+type limitedPayloader struct {
+	inner io.LimitedReader
 	err   error
 }
 
-// FullPayload implements tcpip.Payloader.FullPayload.
-func (r *readerPayload) FullPayload() ([]byte, *tcpip.Error) {
-	return r.Payload(int(r.count))
+func (l *limitedPayloader) Read(p []byte) (int, error) {
+	n, err := l.inner.Read(p)
+	l.err = err
+	return n, err
 }
 
-// Payload implements tcpip.Payloader.Payload.
-func (r *readerPayload) Payload(size int) ([]byte, *tcpip.Error) {
-	if size > int(r.count) {
-		size = int(r.count)
-	}
-	v := buffer.NewView(size)
-	n, err := r.r.Read(v)
-	if n > 0 {
-		// We ignore the error here. It may re-occur on subsequent
-		// reads, but for now we can enqueue some amount of data.
-		r.count -= int64(n)
-		return v[:n], nil
-	}
-	if err == syserror.ErrWouldBlock {
-		return nil, tcpip.ErrWouldBlock
-	} else if err != nil {
-		r.err = err // Save for propation.
-		return nil, tcpip.ErrBadAddress
-	}
-
-	// There is no data and no error. Return an error, which will propagate
-	// r.err, which will be nil. This is the desired result: (0, nil).
-	return nil, tcpip.ErrBadAddress
+func (l *limitedPayloader) Len() int {
+	return int(l.inner.N)
 }
 
 // ReadFrom implements fs.FileOperations.ReadFrom.
 func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader, count int64) (int64, error) {
-	f := &readerPayload{ctx: ctx, r: r, count: count}
-	n, err := s.Endpoint.Write(f, tcpip.WriteOptions{
+	f := limitedPayloader{
+		inner: io.LimitedReader{
+			R: r,
+			N: count,
+		},
+	}
+	n, err := s.Endpoint.Write(&f, tcpip.WriteOptions{
 		// Reads may be destructive but should be very fast,
 		// so we can't release the lock while copying data.
 		Atomic: true,
 	})
-	if err == tcpip.ErrWouldBlock {
-		return n, syserror.ErrWouldBlock
-	} else if err != nil {
-		return int64(n), f.err // Propagate error.
+	if _, ok := err.(*tcpip.ErrBadBuffer); ok {
+		return n, f.err
 	}
-
-	return int64(n), nil
+	return n, syserr.TranslateNetstackError(err).ToError()
 }
 
 // Readiness returns a mask of ready events for socket s.
@@ -572,7 +533,7 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 
 	if family == linux.AF_UNSPEC {
 		err := s.Endpoint.Disconnect()
-		if err == tcpip.ErrNotSupported {
+		if _, ok := err.(*tcpip.ErrNotSupported); ok {
 			return syserr.ErrAddressFamilyNotSupported
 		}
 		return syserr.TranslateNetstackError(err)
@@ -594,15 +555,16 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 	s.EventRegister(&e, waiter.EventOut)
 	defer s.EventUnregister(&e)
 
-	if err := s.Endpoint.Connect(addr); err != tcpip.ErrConnectStarted && err != tcpip.ErrAlreadyConnecting {
+	switch err := s.Endpoint.Connect(addr); err.(type) {
+	case *tcpip.ErrConnectStarted, *tcpip.ErrAlreadyConnecting:
+	case *tcpip.ErrNoPortAvailable:
 		if (s.family == unix.AF_INET || s.family == unix.AF_INET6) && s.skType == linux.SOCK_STREAM {
 			// TCP unlike UDP returns EADDRNOTAVAIL when it can't
 			// find an available local ephemeral port.
-			if err == tcpip.ErrNoPortAvailable {
-				return syserr.ErrAddressNotAvailable
-			}
+			return syserr.ErrAddressNotAvailable
 		}
-
+		return syserr.TranslateNetstackError(err)
+	default:
 		return syserr.TranslateNetstackError(err)
 	}
 
@@ -660,16 +622,16 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 
 	// Issue the bind request to the endpoint.
 	err := s.Endpoint.Bind(addr)
-	if err == tcpip.ErrNoPortAvailable {
+	if _, ok := err.(*tcpip.ErrNoPortAvailable); ok {
 		// Bind always returns EADDRINUSE irrespective of if the specified port was
 		// already bound or if an ephemeral port was requested but none were
 		// available.
 		//
-		// tcpip.ErrNoPortAvailable is mapped to EAGAIN in syserr package because
+		// *tcpip.ErrNoPortAvailable is mapped to EAGAIN in syserr package because
 		// UDP connect returns EAGAIN on ephemeral port exhaustion.
 		//
 		// TCP connect returns EADDRNOTAVAIL on ephemeral port exhaustion.
-		err = tcpip.ErrPortInUse
+		err = &tcpip.ErrPortInUse{}
 	}
 
 	return syserr.TranslateNetstackError(err)
@@ -692,7 +654,8 @@ func (s *socketOpsCommon) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAdd
 	// Try to accept the connection again; if it fails, then wait until we
 	// get a notification.
 	for {
-		if ep, wq, err := s.Endpoint.Accept(peerAddr); err != tcpip.ErrWouldBlock {
+		ep, wq, err := s.Endpoint.Accept(peerAddr)
+		if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
 			return ep, wq, syserr.TranslateNetstackError(err)
 		}
 
@@ -711,7 +674,7 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 	}
 	ep, wq, terr := s.Endpoint.Accept(peerAddr)
 	if terr != nil {
-		if terr != tcpip.ErrWouldBlock || !blocking {
+		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
 			return 0, nil, 0, syserr.TranslateNetstackError(terr)
 		}
 
@@ -892,7 +855,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		size, err := ep.GetSockOptInt(tcpip.SendBufferSizeOption)
+		size, err := ep.SocketOptions().GetSendBufferSize()
 		if err != nil {
 			return nil, syserr.TranslateNetstackError(err)
 		}
@@ -1144,6 +1107,29 @@ func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, 
 		// TODO(b/64800844): Translate fields once they are added to
 		// tcpip.TCPInfoOption.
 		info := linux.TCPInfo{}
+		switch v.CcState {
+		case tcpip.RTORecovery:
+			info.CaState = linux.TCP_CA_Loss
+		case tcpip.FastRecovery, tcpip.SACKRecovery:
+			info.CaState = linux.TCP_CA_Recovery
+		case tcpip.Disorder:
+			info.CaState = linux.TCP_CA_Disorder
+		case tcpip.Open:
+			info.CaState = linux.TCP_CA_Open
+		}
+		info.RTO = uint32(v.RTO / time.Microsecond)
+		info.RTT = uint32(v.RTT / time.Microsecond)
+		info.RTTVar = uint32(v.RTTVar / time.Microsecond)
+		info.SndSsthresh = v.SndSsthresh
+		info.SndCwnd = v.SndCwnd
+
+		// In netstack reorderSeen is updated only when RACK is enabled.
+		// We only track whether the reordering is seen, which is
+		// different than Linux where reorderSeen is not specific to
+		// RACK and is incremented when a reordering event is seen.
+		if v.ReorderSeen {
+			info.ReordSeen = 1
+		}
 
 		// Linux truncates the output binary to outLen.
 		buf := t.CopyScratchBuffer(info.SizeBytes())
@@ -1661,8 +1647,16 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 			return syserr.ErrInvalidArgument
 		}
 
+		family, _, _ := s.Type()
+		// TODO(gvisor.dev/issue/5132): We currently do not support
+		// setting this option for unix sockets.
+		if family == linux.AF_UNIX {
+			return nil
+		}
+
 		v := usermem.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.SendBufferSizeOption, int(v)))
+		ep.SocketOptions().SetSendBufferSize(int64(v), true)
+		return nil
 
 	case linux.SO_RCVBUF:
 		if len(optVal) < sizeOfInt32 {
@@ -1793,10 +1787,6 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 
 		var v linux.Linger
 		binary.Unmarshal(optVal[:linux.SizeOfLinger], usermem.ByteOrder, &v)
-
-		if v != (linux.Linger{}) {
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
-		}
 
 		ep.SocketOptions().SetLinger(tcpip.LingerOption{
 			Enabled: v.OnOff != 0,
@@ -2564,7 +2554,10 @@ func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSeq
 	// caller-supplied  buffer.
 	var w io.Writer
 	if !isPacket && trunc {
-		w = ioutil.Discard
+		w = &tcpip.LimitedWriter{
+			W: ioutil.Discard,
+			N: dst.NumBytes(),
+		}
 	} else {
 		w = dst.Writer(ctx)
 	}
@@ -2572,7 +2565,10 @@ func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSeq
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	res, err := s.Endpoint.Read(w, int(dst.NumBytes()), readOptions)
+	res, err := s.Endpoint.Read(w, readOptions)
+	if _, ok := err.(*tcpip.ErrBadBuffer); ok && dst.NumBytes() == 0 {
+		err = nil
+	}
 	if err != nil {
 		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.TranslateNetstackError(err)
 	}
@@ -2670,9 +2666,9 @@ func (s *socketOpsCommon) dequeueErr() *tcpip.SockError {
 	}
 
 	// Update socket error to reflect ICMP errors in queue.
-	if nextErr := so.PeekErr(); nextErr != nil && nextErr.ErrOrigin.IsICMPErr() {
+	if nextErr := so.PeekErr(); nextErr != nil && nextErr.Cause.Origin().IsICMPErr() {
 		so.SetLastError(nextErr.Err)
-	} else if err.ErrOrigin.IsICMPErr() {
+	} else if err.Cause.Origin().IsICMPErr() {
 		so.SetLastError(nil)
 	}
 	return err
@@ -2814,45 +2810,48 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 		EndOfRecord: flags&linux.MSG_EOR != 0,
 	}
 
-	v := &ioSequencePayload{t, src}
-	n, err := s.Endpoint.Write(v, opts)
-	dontWait := flags&linux.MSG_DONTWAIT != 0
-	if err == nil && (n >= v.src.NumBytes() || dontWait) {
-		// Complete write.
-		return int(n), nil
-	}
-	if err != nil && (err != tcpip.ErrWouldBlock || dontWait) {
-		return int(n), syserr.TranslateNetstackError(err)
-	}
-
-	// We'll have to block. Register for notification and keep trying to
-	// send all the data.
-	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.EventOut)
-	defer s.EventUnregister(&e)
-
-	v.DropFirst(int(n))
-	total := n
+	r := src.Reader(t)
+	var (
+		total int64
+		entry waiter.Entry
+		ch    <-chan struct{}
+	)
 	for {
-		n, err = s.Endpoint.Write(v, opts)
-		v.DropFirst(int(n))
+		n, err := s.Endpoint.Write(r, opts)
 		total += n
-
-		if err != nil && err != tcpip.ErrWouldBlock && total == 0 {
-			return 0, syserr.TranslateNetstackError(err)
+		if flags&linux.MSG_DONTWAIT != 0 {
+			return int(total), syserr.TranslateNetstackError(err)
 		}
-
-		if err == nil && v.src.NumBytes() == 0 || err != nil && err != tcpip.ErrWouldBlock {
-			return int(total), nil
+		block := true
+		switch err.(type) {
+		case nil:
+			block = total != src.NumBytes()
+		case *tcpip.ErrWouldBlock:
+		default:
+			block = false
 		}
-
-		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
-			if err == syserror.ETIMEDOUT {
-				return int(total), syserr.ErrTryAgain
+		if block {
+			if ch == nil {
+				// We'll have to block. Register for notification and keep trying to
+				// send all the data.
+				entry, ch = waiter.NewChannelEntry(nil)
+				s.EventRegister(&entry, waiter.EventOut)
+				defer s.EventUnregister(&entry)
+			} else {
+				// Don't wait immediately after registration in case more data
+				// became available between when we last checked and when we setup
+				// the notification.
+				if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
+					if err == syserror.ETIMEDOUT {
+						return int(total), syserr.ErrTryAgain
+					}
+					// handleIOError will consume errors from t.Block if needed.
+					return int(total), syserr.FromError(err)
+				}
 			}
-			// handleIOError will consume errors from t.Block if needed.
-			return int(total), syserr.FromError(err)
+			continue
 		}
+		return int(total), syserr.TranslateNetstackError(err)
 	}
 }
 

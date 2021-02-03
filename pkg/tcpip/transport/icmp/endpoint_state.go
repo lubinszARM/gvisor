@@ -69,12 +69,13 @@ func (e *endpoint) afterLoad() {
 // Resume implements tcpip.ResumableEndpoint.Resume.
 func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
+	e.ops.InitHandler(e, e.stack, tcpip.GetStackSendBufferLimits)
 
 	if e.state != stateBound && e.state != stateConnected {
 		return
 	}
 
-	var err *tcpip.Error
+	var err tcpip.Error
 	if e.state == stateConnected {
 		e.route, err = e.stack.FindRoute(e.RegisterNICID, e.BindAddr, e.ID.RemoteAddress, e.NetProto, false /* multicastLoop */)
 		if err != nil {
@@ -84,7 +85,7 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		e.ID.LocalAddress = e.route.LocalAddress
 	} else if len(e.ID.LocalAddress) != 0 { // stateBound
 		if e.stack.CheckLocalAddress(e.RegisterNICID, e.NetProto, e.ID.LocalAddress) == 0 {
-			panic(tcpip.ErrBadLocalAddress)
+			panic(&tcpip.ErrBadLocalAddress{})
 		}
 	}
 

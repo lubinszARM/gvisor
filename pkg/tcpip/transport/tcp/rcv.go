@@ -347,7 +347,7 @@ func (r *receiver) updateRTT() {
 	r.ep.rcvListMu.Unlock()
 }
 
-func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, closed bool) (drop bool, err *tcpip.Error) {
+func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, closed bool) (drop bool, err tcpip.Error) {
 	r.ep.rcvListMu.Lock()
 	rcvClosed := r.ep.rcvClosed || r.closed
 	r.ep.rcvListMu.Unlock()
@@ -385,7 +385,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 		// fails, we ignore the packet:
 		// https://github.com/torvalds/linux/blob/v5.8/net/ipv4/tcp_input.c#L5591
 		if r.ep.snd.sndNxt.LessThan(s.ackNumber) {
-			r.ep.snd.sendAck()
+			r.ep.snd.maybeSendOutOfWindowAck(s)
 			return true, nil
 		}
 
@@ -395,7 +395,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 		// trigger a RST.
 		endDataSeq := s.sequenceNumber.Add(seqnum.Size(s.data.Size()))
 		if state != StateCloseWait && rcvClosed && r.rcvNxt.LessThan(endDataSeq) {
-			return true, tcpip.ErrConnectionAborted
+			return true, &tcpip.ErrConnectionAborted{}
 		}
 		if state == StateFinWait1 {
 			break
@@ -424,7 +424,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 		// the last actual data octet in a segment in
 		// which it occurs.
 		if closed && (!s.flagIsSet(header.TCPFlagFin) || s.sequenceNumber.Add(s.logicalLen()) != r.rcvNxt+1) {
-			return true, tcpip.ErrConnectionAborted
+			return true, &tcpip.ErrConnectionAborted{}
 		}
 	}
 
@@ -443,7 +443,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 
 // handleRcvdSegment handles TCP segments directed at the connection managed by
 // r as they arrive. It is called by the protocol main loop.
-func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
+func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	state := r.ep.EndpointState()
 	closed := r.ep.closed
 
@@ -454,7 +454,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
 	// send an ACK and stop further processing of the segment.
 	// This is according to RFC 793, page 68.
 	if !r.acceptable(segSeq, segLen) {
-		r.ep.snd.sendAck()
+		r.ep.snd.maybeSendOutOfWindowAck(s)
 		return true, nil
 	}
 

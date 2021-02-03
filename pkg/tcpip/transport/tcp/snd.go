@@ -48,34 +48,13 @@ const (
 	MaxRetries = 15
 )
 
-// ccState indicates the current congestion control state for this sender.
-type ccState int
-
-const (
-	// Open indicates that the sender is receiving acks in order and
-	// no loss or dupACK's etc have been detected.
-	Open ccState = iota
-	// RTORecovery indicates that an RTO has occurred and the sender
-	// has entered an RTO based recovery phase.
-	RTORecovery
-	// FastRecovery indicates that the sender has entered FastRecovery
-	// based on receiving nDupAck's. This state is entered only when
-	// SACK is not in use.
-	FastRecovery
-	// SACKRecovery indicates that the sender has entered SACK based
-	// recovery.
-	SACKRecovery
-	// Disorder indicates the sender either received some SACK blocks
-	// or dupACK's.
-	Disorder
-)
-
 // congestionControl is an interface that must be implemented by any supported
 // congestion control algorithm.
 type congestionControl interface {
-	// HandleNDupAcks is invoked when sender.dupAckCount >= nDupAckThreshold
-	// just before entering fast retransmit.
-	HandleNDupAcks()
+	// HandleLossDetected is invoked when the loss is detected by RACK or
+	// sender.dupAckCount >= nDupAckThreshold just before entering fast
+	// retransmit.
+	HandleLossDetected()
 
 	// HandleRTOExpired is invoked when the retransmit timer expires.
 	HandleRTOExpired()
@@ -204,7 +183,7 @@ type sender struct {
 	maxSentAck seqnum.Value
 
 	// state is the current state of congestion control for this endpoint.
-	state ccState
+	state tcpip.CongestionControlState
 
 	// cc is the congestion control algorithm in use for this sender.
 	cc congestionControl
@@ -280,13 +259,8 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 			highRxt:   iss,
 			rescueRxt: iss,
 		},
-		rc: rackControl{
-			fack: iss,
-		},
 		gso: ep.gso != nil,
 	}
-
-	s.rc.init()
 
 	if s.gso {
 		s.ep.gso.MSS = uint16(maxPayloadSize)
@@ -295,6 +269,7 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 	s.cc = s.initCongestionControl(ep.cc)
 
 	s.lr = s.initLossRecovery()
+	s.rc.init(s, iss)
 
 	// A negative sndWndScale means that no scaling is in use, otherwise we
 	// store the scaling value.
@@ -593,7 +568,7 @@ func (s *sender) retransmitTimerExpired() bool {
 		s.leaveRecovery()
 	}
 
-	s.state = RTORecovery
+	s.state = tcpip.RTORecovery
 	s.cc.HandleRTOExpired()
 
 	// Mark the next segment to be sent as the first unacknowledged one and
@@ -1018,7 +993,7 @@ func (s *sender) sendData() {
 	// "A TCP SHOULD set cwnd to no more than RW before beginning
 	// transmission if the TCP has not sent data in the interval exceeding
 	// the retrasmission timeout."
-	if !s.fr.active && s.state != RTORecovery && time.Now().Sub(s.lastSendTime) > s.rto {
+	if !s.fr.active && s.state != tcpip.RTORecovery && time.Now().Sub(s.lastSendTime) > s.rto {
 		if s.sndCwnd > InitialCwnd {
 			s.sndCwnd = InitialCwnd
 		}
@@ -1062,14 +1037,14 @@ func (s *sender) enterRecovery() {
 	s.fr.highRxt = s.sndUna
 	s.fr.rescueRxt = s.sndUna
 	if s.ep.sackPermitted {
-		s.state = SACKRecovery
+		s.state = tcpip.SACKRecovery
 		s.ep.stack.Stats().TCP.SACKRecovery.Increment()
 		// Set TLPRxtOut to false according to
 		// https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.6.1.
 		s.rc.tlpRxtOut = false
 		return
 	}
-	s.state = FastRecovery
+	s.state = tcpip.FastRecovery
 	s.ep.stack.Stats().TCP.FastRecovery.Increment()
 }
 
@@ -1080,7 +1055,6 @@ func (s *sender) leaveRecovery() {
 
 	// Deflate cwnd. It had been artificially inflated when new dups arrived.
 	s.sndCwnd = s.sndSsthresh
-
 	s.cc.PostRecovery()
 }
 
@@ -1166,7 +1140,7 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 		s.fr.highRxt = s.sndUna - 1
 		// Do run SetPipe() to calculate the outstanding segments.
 		s.SetPipe()
-		s.state = Disorder
+		s.state = tcpip.Disorder
 		return false
 	}
 
@@ -1179,7 +1153,7 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 		s.dupAckCount = 0
 		return false
 	}
-	s.cc.HandleNDupAcks()
+	s.cc.HandleLossDetected()
 	s.enterRecovery()
 	s.dupAckCount = 0
 	return true
@@ -1217,11 +1191,13 @@ func (s *sender) isDupAck(seg *segment) bool {
 // See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
 // steps 2 and 3.
 func (s *sender) walkSACK(rcvdSeg *segment) {
+	s.rc.setDSACKSeen(false)
+
 	// Look for DSACK block.
 	idx := 0
 	n := len(rcvdSeg.parsedOptions.SACKBlocks)
 	if checkDSACK(rcvdSeg) {
-		s.rc.setDSACKSeen()
+		s.rc.setDSACKSeen(true)
 		idx = 1
 		n--
 	}
@@ -1242,7 +1218,7 @@ func (s *sender) walkSACK(rcvdSeg *segment) {
 	for _, sb := range sackBlocks {
 		for seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0 {
 			if sb.Start.LessThanEq(seg.sequenceNumber) && !seg.acked {
-				s.rc.update(seg, rcvdSeg, s.ep.tsOffset)
+				s.rc.update(seg, rcvdSeg)
 				s.rc.detectReorder(seg)
 				seg.acked = true
 				s.sackedOut += s.pCount(seg, s.maxPayloadSize)
@@ -1412,6 +1388,17 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		acked := s.sndUna.Size(ack)
 		s.sndUna = ack
 
+		// The remote ACK-ing at least 1 byte is an indication that we have a
+		// full-duplex connection to the remote as the only way we will receive an
+		// ACK is if the remote received data that we previously sent.
+		//
+		// As of writing, linux seems to only confirm a route as reachable when
+		// forward progress is made which is indicated by an ACK that removes data
+		// from the retransmit queue.
+		if acked > 0 {
+			s.ep.route.ConfirmReachable()
+		}
+
 		ackLeft := acked
 		originalOutstanding := s.outstanding
 		for ackLeft > 0 {
@@ -1435,7 +1422,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 
 			// Update the RACK fields if SACK is enabled.
 			if s.ep.sackPermitted && !seg.acked {
-				s.rc.update(seg, rcvdSeg, s.ep.tsOffset)
+				s.rc.update(seg, rcvdSeg)
 				s.rc.detectReorder(seg)
 			}
 
@@ -1464,7 +1451,11 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		if !s.fr.active {
 			s.cc.Update(originalOutstanding - s.outstanding)
 			if s.fr.last.LessThan(s.sndUna) {
-				s.state = Open
+				s.state = tcpip.Open
+				// Update RACK when we are exiting fast or RTO
+				// recovery as described in the RFC
+				// draft-ietf-tcpm-rack-08 Section-7.2 Step 4.
+				s.rc.exitRecovery()
 			}
 		}
 
@@ -1488,6 +1479,12 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		}
 	}
 
+	// Update RACK reorder window.
+	// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
+	// * Upon receiving an ACK:
+	// * Step 4: Update RACK reordering window
+	s.rc.updateRACKReorderWindow(rcvdSeg)
+
 	// Now that we've popped all acknowledged data from the retransmit
 	// queue, retransmit if needed.
 	if s.fr.active {
@@ -1508,7 +1505,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 }
 
 // sendSegment sends the specified segment.
-func (s *sender) sendSegment(seg *segment) *tcpip.Error {
+func (s *sender) sendSegment(seg *segment) tcpip.Error {
 	if seg.xmitCount > 0 {
 		s.ep.stack.Stats().TCP.Retransmits.Increment()
 		s.ep.stats.SendErrors.Retransmits.Increment()
@@ -1539,7 +1536,7 @@ func (s *sender) sendSegment(seg *segment) *tcpip.Error {
 
 // sendSegmentFromView sends a new segment containing the given payload, flags
 // and sequence number.
-func (s *sender) sendSegmentFromView(data buffer.VectorisedView, flags byte, seq seqnum.Value) *tcpip.Error {
+func (s *sender) sendSegmentFromView(data buffer.VectorisedView, flags byte, seq seqnum.Value) tcpip.Error {
 	s.lastSendTime = time.Now()
 	if seq == s.rttMeasureSeqNum {
 		s.rttMeasureTime = s.lastSendTime
@@ -1551,4 +1548,14 @@ func (s *sender) sendSegmentFromView(data buffer.VectorisedView, flags byte, seq
 	s.maxSentAck = rcvNxt
 
 	return s.ep.sendRaw(data, flags, seq, rcvNxt, rcvWnd)
+}
+
+// maybeSendOutOfWindowAck sends an ACK if we are not being rate limited
+// currently.
+func (s *sender) maybeSendOutOfWindowAck(seg *segment) {
+	// Data packets are unlikely to be part of an ACK loop. So always send
+	// an ACK for a packet w/ data.
+	if seg.payloadSize() > 0 || s.ep.allowOutOfWindowAck() {
+		s.sendAck()
+	}
 }

@@ -39,8 +39,8 @@ type FileLocks struct {
 }
 
 // LockBSD tries to acquire a BSD-style lock on the entire file.
-func (fl *FileLocks) LockBSD(uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
-	if fl.bsd.LockRegion(uid, t, fslock.LockRange{0, fslock.LockEOF}, block) {
+func (fl *FileLocks) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerID int32, t fslock.LockType, block fslock.Blocker) error {
+	if fl.bsd.LockRegion(uid, ownerID, t, fslock.LockRange{0, fslock.LockEOF}, block) {
 		return nil
 	}
 
@@ -61,12 +61,8 @@ func (fl *FileLocks) UnlockBSD(uid fslock.UniqueID) {
 }
 
 // LockPOSIX tries to acquire a POSIX-style lock on a file region.
-func (fl *FileLocks) LockPOSIX(ctx context.Context, fd *FileDescription, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	rng, err := computeRange(ctx, fd, start, length, whence)
-	if err != nil {
-		return err
-	}
-	if fl.posix.LockRegion(uid, t, rng, block) {
+func (fl *FileLocks) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
+	if fl.posix.LockRegion(uid, ownerPID, t, r, block) {
 		return nil
 	}
 
@@ -82,37 +78,12 @@ func (fl *FileLocks) LockPOSIX(ctx context.Context, fd *FileDescription, uid fsl
 //
 // This operation is always successful, even if there did not exist a lock on
 // the requested region held by uid in the first place.
-func (fl *FileLocks) UnlockPOSIX(ctx context.Context, fd *FileDescription, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	rng, err := computeRange(ctx, fd, start, length, whence)
-	if err != nil {
-		return err
-	}
-	fl.posix.UnlockRegion(uid, rng)
+func (fl *FileLocks) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	fl.posix.UnlockRegion(uid, r)
 	return nil
 }
 
-func computeRange(ctx context.Context, fd *FileDescription, start uint64, length uint64, whence int16) (fslock.LockRange, error) {
-	var off int64
-	switch whence {
-	case linux.SEEK_SET:
-		off = 0
-	case linux.SEEK_CUR:
-		// Note that Linux does not hold any mutexes while retrieving the file
-		// offset, see fs/locks.c:flock_to_posix_lock and fs/locks.c:fcntl_setlk.
-		curOff, err := fd.Seek(ctx, 0, linux.SEEK_CUR)
-		if err != nil {
-			return fslock.LockRange{}, err
-		}
-		off = curOff
-	case linux.SEEK_END:
-		stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_SIZE})
-		if err != nil {
-			return fslock.LockRange{}, err
-		}
-		off = int64(stat.Size)
-	default:
-		return fslock.LockRange{}, syserror.EINVAL
-	}
-
-	return fslock.ComputeRange(int64(start), int64(length), off)
+// TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
+func (fl *FileLocks) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	return fl.posix.TestRegion(ctx, uid, t, r), nil
 }

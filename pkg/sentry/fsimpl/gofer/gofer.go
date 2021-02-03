@@ -1944,22 +1944,22 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
-func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
+func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
 	fd.lockLogging.Do(func() {
 		log.Infof("File lock using gofer file handled internally.")
 	})
-	return fd.LockFD.LockBSD(ctx, uid, t, block)
+	return fd.LockFD.LockBSD(ctx, uid, ownerPID, t, block)
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
 	fd.lockLogging.Do(func() {
 		log.Infof("Range lock using gofer file handled internally.")
 	})
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+	return fd.Locks().LockPOSIX(ctx, uid, ownerPID, t, r, block)
 }
 
 // UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
+	return fd.Locks().UnlockPOSIX(ctx, uid, r)
 }

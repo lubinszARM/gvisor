@@ -45,26 +45,53 @@ type Endpoint struct {
 	linkAddr   tcpip.LinkAddress
 }
 
-// WritePacket implements stack.LinkEndpoint.
-func (e *Endpoint) WritePacket(r *stack.Route, _ *stack.GSO, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
-	if !e.linked.IsAttached() {
-		return nil
-	}
-
+func (e *Endpoint) deliverPackets(r stack.RouteInfo, proto tcpip.NetworkProtocolNumber, pkts stack.PacketBufferList) {
 	// Note that the local address from the perspective of this endpoint is the
 	// remote address from the perspective of the other end of the pipe
 	// (e.linked). Similarly, the remote address from the perspective of this
 	// endpoint is the local address on the other end.
-	e.linked.dispatcher.DeliverNetworkPacket(r.LocalLinkAddress /* remote */, r.RemoteLinkAddress() /* local */, proto, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
-	}))
+	//
+	// Deliver the packet in a new goroutine to escape this goroutine's stack and
+	// avoid a deadlock when a packet triggers a response which leads the stack to
+	// try and take a lock it already holds.
+	//
+	// As of writing, a deadlock may occur when performing link resolution as the
+	// neighbor table will send a solicitation while holding a lock and the
+	// response advertisement will be sent in the same stack that sent the
+	// solictation. When the response is received, the stack attempts to take the
+	// same lock it already took before sending the solicitation, leading to a
+	// deadlock. Basically, we attempt to lock the same lock twice in the same
+	// call stack.
+	//
+	// TODO(gvisor.dev/issue/5289): don't use a new goroutine once we support send
+	// and receive queues.
+	go func() {
+		for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+			e.linked.dispatcher.DeliverNetworkPacket(r.LocalLinkAddress /* remote */, r.RemoteLinkAddress /* local */, proto, stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Data: buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
+			}))
+		}
+	}()
+}
+
+// WritePacket implements stack.LinkEndpoint.
+func (e *Endpoint) WritePacket(r stack.RouteInfo, _ *stack.GSO, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+	if e.linked.IsAttached() {
+		var pkts stack.PacketBufferList
+		pkts.PushBack(pkt)
+		e.deliverPackets(r, proto, pkts)
+	}
 
 	return nil
 }
 
 // WritePackets implements stack.LinkEndpoint.
-func (*Endpoint) WritePackets(*stack.Route, *stack.GSO, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
-	panic("not implemented")
+func (e *Endpoint) WritePackets(r stack.RouteInfo, _ *stack.GSO, pkts stack.PacketBufferList, proto tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+	if e.linked.IsAttached() {
+		e.deliverPackets(r, proto, pkts)
+	}
+
+	return pkts.Len(), nil
 }
 
 // Attach implements stack.LinkEndpoint.
