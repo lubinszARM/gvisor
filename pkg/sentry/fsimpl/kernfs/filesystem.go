@@ -464,7 +464,8 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	// O_NOFOLLOW have no effect here (they're handled by VFS by setting
 	// appropriate bits in rp), but are returned by
 	// FileDescriptionImpl.StatusFlags().
-	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC | linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK
+	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
+		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	ats := vfs.AccessTypesForOpenFlags(&opts)
 
 	// Do not create new file.
@@ -667,8 +668,14 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	// Can we create the dst dentry?
 	var dst *Dentry
-	pc := rp.Component()
-	switch err := checkCreateLocked(ctx, rp.Credentials(), pc, dstDir); err {
+	newName := rp.Component()
+	if newName == "." || newName == ".." {
+		if noReplace {
+			return syserror.EEXIST
+		}
+		return syserror.EBUSY
+	}
+	switch err := checkCreateLocked(ctx, rp.Credentials(), newName, dstDir); err {
 	case nil:
 		// Ok, continue with rename as replacement.
 	case syserror.EEXIST:
@@ -676,13 +683,18 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			// Won't overwrite existing node since RENAME_NOREPLACE was requested.
 			return syserror.EEXIST
 		}
-		dst = dstDir.children[pc]
+		dst = dstDir.children[newName]
 		if dst == nil {
-			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", pc, dstDir))
+			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", newName, dstDir))
 		}
 	default:
 		return err
 	}
+
+	if srcDir == dstDir && oldName == newName {
+		return nil
+	}
+
 	var dstVFSD *vfs.Dentry
 	if dst != nil {
 		dstVFSD = dst.VFSDentry()
@@ -705,7 +717,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD); err != nil {
 		return err
 	}
-	err = srcDir.inode.Rename(ctx, src.name, pc, src.inode, dstDir.inode)
+	err = srcDir.inode.Rename(ctx, src.name, newName, src.inode, dstDir.inode)
 	if err != nil {
 		virtfs.AbortRenameDentry(srcVFSD, dstVFSD)
 		return err
@@ -716,12 +728,12 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		dstDir.IncRef()        // child (src) takes a ref on the new parent.
 	}
 	src.parent = dstDir
-	src.name = pc
+	src.name = newName
 	if dstDir.children == nil {
 		dstDir.children = make(map[string]*Dentry)
 	}
-	replaced := dstDir.children[pc]
-	dstDir.children[pc] = src
+	replaced := dstDir.children[newName]
+	dstDir.children[newName] = src
 	var replaceVFSD *vfs.Dentry
 	if replaced != nil {
 		// deferDecRef so that fs.mu and dstDir.mu are unlocked by then.

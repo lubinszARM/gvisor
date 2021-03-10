@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/google/subcommands"
 	"golang.org/x/sys/unix"
@@ -52,7 +51,7 @@ func (*Kill) Usage() string {
 // SetFlags implements subcommands.Command.SetFlags.
 func (k *Kill) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&k.all, "all", false, "send the specified signal to all processes inside the container")
-	f.IntVar(&k.pid, "pid", 0, "send the specified signal to a specific process")
+	f.IntVar(&k.pid, "pid", 0, "send the specified signal to a specific process. pid is relative to the root PID namespace")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -99,10 +98,10 @@ func (k *Kill) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	return subcommands.ExitSuccess
 }
 
-func parseSignal(s string) (syscall.Signal, error) {
+func parseSignal(s string) (unix.Signal, error) {
 	n, err := strconv.Atoi(s)
 	if err == nil {
-		sig := syscall.Signal(n)
+		sig := unix.Signal(n)
 		for _, msig := range signalMap {
 			if sig == msig {
 				return sig, nil
@@ -116,7 +115,7 @@ func parseSignal(s string) (syscall.Signal, error) {
 	return -1, fmt.Errorf("unknown signal %q", s)
 }
 
-var signalMap = map[string]syscall.Signal{
+var signalMap = map[string]unix.Signal{
 	"ABRT":   unix.SIGABRT,
 	"ALRM":   unix.SIGALRM,
 	"BUS":    unix.SIGBUS,

@@ -22,10 +22,12 @@ import (
 	"reflect"
 	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
+	"gvisor.dev/gvisor/pkg/tcpip/network/internal/ip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -34,6 +36,7 @@ const (
 	ProtocolNumber = header.ARPProtocolNumber
 )
 
+var _ stack.DuplicateAddressDetector = (*endpoint)(nil)
 var _ stack.LinkAddressResolver = (*endpoint)(nil)
 
 // ARP endpoints need to implement stack.NetworkEndpoint because the stack
@@ -52,6 +55,35 @@ type endpoint struct {
 
 	nic   stack.NetworkInterface
 	stats sharedStats
+
+	mu struct {
+		sync.Mutex
+
+		dad ip.DAD
+	}
+}
+
+// CheckDuplicateAddress implements stack.DuplicateAddressDetector.
+func (e *endpoint) CheckDuplicateAddress(addr tcpip.Address, h stack.DADCompletionHandler) stack.DADCheckAddressDisposition {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.mu.dad.CheckDuplicateAddressLocked(addr, h)
+}
+
+// SetDADConfigurations implements stack.DuplicateAddressDetector.
+func (e *endpoint) SetDADConfigurations(c stack.DADConfigurations) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mu.dad.SetConfigsLocked(c)
+}
+
+// DuplicateAddressProtocol implements stack.DuplicateAddressDetector.
+func (*endpoint) DuplicateAddressProtocol() tcpip.NetworkProtocolNumber {
+	return header.IPv4ProtocolNumber
+}
+
+func (e *endpoint) SendDADMessage(addr tcpip.Address) tcpip.Error {
+	return e.sendARPRequest(header.IPv4Any, addr, header.EthernetBroadcastAddress)
 }
 
 func (e *endpoint) Enable() tcpip.Error {
@@ -129,6 +161,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		return
 	}
 
+	if _, _, ok := e.protocol.Parse(pkt); !ok {
+		stats.malformedPacketsReceived.Increment()
+		return
+	}
+
 	h := header.ARP(pkt.NetworkHeader().View())
 	if !h.IsValid() {
 		stats.malformedPacketsReceived.Increment()
@@ -140,7 +177,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		stats.requestsReceived.Increment()
 		localAddr := tcpip.Address(h.ProtocolAddressTarget())
 
-		if e.protocol.stack.CheckLocalAddress(e.nic.ID(), header.IPv4ProtocolNumber, localAddr) == 0 {
+		if !e.nic.CheckLocalAddress(header.IPv4ProtocolNumber, localAddr) {
 			stats.requestsReceivedUnknownTargetAddress.Increment()
 			return // we have no useful answer, ignore the request
 		}
@@ -194,6 +231,10 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		addr := tcpip.Address(h.ProtocolAddressSender())
 		linkAddr := tcpip.LinkAddress(h.HardwareAddressSender())
 
+		e.mu.Lock()
+		e.mu.dad.StopLocked(addr, &stack.DADDupAddrDetected{HolderLinkAddress: linkAddr})
+		e.mu.Unlock()
+
 		// The solicited, override, and isRouter flags are not available for ARP;
 		// they are only available for IPv6 Neighbor Advertisements.
 		switch err := e.nic.HandleNeighborConfirmation(header.IPv4ProtocolNumber, addr, linkAddr, stack.ReachabilityConfirmationFlags{
@@ -222,9 +263,9 @@ func (e *endpoint) Stats() stack.NetworkEndpointStats {
 
 var _ stack.NetworkProtocol = (*protocol)(nil)
 
-// protocol implements stack.NetworkProtocol and stack.LinkAddressResolver.
 type protocol struct {
-	stack *stack.Stack
+	stack   *stack.Stack
+	options Options
 }
 
 func (p *protocol) Number() tcpip.NetworkProtocolNumber { return ProtocolNumber }
@@ -240,6 +281,14 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, dispatcher stack.Tran
 		protocol: p,
 		nic:      nic,
 	}
+
+	e.mu.Lock()
+	e.mu.dad.Init(&e.mu, p.options.DADConfigs, ip.DADOptions{
+		Clock:    p.stack.Clock(),
+		Protocol: e,
+		NICID:    nic.ID(),
+	})
+	e.mu.Unlock()
 
 	tcpip.InitStatCounters(reflect.ValueOf(&e.stats.localStats).Elem())
 
@@ -276,13 +325,17 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 		}
 
 		localAddr = addr.Address
-	} else if e.protocol.stack.CheckLocalAddress(nicID, header.IPv4ProtocolNumber, localAddr) == 0 {
+	} else if !e.nic.CheckLocalAddress(header.IPv4ProtocolNumber, localAddr) {
 		stats.outgoingRequestBadLocalAddressErrors.Increment()
 		return &tcpip.ErrBadLocalAddress{}
 	}
 
+	return e.sendARPRequest(localAddr, targetAddr, remoteLinkAddr)
+}
+
+func (e *endpoint) sendARPRequest(localAddr, targetAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress) tcpip.Error {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: int(e.nic.MaxHeaderLength()) + header.ARPSize,
+		ReserveHeaderBytes: int(e.MaxHeaderLength()),
 	})
 	h := header.ARP(pkt.NetworkHeader().Push(header.ARPSize))
 	pkt.NetworkProtocolNumber = ProtocolNumber
@@ -297,6 +350,8 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 	if n := copy(h.ProtocolAddressTarget(), targetAddr); n != header.IPv4AddressSize {
 		panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, header.IPv4AddressSize))
 	}
+
+	stats := e.stats.arp
 	if err := e.nic.WritePacketToRemote(remoteLinkAddr, nil /* gso */, ProtocolNumber, pkt); err != nil {
 		stats.outgoingRequestsDropped.Increment()
 		return err
@@ -337,9 +392,24 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 	return 0, false, parse.ARP(pkt)
 }
 
+// Options holds options to configure a protocol.
+type Options struct {
+	// DADConfigs is the default DAD configurations used by ARP endpoints.
+	DADConfigs stack.DADConfigurations
+}
+
+// NewProtocolWithOptions returns an ARP network protocol factory that
+// will return an ARP network protocol with the provided options.
+func NewProtocolWithOptions(opts Options) stack.NetworkProtocolFactory {
+	return func(s *stack.Stack) stack.NetworkProtocol {
+		return &protocol{
+			stack:   s,
+			options: opts,
+		}
+	}
+}
+
 // NewProtocol returns an ARP network protocol.
 func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
-	return &protocol{
-		stack: s,
-	}
+	return NewProtocolWithOptions(Options{})(s)
 }

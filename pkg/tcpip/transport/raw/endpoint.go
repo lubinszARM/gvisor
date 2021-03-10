@@ -84,7 +84,6 @@ type endpoint struct {
 	// Connect(), and is valid only when conneted is true.
 	route *stack.Route                 `state:"manual"`
 	stats tcpip.TransportEndpointStats `state:"nosave"`
-
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
 
@@ -185,6 +184,8 @@ func (e *endpoint) Close() {
 func (e *endpoint) ModerateRecvBuf(copied int) {}
 
 func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.owner = owner
 }
 
@@ -270,73 +271,74 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	if opts.More {
 		return 0, &tcpip.ErrInvalidOptionValue{}
 	}
+	payloadBytes, route, owner, err := func() ([]byte, *stack.Route, tcpip.PacketOwner, tcpip.Error) {
+		e.mu.RLock()
+		defer e.mu.RUnlock()
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	if e.closed {
-		return 0, &tcpip.ErrInvalidEndpointState{}
-	}
-
-	payloadBytes := make([]byte, p.Len())
-	if _, err := io.ReadFull(p, payloadBytes); err != nil {
-		return 0, &tcpip.ErrBadBuffer{}
-	}
-
-	// If this is an unassociated socket and callee provided a nonzero
-	// destination address, route using that address.
-	if e.ops.GetHeaderIncluded() {
-		ip := header.IPv4(payloadBytes)
-		if !ip.IsValid(len(payloadBytes)) {
-			return 0, &tcpip.ErrInvalidOptionValue{}
+		if e.closed {
+			return nil, nil, nil, &tcpip.ErrInvalidEndpointState{}
 		}
-		dstAddr := ip.DestinationAddress()
-		// Update dstAddr with the address in the IP header, unless
-		// opts.To is set (e.g. if sendto specifies a specific
-		// address).
-		if dstAddr != tcpip.Address([]byte{0, 0, 0, 0}) && opts.To == nil {
-			opts.To = &tcpip.FullAddress{
-				NIC:  0,       // NIC is unset.
-				Addr: dstAddr, // The address from the payload.
-				Port: 0,       // There are no ports here.
+
+		payloadBytes := make([]byte, p.Len())
+		if _, err := io.ReadFull(p, payloadBytes); err != nil {
+			return nil, nil, nil, &tcpip.ErrBadBuffer{}
+		}
+
+		// If this is an unassociated socket and callee provided a nonzero
+		// destination address, route using that address.
+		if e.ops.GetHeaderIncluded() {
+			ip := header.IPv4(payloadBytes)
+			if !ip.IsValid(len(payloadBytes)) {
+				return nil, nil, nil, &tcpip.ErrInvalidOptionValue{}
+			}
+			dstAddr := ip.DestinationAddress()
+			// Update dstAddr with the address in the IP header, unless
+			// opts.To is set (e.g. if sendto specifies a specific
+			// address).
+			if dstAddr != tcpip.Address([]byte{0, 0, 0, 0}) && opts.To == nil {
+				opts.To = &tcpip.FullAddress{
+					NIC:  0,       // NIC is unset.
+					Addr: dstAddr, // The address from the payload.
+					Port: 0,       // There are no ports here.
+				}
 			}
 		}
-	}
 
-	// Did the user caller provide a destination? If not, use the connected
-	// destination.
-	if opts.To == nil {
-		// If the user doesn't specify a destination, they should have
-		// connected to another address.
-		if !e.connected {
-			return 0, &tcpip.ErrDestinationRequired{}
+		// Did the user caller provide a destination? If not, use the connected
+		// destination.
+		if opts.To == nil {
+			// If the user doesn't specify a destination, they should have
+			// connected to another address.
+			if !e.connected {
+				return nil, nil, nil, &tcpip.ErrDestinationRequired{}
+			}
+
+			e.route.Acquire()
+
+			return payloadBytes, e.route, e.owner, nil
 		}
 
-		return e.finishWrite(payloadBytes, e.route)
-	}
+		// The caller provided a destination. Reject destination address if it
+		// goes through a different NIC than the endpoint was bound to.
+		nic := opts.To.NIC
+		if e.bound && nic != 0 && nic != e.BindNICID {
+			return nil, nil, nil, &tcpip.ErrNoRoute{}
+		}
 
-	// The caller provided a destination. Reject destination address if it
-	// goes through a different NIC than the endpoint was bound to.
-	nic := opts.To.NIC
-	if e.bound && nic != 0 && nic != e.BindNICID {
-		return 0, &tcpip.ErrNoRoute{}
-	}
+		// Find the route to the destination. If BindAddress is 0,
+		// FindRoute will choose an appropriate source address.
+		route, err := e.stack.FindRoute(nic, e.BindAddr, opts.To.Addr, e.NetProto, false)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 
-	// Find the route to the destination. If BindAddress is 0,
-	// FindRoute will choose an appropriate source address.
-	route, err := e.stack.FindRoute(nic, e.BindAddr, opts.To.Addr, e.NetProto, false)
+		return payloadBytes, route, e.owner, nil
+	}()
 	if err != nil {
 		return 0, err
 	}
+	defer route.Release()
 
-	n, err := e.finishWrite(payloadBytes, route)
-	route.Release()
-	return n, err
-}
-
-// finishWrite writes the payload to a route. It resolves the route if
-// necessary. It's really just a helper to make defer unnecessary in Write.
-func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, tcpip.Error) {
 	if e.ops.GetHeaderIncluded() {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Data: buffer.View(payloadBytes).ToVectorisedView(),
@@ -349,7 +351,7 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 			ReserveHeaderBytes: int(route.MaxHeaderLength()),
 			Data:               buffer.View(payloadBytes).ToVectorisedView(),
 		})
-		pkt.Owner = e.owner
+		pkt.Owner = owner
 		if err := route.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
 			Protocol: e.TransProto,
 			TTL:      route.DefaultTTL(),
@@ -642,7 +644,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	} else {
 		combinedVV = append(buffer.View(nil), pkt.TransportHeader().View()...).ToVectorisedView()
 	}
-	combinedVV.Append(pkt.Data)
+	combinedVV.Append(pkt.Data().ExtractVV())
 	packet.data = combinedVV
 	packet.timestampNS = e.stack.Clock().NowNanoseconds()
 

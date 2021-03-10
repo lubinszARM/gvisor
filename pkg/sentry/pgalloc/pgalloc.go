@@ -26,9 +26,9 @@ import (
 	"math"
 	"os"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -341,12 +341,12 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	// Work around IMA by immediately creating a temporary PROT_EXEC mapping,
 	// while the backing file is still small. IMA will ignore any future
 	// mappings.
-	m, _, errno := syscall.Syscall6(
-		syscall.SYS_MMAP,
+	m, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
 		0,
 		usermem.PageSize,
-		syscall.PROT_EXEC,
-		syscall.MAP_SHARED,
+		unix.PROT_EXEC,
+		unix.MAP_SHARED,
 		file.Fd(),
 		0)
 	if errno != 0 {
@@ -354,8 +354,8 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		// don't return it.
 		log.Warningf("Failed to pre-map MemoryFile PROT_EXEC: %v", errno)
 	} else {
-		if _, _, errno := syscall.Syscall(
-			syscall.SYS_MUNMAP,
+		if _, _, errno := unix.Syscall(
+			unix.SYS_MUNMAP,
 			m,
 			usermem.PageSize,
 			0); errno != 0 {
@@ -584,7 +584,7 @@ func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
 	// "After a successful call, subsequent reads from this range will
 	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
 	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
-	return syscall.Fallocate(
+	return unix.Fallocate(
 		int(f.file.Fd()),
 		_FALLOC_FL_PUNCH_HOLE|_FALLOC_FL_KEEP_SIZE,
 		int64(fr.Start),
@@ -730,12 +730,12 @@ func (f *MemoryFile) getChunkMapping(chunk int) ([]uintptr, uintptr, error) {
 	if m := mappings[chunk]; m != 0 {
 		return mappings, m, nil
 	}
-	m, _, errno := syscall.Syscall6(
-		syscall.SYS_MMAP,
+	m, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
 		0,
 		chunkSize,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
 		f.file.Fd(),
 		uintptr(chunk<<chunkShift))
 	if errno != 0 {
@@ -876,6 +876,7 @@ func (f *MemoryFile) UpdateUsage() error {
 // in bs, sets committed[i] to 1 if the page is committed and 0 otherwise.
 //
 // Precondition: f.mu must be held; it may be unlocked and reacquired.
+// +checklocks:f.mu
 func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(bs []byte, committed []byte) error) error {
 	// Track if anything changed to elide the merge. In the common case, we
 	// expect all segments to be committed and no merge to occur.
@@ -925,72 +926,73 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 		r := seg.Range()
 
 		var checkErr error
-		err := f.forEachMappingSlice(r, func(s []byte) {
-			if checkErr != nil {
-				return
-			}
-
-			// Ensure that we have sufficient buffer for the call
-			// (one byte per page). The length of each slice must
-			// be page-aligned.
-			bufLen := len(s) / usermem.PageSize
-			if len(buf) < bufLen {
-				buf = make([]byte, bufLen)
-			}
-
-			// Query for new pages in core.
-			// NOTE(b/165896008): mincore (which is passed as checkCommitted)
-			// by f.UpdateUsage() might take a really long time. So unlock f.mu
-			// while checkCommitted runs.
-			f.mu.Unlock()
-			err := checkCommitted(s, buf)
-			f.mu.Lock()
-			if err != nil {
-				checkErr = err
-				return
-			}
-
-			// Scan each page and switch out segments.
-			seg := f.usage.LowerBoundSegment(r.Start)
-			for i := 0; i < bufLen; {
-				if buf[i]&0x1 == 0 {
-					i++
-					continue
+		err := f.forEachMappingSlice(r,
+			func(s []byte) {
+				if checkErr != nil {
+					return
 				}
-				// Scan to the end of this committed range.
-				j := i + 1
-				for ; j < bufLen; j++ {
-					if buf[j]&0x1 == 0 {
-						break
+
+				// Ensure that we have sufficient buffer for the call
+				// (one byte per page). The length of each slice must
+				// be page-aligned.
+				bufLen := len(s) / usermem.PageSize
+				if len(buf) < bufLen {
+					buf = make([]byte, bufLen)
+				}
+
+				// Query for new pages in core.
+				// NOTE(b/165896008): mincore (which is passed as checkCommitted)
+				// by f.UpdateUsage() might take a really long time. So unlock f.mu
+				// while checkCommitted runs.
+				f.mu.Unlock()
+				err := checkCommitted(s, buf)
+				f.mu.Lock()
+				if err != nil {
+					checkErr = err
+					return
+				}
+
+				// Scan each page and switch out segments.
+				seg := f.usage.LowerBoundSegment(r.Start)
+				for i := 0; i < bufLen; {
+					if buf[i]&0x1 == 0 {
+						i++
+						continue
 					}
-				}
-				committedFR := memmap.FileRange{
-					Start: r.Start + uint64(i*usermem.PageSize),
-					End:   r.Start + uint64(j*usermem.PageSize),
-				}
-				// Advance seg to committedFR.Start.
-				for seg.Ok() && seg.End() < committedFR.Start {
-					seg = seg.NextSegment()
-				}
-				// Mark pages overlapping committedFR as committed.
-				for seg.Ok() && seg.Start() < committedFR.End {
-					if seg.ValuePtr().canCommit() {
-						seg = f.usage.Isolate(seg, committedFR)
-						seg.ValuePtr().knownCommitted = true
-						amount := seg.Range().Length()
-						usage.MemoryAccounting.Inc(amount, seg.ValuePtr().kind)
-						f.usageExpected += amount
-						changedAny = true
+					// Scan to the end of this committed range.
+					j := i + 1
+					for ; j < bufLen; j++ {
+						if buf[j]&0x1 == 0 {
+							break
+						}
 					}
-					seg = seg.NextSegment()
+					committedFR := memmap.FileRange{
+						Start: r.Start + uint64(i*usermem.PageSize),
+						End:   r.Start + uint64(j*usermem.PageSize),
+					}
+					// Advance seg to committedFR.Start.
+					for seg.Ok() && seg.End() < committedFR.Start {
+						seg = seg.NextSegment()
+					}
+					// Mark pages overlapping committedFR as committed.
+					for seg.Ok() && seg.Start() < committedFR.End {
+						if seg.ValuePtr().canCommit() {
+							seg = f.usage.Isolate(seg, committedFR)
+							seg.ValuePtr().knownCommitted = true
+							amount := seg.Range().Length()
+							usage.MemoryAccounting.Inc(amount, seg.ValuePtr().kind)
+							f.usageExpected += amount
+							changedAny = true
+						}
+						seg = seg.NextSegment()
+					}
+					// Continue scanning for committed pages.
+					i = j + 1
 				}
-				// Continue scanning for committed pages.
-				i = j + 1
-			}
 
-			// Advance r.Start.
-			r.Start += uint64(len(s))
-		})
+				// Advance r.Start.
+				r.Start += uint64(len(s))
+			})
 		if checkErr != nil {
 			return checkErr
 		}
@@ -1012,8 +1014,8 @@ func (f *MemoryFile) TotalUsage() (uint64, error) {
 	// Stat the underlying file to discover the underlying usage. stat(2)
 	// always reports the allocated block count in units of 512 bytes. This
 	// includes pages in the page cache and swapped pages.
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(f.file.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(f.file.Fd()), &stat); err != nil {
 		return 0, err
 	}
 	return uint64(stat.Blocks * 512), nil
@@ -1093,7 +1095,7 @@ func (f *MemoryFile) runReclaim() {
 	mappings := f.mappings.Load().([]uintptr)
 	for i, m := range mappings {
 		if m != 0 {
-			_, _, errno := syscall.Syscall(syscall.SYS_MUNMAP, m, chunkSize, 0)
+			_, _, errno := unix.Syscall(unix.SYS_MUNMAP, m, chunkSize, 0)
 			if errno != 0 {
 				log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", m, i, errno)
 			}

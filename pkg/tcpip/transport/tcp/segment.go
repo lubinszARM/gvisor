@@ -62,7 +62,7 @@ type segment struct {
 	views          [8]buffer.View `state:"nosave"`
 	sequenceNumber seqnum.Value
 	ackNumber      seqnum.Value
-	flags          uint8
+	flags          header.TCPFlags
 	window         seqnum.Size
 	// csum is only populated for received segments.
 	csum uint16
@@ -83,6 +83,9 @@ type segment struct {
 
 	// dataMemSize is the memory used by data initially.
 	dataMemSize int
+
+	// lost indicates if the segment is marked as lost by RACK.
+	lost bool
 }
 
 func newIncomingSegment(id stack.TransportEndpointID, pkt *stack.PacketBuffer) *segment {
@@ -95,7 +98,7 @@ func newIncomingSegment(id stack.TransportEndpointID, pkt *stack.PacketBuffer) *
 		netProto: pkt.NetworkProtocolNumber,
 		nicID:    pkt.NICID,
 	}
-	s.data = pkt.Data.Clone(s.views[:])
+	s.data = pkt.Data().ExtractVV().Clone(s.views[:])
 	s.hdr = header.TCP(pkt.TransportHeader().View())
 	s.rcvdTime = time.Now()
 	s.dataMemSize = s.data.Size()
@@ -138,12 +141,12 @@ func (s *segment) clone() *segment {
 }
 
 // flagIsSet checks if at least one flag in flags is set in s.flags.
-func (s *segment) flagIsSet(flags uint8) bool {
+func (s *segment) flagIsSet(flags header.TCPFlags) bool {
 	return s.flags&flags != 0
 }
 
 // flagsAreSet checks if all flags in flags are set in s.flags.
-func (s *segment) flagsAreSet(flags uint8) bool {
+func (s *segment) flagsAreSet(flags header.TCPFlags) bool {
 	return s.flags&flags == flags
 }
 

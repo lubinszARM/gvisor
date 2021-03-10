@@ -16,6 +16,7 @@ package stack
 
 import (
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -514,7 +515,18 @@ type NetworkInterface interface {
 	Enabled() bool
 
 	// Promiscuous returns true if the interface is in promiscuous mode.
+	//
+	// When in promiscuous mode, the interface should accept all packets.
 	Promiscuous() bool
+
+	// Spoofing returns true if the interface is in spoofing mode.
+	//
+	// When in spoofing mode, the interface should consider all addresses as
+	// assigned to it.
+	Spoofing() bool
+
+	// CheckLocalAddress returns true if the address exists on the interface.
+	CheckLocalAddress(tcpip.NetworkProtocolNumber, tcpip.Address) bool
 
 	// WritePacketToRemote writes the packet to the given remote link address.
 	WritePacketToRemote(tcpip.LinkAddress, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
@@ -840,7 +852,125 @@ type InjectableLinkEndpoint interface {
 	InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error
 }
 
-// A LinkAddressResolver handles link address resolution for a network protocol.
+// DADResult is a marker interface for the result of a duplicate address
+// detection process.
+type DADResult interface {
+	isDADResult()
+}
+
+var _ DADResult = (*DADSucceeded)(nil)
+
+// DADSucceeded indicates DAD completed without finding any duplicate addresses.
+type DADSucceeded struct{}
+
+func (*DADSucceeded) isDADResult() {}
+
+var _ DADResult = (*DADError)(nil)
+
+// DADError indicates DAD hit an error.
+type DADError struct {
+	Err tcpip.Error
+}
+
+func (*DADError) isDADResult() {}
+
+var _ DADResult = (*DADAborted)(nil)
+
+// DADAborted indicates DAD was aborted.
+type DADAborted struct{}
+
+func (*DADAborted) isDADResult() {}
+
+var _ DADResult = (*DADDupAddrDetected)(nil)
+
+// DADDupAddrDetected indicates DAD detected a duplicate address.
+type DADDupAddrDetected struct {
+	// HolderLinkAddress is the link address of the node that holds the duplicate
+	// address.
+	HolderLinkAddress tcpip.LinkAddress
+}
+
+func (*DADDupAddrDetected) isDADResult() {}
+
+// DADCompletionHandler is a handler for DAD completion.
+type DADCompletionHandler func(DADResult)
+
+// DADCheckAddressDisposition enumerates the possible return values from
+// DAD.CheckDuplicateAddress.
+type DADCheckAddressDisposition int
+
+const (
+	_ DADCheckAddressDisposition = iota
+
+	// DADDisabled indicates that DAD is disabled.
+	DADDisabled
+
+	// DADStarting indicates that DAD is starting for an address.
+	DADStarting
+
+	// DADAlreadyRunning indicates that DAD was already started for an address.
+	DADAlreadyRunning
+)
+
+const (
+	// defaultDupAddrDetectTransmits is the default number of NDP Neighbor
+	// Solicitation messages to send when doing Duplicate Address Detection
+	// for a tentative address.
+	//
+	// Default = 1 (from RFC 4862 section 5.1)
+	defaultDupAddrDetectTransmits = 1
+)
+
+// DADConfigurations holds configurations for duplicate address detection.
+type DADConfigurations struct {
+	// The number of Neighbor Solicitation messages to send when doing
+	// Duplicate Address Detection for a tentative address.
+	//
+	// Note, a value of zero effectively disables DAD.
+	DupAddrDetectTransmits uint8
+
+	// The amount of time to wait between sending Neighbor Solicitation
+	// messages.
+	//
+	// Must be greater than or equal to 1ms.
+	RetransmitTimer time.Duration
+}
+
+// DefaultDADConfigurations returns the default DAD configurations.
+func DefaultDADConfigurations() DADConfigurations {
+	return DADConfigurations{
+		DupAddrDetectTransmits: defaultDupAddrDetectTransmits,
+		RetransmitTimer:        defaultRetransmitTimer,
+	}
+}
+
+// Validate modifies the configuration with valid values. If invalid values are
+// present in the configurations, the corresponding default values are used
+// instead.
+func (c *DADConfigurations) Validate() {
+	if c.RetransmitTimer < minimumRetransmitTimer {
+		c.RetransmitTimer = defaultRetransmitTimer
+	}
+}
+
+// DuplicateAddressDetector handles checking if an address is already assigned
+// to some neighboring node on the link.
+type DuplicateAddressDetector interface {
+	// CheckDuplicateAddress checks if an address is assigned to a neighbor.
+	//
+	// If DAD is already being performed for the address, the handler will be
+	// called with the result of the original DAD request.
+	CheckDuplicateAddress(tcpip.Address, DADCompletionHandler) DADCheckAddressDisposition
+
+	// SetDADConfiguations sets the configurations for DAD.
+	SetDADConfigurations(c DADConfigurations)
+
+	// DuplicateAddressProtocol returns the network protocol the receiver can
+	// perform duplicate address detection for.
+	DuplicateAddressProtocol() tcpip.NetworkProtocolNumber
+}
+
+// LinkAddressResolver handles link address resolution for a network protocol.
 type LinkAddressResolver interface {
 	// LinkAddressRequest sends a request for the link address of the target
 	// address. The request is broadcasted on the local network if a remote link

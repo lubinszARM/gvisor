@@ -17,9 +17,10 @@ package safemem
 import (
 	"bytes"
 	"fmt"
-	"reflect"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/gohacks"
 )
 
 // A BlockSeq represents a sequence of Blocks, each of which has non-zero
@@ -184,8 +185,8 @@ func (bs BlockSeq) Tail() BlockSeq {
 		return BlockSeq{}
 	}
 	var extSlice []Block
-	extSliceHdr := (*reflect.SliceHeader)(unsafe.Pointer(&extSlice))
-	extSliceHdr.Data = uintptr(bs.data)
+	extSliceHdr := (*gohacks.SliceHeader)(unsafe.Pointer(&extSlice))
+	extSliceHdr.Data = bs.data
 	extSliceHdr.Len = bs.length
 	extSliceHdr.Cap = bs.length
 	tailSlice := skipEmpty(extSlice[1:])
@@ -303,12 +304,12 @@ func ZeroSeq(dsts BlockSeq) (uint64, error) {
 	return done, nil
 }
 
-// IovecsFromBlockSeq returns a []syscall.Iovec representing seq.
-func IovecsFromBlockSeq(bs BlockSeq) []syscall.Iovec {
-	iovs := make([]syscall.Iovec, 0, bs.NumBlocks())
+// IovecsFromBlockSeq returns a []unix.Iovec representing seq.
+func IovecsFromBlockSeq(bs BlockSeq) []unix.Iovec {
+	iovs := make([]unix.Iovec, 0, bs.NumBlocks())
 	for ; !bs.IsEmpty(); bs = bs.Tail() {
 		b := bs.Head()
-		iovs = append(iovs, syscall.Iovec{
+		iovs = append(iovs, unix.Iovec{
 			Base: &b.ToSlice()[0],
 			Len:  uint64(b.Len()),
 		})

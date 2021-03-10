@@ -18,8 +18,8 @@ import (
 	"io"
 	"runtime/debug"
 	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fdchannel"
 	"gvisor.dev/gvisor/pkg/flipcall"
@@ -81,8 +81,8 @@ type connState struct {
 	// version 0 implies 9P2000.L.
 	version uint32
 
-	// pendingWg counts requests that are still being handled.
-	pendingWg sync.WaitGroup
+	// reqGate counts requests that are still being handled.
+	reqGate sync.Gate
 
 	// -- below relates to the legacy handler --
 
@@ -481,9 +481,13 @@ func (cs *connState) lookupChannel(id uint32) *channel {
 
 // handle handles a single message.
 func (cs *connState) handle(m message) (r message) {
-	cs.pendingWg.Add(1)
+	if !cs.reqGate.Enter() {
+		// connState.stop() has been called; the connection is shutting down.
+		r = newErr(unix.ECONNRESET)
+		return
+	}
 	defer func() {
-		cs.pendingWg.Done()
+		cs.reqGate.Leave()
 		if r == nil {
 			// Don't allow a panic to propagate.
 			err := recover()
@@ -494,7 +498,7 @@ func (cs *connState) handle(m message) (r message) {
 			// Wrap in an EFAULT error; we don't really have a
 			// better way to describe this kind of error. It will
 			// usually manifest as a result of the test framework.
-			r = newErr(syscall.EFAULT)
+			r = newErr(unix.EFAULT)
 		}
 	}()
 	if handler, ok := m.(handler); ok {
@@ -502,7 +506,7 @@ func (cs *connState) handle(m message) (r message) {
 		r = handler.handle(cs)
 	} else {
 		// Produce an ENOSYS error.
-		r = newErr(syscall.ENOSYS)
+		r = newErr(unix.ENOSYS)
 	}
 	return
 }
@@ -594,10 +598,11 @@ func (cs *connState) handleRequests() {
 }
 
 func (cs *connState) stop() {
-	// Wait for completion of all inflight requests. This is mostly so that if
-	// a request is stuck, the sandbox supervisor has the opportunity to kill
-	// us with SIGABRT to get a stack dump of the offending handler.
-	cs.pendingWg.Wait()
+	// Stop new requests from proceeding, and wait for completion of all
+	// inflight requests. This is mostly so that if a request is stuck, the
+	// sandbox supervisor has the opportunity to kill us with SIGABRT to get a
+	// stack dump of the offending handler.
+	cs.reqGate.Close()
 
 	// Free the channels.
 	cs.channelMu.Lock()

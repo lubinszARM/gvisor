@@ -16,8 +16,9 @@ package host
 
 import (
 	"fmt"
-	"syscall"
+	"sync/atomic"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -86,32 +87,32 @@ type ConnectedEndpoint struct {
 func (c *ConnectedEndpoint) init() *syserr.Error {
 	c.InitRefs()
 
-	family, err := syscall.GetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_DOMAIN)
+	family, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_DOMAIN)
 	if err != nil {
 		return syserr.FromError(err)
 	}
 
-	if family != syscall.AF_UNIX {
+	if family != unix.AF_UNIX {
 		// We only allow Unix sockets.
 		return syserr.ErrInvalidEndpointState
 	}
 
-	stype, err := syscall.GetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_TYPE)
+	stype, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_TYPE)
 	if err != nil {
 		return syserr.FromError(err)
 	}
 
-	if err := syscall.SetNonblock(c.fd, true); err != nil {
+	if err := unix.SetNonblock(c.fd, true); err != nil {
 		return syserr.FromError(err)
 	}
 
-	sndbuf, err := syscall.GetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	sndbuf, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
 	if err != nil {
 		return syserr.FromError(err)
 	}
 
 	c.stype = linux.SockType(stype)
-	c.sndbuf = int64(sndbuf)
+	atomic.StoreInt64(&c.sndbuf, int64(sndbuf))
 
 	return nil
 }
@@ -150,7 +151,7 @@ func (c *ConnectedEndpoint) Send(ctx context.Context, data [][]byte, controlMess
 	// only as much of the message as fits in the send buffer.
 	truncate := c.stype == linux.SOCK_STREAM
 
-	n, totalLen, err := fdWriteVec(c.fd, data, c.sndbuf, truncate)
+	n, totalLen, err := fdWriteVec(c.fd, data, c.SendMaxQueueSize(), truncate)
 	if n < totalLen && err == nil {
 		// The host only returns a short write if it would otherwise
 		// block (and only for stream sockets).
@@ -176,7 +177,7 @@ func (c *ConnectedEndpoint) CloseSend() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := syscall.Shutdown(c.fd, syscall.SHUT_WR); err != nil {
+	if err := unix.Shutdown(c.fd, unix.SHUT_WR); err != nil {
 		// A well-formed UDS shutdown can't fail. See
 		// net/unix/af_unix.c:unix_shutdown.
 		panic(fmt.Sprintf("failed write shutdown on host socket %+v: %v", c, err))
@@ -226,7 +227,7 @@ func (c *ConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds bool,
 
 	// N.B. Unix sockets don't have a receive buffer, the send buffer
 	// serves both purposes.
-	rl, ml, cl, cTrunc, err := fdReadVec(c.fd, data, []byte(cm), peek, c.sndbuf)
+	rl, ml, cl, cTrunc, err := fdReadVec(c.fd, data, []byte(cm), peek, c.RecvMaxQueueSize())
 	if rl > 0 && err != nil {
 		// We got some data, so all we need to do on error is return
 		// the data that we got. Short reads are fine, no need to
@@ -269,7 +270,7 @@ func (c *ConnectedEndpoint) CloseRecv() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := syscall.Shutdown(c.fd, syscall.SHUT_RD); err != nil {
+	if err := unix.Shutdown(c.fd, unix.SHUT_RD); err != nil {
 		// A well-formed UDS shutdown can't fail. See
 		// net/unix/af_unix.c:unix_shutdown.
 		panic(fmt.Sprintf("failed read shutdown on host socket %+v: %v", c, err))
@@ -300,14 +301,14 @@ func (c *ConnectedEndpoint) RecvQueuedSize() int64 {
 
 // SendMaxQueueSize implements transport.Receiver.SendMaxQueueSize.
 func (c *ConnectedEndpoint) SendMaxQueueSize() int64 {
-	return int64(c.sndbuf)
+	return atomic.LoadInt64(&c.sndbuf)
 }
 
 // RecvMaxQueueSize implements transport.Receiver.RecvMaxQueueSize.
 func (c *ConnectedEndpoint) RecvMaxQueueSize() int64 {
 	// N.B. Unix sockets don't use the receive buffer. We'll claim it is
 	// the same size as the send buffer.
-	return int64(c.sndbuf)
+	return atomic.LoadInt64(&c.sndbuf)
 }
 
 func (c *ConnectedEndpoint) destroyLocked() {
@@ -326,6 +327,13 @@ func (c *ConnectedEndpoint) Release(ctx context.Context) {
 
 // CloseUnread implements transport.ConnectedEndpoint.CloseUnread.
 func (c *ConnectedEndpoint) CloseUnread() {}
+
+// SetSendBufferSize implements transport.ConnectedEndpoint.SetSendBufferSize.
+func (c *ConnectedEndpoint) SetSendBufferSize(v int64) (newSz int64) {
+	// gVisor does not permit setting of SO_SNDBUF for host backed unix domain
+	// sockets.
+	return atomic.LoadInt64(&c.sndbuf)
+}
 
 // SCMConnectedEndpoint represents an endpoint backed by a host fd that was
 // passed through a gofer Unix socket. It resembles ConnectedEndpoint, with the
@@ -350,7 +358,7 @@ func (e *SCMConnectedEndpoint) Release(ctx context.Context) {
 	e.DecRef(func() {
 		e.mu.Lock()
 		fdnotifier.RemoveFD(int32(e.fd))
-		if err := syscall.Close(e.fd); err != nil {
+		if err := unix.Close(e.fd); err != nil {
 			log.Warningf("Failed to close host fd %d: %v", err)
 		}
 		e.destroyLocked()

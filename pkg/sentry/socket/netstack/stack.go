@@ -336,7 +336,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			in.ParamProblem.Value(),   // InParmProbs.
 			in.SrcQuench.Value(),      // InSrcQuenchs.
 			in.Redirect.Value(),       // InRedirects.
-			in.Echo.Value(),           // InEchos.
+			in.EchoRequest.Value(),    // InEchos.
 			in.EchoReply.Value(),      // InEchoReps.
 			in.Timestamp.Value(),      // InTimestamps.
 			in.TimestampReply.Value(), // InTimestampReps.
@@ -349,7 +349,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			out.ParamProblem.Value(),                        // OutParmProbs.
 			out.SrcQuench.Value(),                           // OutSrcQuenchs.
 			out.Redirect.Value(),                            // OutRedirects.
-			out.Echo.Value(),                                // OutEchos.
+			out.EchoRequest.Value(),                         // OutEchos.
 			out.EchoReply.Value(),                           // OutEchoReps.
 			out.Timestamp.Value(),                           // OutTimestamps.
 			out.TimestampReply.Value(),                      // OutTimestampReps.
@@ -477,4 +477,14 @@ func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool)
 		panic(fmt.Sprintf("SetForwarding(%v) failed: unsupported protocol", protocol))
 	}
 	return nil
+}
+
+// PortRange implements inet.Stack.PortRange.
+func (s *Stack) PortRange() (uint16, uint16) {
+	return s.Stack.PortRange()
+}
+
+// SetPortRange implements inet.Stack.SetPortRange.
+func (s *Stack) SetPortRange(start uint16, end uint16) error {
+	return syserr.TranslateNetstackError(s.Stack.SetPortRange(start, end)).ToError()
 }

@@ -290,7 +290,7 @@ func logPacket(prefix string, dir direction, protocol tcpip.NetworkProtocolNumbe
 	switch tcpip.TransportProtocolNumber(transProto) {
 	case header.ICMPv4ProtocolNumber:
 		transName = "icmp"
-		hdr, ok := pkt.Data.PullUp(header.ICMPv4MinimumSize)
+		hdr, ok := pkt.Data().PullUp(header.ICMPv4MinimumSize)
 		if !ok {
 			break
 		}
@@ -327,7 +327,7 @@ func logPacket(prefix string, dir direction, protocol tcpip.NetworkProtocolNumbe
 
 	case header.ICMPv6ProtocolNumber:
 		transName = "icmp"
-		hdr, ok := pkt.Data.PullUp(header.ICMPv6MinimumSize)
+		hdr, ok := pkt.Data().PullUp(header.ICMPv6MinimumSize)
 		if !ok {
 			break
 		}
@@ -387,7 +387,7 @@ func logPacket(prefix string, dir direction, protocol tcpip.NetworkProtocolNumbe
 				details += fmt.Sprintf("invalid packet: tcp data offset too small %d", offset)
 				break
 			}
-			if size := pkt.Data.Size() + len(tcp); offset > size && !moreFragments {
+			if size := pkt.Data().Size() + len(tcp); offset > size && !moreFragments {
 				details += fmt.Sprintf("invalid packet: tcp data offset %d larger than tcp packet length %d", offset, size)
 				break
 			}
@@ -398,13 +398,7 @@ func logPacket(prefix string, dir direction, protocol tcpip.NetworkProtocolNumbe
 
 			// Initialize the TCP flags.
 			flags := tcp.Flags()
-			flagsStr := []byte("FSRPAU")
-			for i := range flagsStr {
-				if flags&(1<<uint(i)) == 0 {
-					flagsStr[i] = ' '
-				}
-			}
-			details = fmt.Sprintf("flags:0x%02x (%s) seqnum: %d ack: %d win: %d xsum:0x%x", flags, string(flagsStr), tcp.SequenceNumber(), tcp.AckNumber(), tcp.WindowSize(), tcp.Checksum())
+			details = fmt.Sprintf("flags: %s seqnum: %d ack: %d win: %d xsum:0x%x", flags, tcp.SequenceNumber(), tcp.AckNumber(), tcp.WindowSize(), tcp.Checksum())
 			if flags&header.TCPFlagSyn != 0 {
 				details += fmt.Sprintf(" options: %+v", header.ParseSynOptions(tcp.Options(), flags&header.TCPFlagAck != 0))
 			} else {

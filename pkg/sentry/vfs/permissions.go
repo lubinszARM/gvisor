@@ -243,11 +243,13 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, opts *SetStatOpt
 // the given file mode, and if so, checks whether creds has permission to
 // remove a file owned by childKUID from a directory with the given mode.
 // CheckDeleteSticky is consistent with fs/linux.h:check_sticky().
-func CheckDeleteSticky(creds *auth.Credentials, parentMode linux.FileMode, childKUID auth.KUID) error {
+func CheckDeleteSticky(creds *auth.Credentials, parentMode linux.FileMode, parentKUID auth.KUID, childKUID auth.KUID, childKGID auth.KGID) error {
 	if parentMode&linux.ModeSticky == 0 {
 		return nil
 	}
-	if CanActAsOwner(creds, childKUID) {
+	if creds.EffectiveKUID == childKUID ||
+		creds.EffectiveKUID == parentKUID ||
+		HasCapabilityOnFile(creds, linux.CAP_FOWNER, childKUID, childKGID) {
 		return nil
 	}
 	return syserror.EPERM
@@ -323,4 +325,21 @@ func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.
 		}
 	}
 	return nil
+}
+
+// ClearSUIDAndSGID clears the setuid and/or setgid bits after a chown or write.
+// Depending on the mode, neither bit, only the setuid bit, or both are cleared.
+func ClearSUIDAndSGID(mode uint32) uint32 {
+	// Directories don't have their bits changed.
+	if mode&linux.ModeDirectory == linux.ModeDirectory {
+		return mode
+	}
+
+	// Changing owners always disables the setuid bit. It disables
+	// the setgid bit when the file is executable.
+	mode &= ^uint32(linux.ModeSetUID)
+	if sgid := uint32(linux.ModeSetGID | linux.ModeGroupExec); mode&sgid == sgid {
+		mode &= ^uint32(linux.ModeSetGID)
+	}
+	return mode
 }

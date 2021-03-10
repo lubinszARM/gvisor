@@ -22,9 +22,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 
 	"github.com/gofrs/flock"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -89,7 +89,7 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 				c.changeStatus(Stopped)
 			}
 		case Running:
-			if err := c.SignalContainer(syscall.Signal(0), false); err != nil {
+			if err := c.SignalContainer(unix.Signal(0), false); err != nil {
 				c.changeStatus(Stopped)
 			}
 		}
@@ -245,7 +245,7 @@ type StateFile struct {
 // lock globally locks all locking operations for the container.
 func (s *StateFile) lock() error {
 	s.once.Do(func() {
-		s.flock = flock.NewFlock(s.lockPath())
+		s.flock = flock.New(s.lockPath())
 	})
 
 	if err := s.flock.Lock(); err != nil {

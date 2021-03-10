@@ -415,6 +415,12 @@ func (tg *ThreadGroup) anyNonExitingTaskLocked() *Task {
 func (t *Task) reparentLocked(parent *Task) {
 	oldParent := t.parent
 	t.parent = parent
+	if oldParent != nil {
+		delete(oldParent.children, t)
+	}
+	if parent != nil {
+		parent.children[t] = struct{}{}
+	}
 	// If a thread group leader's parent changes, reset the thread group's
 	// termination signal to SIGCHLD and re-check exit notification. (Compare
 	// kernel/exit.c:reparent_leader().)
@@ -688,7 +694,8 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 		}
 		if t.parent != nil {
 			delete(t.parent.children, t)
-			t.parent = nil
+			// Do not clear t.parent. It may be still be needed after the task has exited
+			// (for example, to perform ptrace access checks on /proc/[pid] files).
 		}
 	}
 }

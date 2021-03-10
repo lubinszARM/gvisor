@@ -4,9 +4,10 @@
 // license that can be found in the LICENSE file.
 
 // +build go1.13
-// +build !go1.17
+// +build !go1.18
 
-// Check function signatures and constants when updating Go version.
+// Check go:linkname function signatures, type definitions, and constants when
+// updating Go version.
 
 package sync
 
@@ -55,12 +56,16 @@ func goready(gp uintptr, traceskip int)
 
 // Values for the reason argument to gopark, from Go's src/runtime/runtime2.go.
 const (
-	WaitReasonSelect uint8 = 9
+	WaitReasonSelect      uint8 = 9
+	WaitReasonChanReceive uint8 = 14
+	WaitReasonSemacquire  uint8 = 18
 )
 
 // Values for the traceEv argument to gopark, from Go's src/runtime/trace.go.
 const (
+	TraceEvGoBlockRecv   byte = 23
 	TraceEvGoBlockSelect byte = 24
+	TraceEvGoBlockSync   byte = 25
 )
 
 // Rand32 returns a non-cryptographically-secure random uint32.
@@ -95,6 +100,7 @@ func MapKeyHasher(m interface{}) func(unsafe.Pointer, uintptr) uintptr {
 	return mtyp.hasher
 }
 
+// maptype is equivalent to the beginning of runtime.maptype.
 type maptype struct {
 	size       uintptr
 	ptrdata    uintptr

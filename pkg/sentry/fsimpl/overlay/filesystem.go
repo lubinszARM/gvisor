@@ -85,6 +85,8 @@ func putDentrySlice(ds *[]*dentry) {
 // but dentry slices are allocated lazily, and it's much easier to say "defer
 // fs.renameMuRUnlockAndCheckDrop(&ds)" than "defer func() {
 // fs.renameMuRUnlockAndCheckDrop(ds) }()" to work around this.
+//
+// +checklocks:fs.renameMu
 func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*dentry) {
 	fs.renameMu.RUnlock()
 	if *dsp == nil {
@@ -110,6 +112,7 @@ func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*
 	putDentrySlice(*dsp)
 }
 
+// +checklocks:fs.renameMu
 func (fs *filesystem) renameMuUnlockAndCheckDrop(ctx context.Context, ds **[]*dentry) {
 	if *ds == nil {
 		fs.renameMu.Unlock()
@@ -313,22 +316,16 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		return nil, topLookupLayer, syserror.ENOENT
 	}
 
-	// Device and inode numbers were copied from the topmost layer above;
-	// override them if necessary.
-	if child.isDir() {
-		child.devMajor = linux.UNNAMED_MAJOR
-		child.devMinor = fs.dirDevMinor
-		child.ino = fs.newDirIno()
-	} else if !child.upperVD.Ok() {
-		childDevMinor, err := fs.getLowerDevMinor(child.devMajor, child.devMinor)
-		if err != nil {
-			ctx.Infof("overlay.filesystem.lookupLocked: failed to map lower layer device number (%d, %d) to an overlay-specific device number: %v", child.devMajor, child.devMinor, err)
-			child.destroyLocked(ctx)
-			return nil, topLookupLayer, err
-		}
-		child.devMajor = linux.UNNAMED_MAJOR
-		child.devMinor = childDevMinor
+	// Device and inode numbers were copied from the topmost layer above. Remap
+	// the device number to an appropriate overlay-private one.
+	childDevMinor, err := fs.getPrivateDevMinor(child.devMajor, child.devMinor)
+	if err != nil {
+		ctx.Infof("overlay.filesystem.lookupLocked: failed to map layer device number (%d, %d) to an overlay-specific device number: %v", child.devMajor, child.devMinor, err)
+		child.destroyLocked(ctx)
+		return nil, topLookupLayer, err
 	}
+	child.devMajor = linux.UNNAMED_MAJOR
+	child.devMinor = childDevMinor
 
 	parent.IncRef()
 	child.parent = parent
@@ -1068,7 +1065,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
-	if err := vfs.CheckDeleteSticky(creds, linux.FileMode(atomic.LoadUint32(&oldParent.mode)), auth.KUID(atomic.LoadUint32(&renamed.uid))); err != nil {
+	if err := oldParent.mayDelete(creds, renamed); err != nil {
 		return err
 	}
 	if renamed.isDir() {
@@ -1308,8 +1305,8 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 
-	// Unlike UnlinkAt, we need a dentry representing the child directory being
-	// removed in order to verify that it's empty.
+	// We need a dentry representing the child directory being removed in order
+	// to verify that it's empty.
 	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
 	if err != nil {
 		return err
@@ -1317,7 +1314,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if !child.isDir() {
 		return syserror.ENOTDIR
 	}
-	if err := vfs.CheckDeleteSticky(rp.Credentials(), linux.FileMode(atomic.LoadUint32(&parent.mode)), auth.KUID(atomic.LoadUint32(&child.uid))); err != nil {
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
 		return err
 	}
 	child.dirMu.Lock()
@@ -1555,50 +1552,24 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 
-	parentMode := atomic.LoadUint32(&parent.mode)
-	child := parent.children[name]
-	var childLayer lookupLayer
-	if child == nil {
-		if parentMode&linux.S_ISVTX != 0 {
-			// If the parent's sticky bit is set, we need a child dentry to get
-			// its owner.
-			child, _, err = fs.getChildLocked(ctx, parent, name, &ds)
-			if err != nil {
-				return err
-			}
-		} else {
-			// Determine if the file being unlinked actually exists. Holding
-			// parent.dirMu prevents a dentry from being instantiated for the file,
-			// which in turn prevents it from being copied-up, so this result is
-			// stable.
-			childLayer, err = fs.lookupLayerLocked(ctx, parent, name)
-			if err != nil {
-				return err
-			}
-			if !childLayer.existsInOverlay() {
-				return syserror.ENOENT
-			}
-		}
+	// We need a dentry representing the child being removed in order to verify
+	// that it's not a directory.
+	child, childLayer, err := fs.getChildLocked(ctx, parent, name, &ds)
+	if err != nil {
+		return err
 	}
-	if child != nil {
-		if child.isDir() {
-			return syserror.EISDIR
-		}
-		if err := vfs.CheckDeleteSticky(rp.Credentials(), linux.FileMode(parentMode), auth.KUID(atomic.LoadUint32(&child.uid))); err != nil {
-			return err
-		}
-		if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
-			return err
-		}
-		// Hold child.copyMu to prevent it from being copied-up during
-		// deletion.
-		child.copyMu.RLock()
-		defer child.copyMu.RUnlock()
-		if child.upperVD.Ok() {
-			childLayer = lookupLayerUpper
-		} else {
-			childLayer = lookupLayerLower
-		}
+	if child.isDir() {
+		return syserror.EISDIR
+	}
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
+		return err
+	}
+	// Hold child.copyMu to prevent it from being copied-up during
+	// deletion.
+	child.copyMu.RLock()
+	defer child.copyMu.RUnlock()
+	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+		return err
 	}
 
 	pop := vfs.PathOperation{

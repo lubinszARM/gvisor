@@ -14,15 +14,16 @@
 
 // +build linux,amd64 linux,arm64
 // +build go1.12
-// +build !go1.17
+// +build !go1.18
 
 // Check go:linkname function signatures when updating Go version.
 
 package rawfile
 
 import (
-	"syscall"
 	_ "unsafe" // for go:linkname
+
+	"golang.org/x/sys/unix"
 )
 
 // BlockingPoll on amd64/arm64 makes the ppoll() syscall while calling the
@@ -32,7 +33,7 @@ import (
 // call.
 //
 //go:noescape
-func BlockingPoll(fds *PollEvent, nfds int, timeout *syscall.Timespec) (int, syscall.Errno)
+func BlockingPoll(fds *PollEvent, nfds int, timeout *unix.Timespec) (int, unix.Errno)
 
 // Use go:linkname to call into the runtime. As of Go 1.12 this has to
 // be done from Go code so that we make an ABIInternal call to an

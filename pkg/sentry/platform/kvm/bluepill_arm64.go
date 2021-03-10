@@ -17,15 +17,14 @@
 package kvm
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
 var (
 	// The action for bluepillSignal is changed by sigaction().
-	bluepillSignal = syscall.SIGILL
+	bluepillSignal = unix.SIGILL
 
 	// vcpuSErrBounce is the event of system error for bouncing KVM.
 	vcpuSErrBounce = kvmVcpuEvents{
@@ -111,8 +110,8 @@ func (c *vCPU) KernelSyscall() {
 		regs.Pc -= 4 // Rewind.
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
 		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
@@ -135,8 +134,8 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 		regs.Pc = 0
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
 		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()

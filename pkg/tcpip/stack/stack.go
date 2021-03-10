@@ -395,7 +395,7 @@ type Stack struct {
 	}
 
 	mu   sync.RWMutex
-	nics map[tcpip.NICID]*NIC
+	nics map[tcpip.NICID]*nic
 
 	// cleanupEndpointsMu protects cleanupEndpoints.
 	cleanupEndpointsMu sync.Mutex
@@ -433,12 +433,6 @@ type Stack struct {
 
 	// nudConfigs is the default NUD configurations used by interfaces.
 	nudConfigs NUDConfigurations
-
-	// useNeighborCache indicates whether ARP and NDP packets should be handled
-	// by the NIC's neighborCache instead of linkAddrCache.
-	//
-	// TODO(gvisor.dev/issue/4658): Remove this field.
-	useNeighborCache bool
 
 	// nudDisp is the NUD event dispatcher that is used to send the netstack
 	// integrator NUD related events.
@@ -515,17 +509,6 @@ type Options struct {
 
 	// NUDConfigs is the default NUD configurations used by interfaces.
 	NUDConfigs NUDConfigurations
-
-	// UseNeighborCache is unused.
-	//
-	// TODO(gvisor.dev/issue/4658): Remove this field.
-	UseNeighborCache bool
-
-	// UseLinkAddrCache indicates that the legacy link address cache should be
-	// used for link resolution.
-	//
-	// TODO(gvisor.dev/issue/4658): Remove this field.
-	UseLinkAddrCache bool
 
 	// NUDDisp is the NUD event dispatcher that an integrator can provide to
 	// receive NUD related events.
@@ -656,7 +639,7 @@ func New(opts Options) *Stack {
 	s := &Stack{
 		transportProtocols: make(map[tcpip.TransportProtocolNumber]*transportProtocolState),
 		networkProtocols:   make(map[tcpip.NetworkProtocolNumber]NetworkProtocol),
-		nics:               make(map[tcpip.NICID]*NIC),
+		nics:               make(map[tcpip.NICID]*nic),
 		cleanupEndpoints:   make(map[TransportEndpoint]struct{}),
 		PortManager:        ports.NewPortManager(),
 		clock:              clock,
@@ -666,7 +649,6 @@ func New(opts Options) *Stack {
 		icmpRateLimiter:    NewICMPRateLimiter(),
 		seed:               generateRandUint32(),
 		nudConfigs:         opts.NUDConfigs,
-		useNeighborCache:   !opts.UseLinkAddrCache,
 		uniqueIDGenerator:  opts.UniqueID,
 		nudDisp:            opts.NUDDisp,
 		randomGenerator:    mathrand.New(randSrc),
@@ -829,6 +811,18 @@ func (s *Stack) Forwarding(protocolNum tcpip.NetworkProtocolNumber) bool {
 	}
 
 	return forwardingProtocol.Forwarding()
+}
+
+// PortRange returns the UDP and TCP inclusive range of ephemeral ports used in
+// both IPv4 and IPv6.
+func (s *Stack) PortRange() (uint16, uint16) {
+	return s.PortManager.PortRange()
+}
+
+// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
+// (inclusive).
+func (s *Stack) SetPortRange(start uint16, end uint16) tcpip.Error {
+	return s.PortManager.SetPortRange(start, end)
 }
 
 // SetRouteTable assigns the route table to be used by this stack. It
@@ -1233,7 +1227,7 @@ func (s *Stack) GetMainNICAddress(id tcpip.NICID, protocol tcpip.NetworkProtocol
 	return nic.primaryAddress(protocol), true
 }
 
-func (s *Stack) getAddressEP(nic *NIC, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) AssignableAddressEndpoint {
+func (s *Stack) getAddressEP(nic *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) AssignableAddressEndpoint {
 	if len(localAddr) == 0 {
 		return nic.primaryEndpoint(netProto, remoteAddr)
 	}
@@ -1244,13 +1238,13 @@ func (s *Stack) getAddressEP(nic *NIC, localAddr, remoteAddr tcpip.Address, netP
 // from the specified NIC.
 //
 // Precondition: s.mu must be read locked.
-func (s *Stack) findLocalRouteFromNICRLocked(localAddressNIC *NIC, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) *Route {
+func (s *Stack) findLocalRouteFromNICRLocked(localAddressNIC *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) *Route {
 	localAddressEndpoint := localAddressNIC.getAddressOrCreateTempInner(netProto, localAddr, false /* createTemp */, NeverPrimaryEndpoint)
 	if localAddressEndpoint == nil {
 		return nil
 	}
 
-	var outgoingNIC *NIC
+	var outgoingNIC *nic
 	// Prefer a local route to the same interface as the local address.
 	if localAddressNIC.hasAddress(netProto, remoteAddr) {
 		outgoingNIC = localAddressNIC
@@ -1317,6 +1311,11 @@ func (s *Stack) findLocalRouteRLocked(localAddressNICID tcpip.NICID, localAddr, 
 	}
 
 	return nil
+}
+
+// HandleLocal returns true if non-loopback interfaces are allowed to loop packets.
+func (s *Stack) HandleLocal() bool {
+	return s.handleLocal
 }
 
 // FindRoute creates a route to the given destination address, leaving through
@@ -1479,6 +1478,17 @@ func (s *Stack) CheckNetworkProtocol(protocol tcpip.NetworkProtocolNumber) bool 
 	return ok
 }
 
+// CheckDuplicateAddress performs duplicate address detection for the address on
+// the specified interface.
+func (s *Stack) CheckDuplicateAddress(nicID tcpip.NICID, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address, h DADCompletionHandler) (DADCheckAddressDisposition, tcpip.Error) {
+	nic, ok := s.nics[nicID]
+	if !ok {
+		return 0, &tcpip.ErrUnknownNICID{}
+	}
+
+	return nic.checkDuplicateAddress(protocol, addr, h)
+}
+
 // CheckLocalAddress determines if the given local address exists, and if it
 // does, returns the id of the NIC it's bound to. Returns 0 if the address
 // does not exist.
@@ -1493,20 +1503,16 @@ func (s *Stack) CheckLocalAddress(nicID tcpip.NICID, protocol tcpip.NetworkProto
 			return 0
 		}
 
-		addressEndpoint := nic.findEndpoint(protocol, addr, CanBePrimaryEndpoint)
-		if addressEndpoint == nil {
-			return 0
+		if nic.CheckLocalAddress(protocol, addr) {
+			return nic.id
 		}
 
-		addressEndpoint.DecRef()
-
-		return nic.id
+		return 0
 	}
 
 	// Go through all the NICs.
 	for _, nic := range s.nics {
-		if addressEndpoint := nic.findEndpoint(protocol, addr, CanBePrimaryEndpoint); addressEndpoint != nil {
-			addressEndpoint.DecRef()
+		if nic.CheckLocalAddress(protocol, addr) {
 			return nic.id
 		}
 	}
@@ -1548,7 +1554,7 @@ func (s *Stack) SetSpoofing(nicID tcpip.NICID, enable bool) tcpip.Error {
 // LinkResolutionResult is the result of a link address resolution attempt.
 type LinkResolutionResult struct {
 	LinkAddress tcpip.LinkAddress
-	Success     bool
+	Err         tcpip.Error
 }
 
 // GetLinkAddress finds the link address corresponding to a network address.
@@ -2062,22 +2068,6 @@ func generateRandInt64() int64 {
 	return v
 }
 
-// FindNetworkEndpoint returns the network endpoint for the given address.
-func (s *Stack) FindNetworkEndpoint(netProto tcpip.NetworkProtocolNumber, address tcpip.Address) (NetworkEndpoint, tcpip.Error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, nic := range s.nics {
-		addressEndpoint := nic.getAddressOrCreateTempInner(netProto, address, false /* createTemp */, NeverPrimaryEndpoint)
-		if addressEndpoint == nil {
-			continue
-		}
-		addressEndpoint.DecRef()
-		return nic.getNetworkEndpoint(netProto), nil
-	}
-	return nil, &tcpip.ErrBadAddress{}
-}
-
 // FindNICNameFromID returns the name of the NIC for the given NICID.
 func (s *Stack) FindNICNameFromID(id tcpip.NICID) string {
 	s.mu.RLock()
@@ -2103,13 +2093,6 @@ const (
 	// ParsedOK indicates that a packet was successfully parsed.
 	ParsedOK ParseResult = iota
 
-	// UnknownNetworkProtocol indicates that the network protocol is unknown.
-	UnknownNetworkProtocol
-
-	// NetworkLayerParseError indicates that the network packet was not
-	// successfully parsed.
-	NetworkLayerParseError
-
 	// UnknownTransportProtocol indicates that the transport protocol is unknown.
 	UnknownTransportProtocol
 
@@ -2118,31 +2101,19 @@ const (
 	TransportLayerParseError
 )
 
-// ParsePacketBuffer parses the provided packet buffer.
-func (s *Stack) ParsePacketBuffer(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) ParseResult {
-	netProto, ok := s.networkProtocols[protocol]
-	if !ok {
-		return UnknownNetworkProtocol
-	}
-
-	transProtoNum, hasTransportHdr, ok := netProto.Parse(pkt)
-	if !ok {
-		return NetworkLayerParseError
-	}
-	if !hasTransportHdr {
-		return ParsedOK
-	}
-
+// ParsePacketBufferTransport parses the provided packet buffer's transport
+// header.
+func (s *Stack) ParsePacketBufferTransport(protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) ParseResult {
 	// TODO(gvisor.dev/issue/170): ICMP packets don't have their TransportHeader
 	// fields set yet, parse it here. See icmp/protocol.go:protocol.Parse for a
 	// full explanation.
-	if transProtoNum == header.ICMPv4ProtocolNumber || transProtoNum == header.ICMPv6ProtocolNumber {
+	if protocol == header.ICMPv4ProtocolNumber || protocol == header.ICMPv6ProtocolNumber {
 		return ParsedOK
 	}
 
-	pkt.TransportProtocolNumber = transProtoNum
+	pkt.TransportProtocolNumber = protocol
 	// Parse the transport header if present.
-	state, ok := s.transportProtocols[transProtoNum]
+	state, ok := s.transportProtocols[protocol]
 	if !ok {
 		return UnknownTransportProtocol
 	}
@@ -2164,7 +2135,7 @@ func (s *Stack) networkProtocolNumbers() []tcpip.NetworkProtocolNumber {
 	return protos
 }
 
-func isSubnetBroadcastOnNIC(nic *NIC, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
+func isSubnetBroadcastOnNIC(nic *nic, protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) bool {
 	addressEndpoint := nic.getAddressOrCreateTempInner(protocol, addr, false /* createTemp */, NeverPrimaryEndpoint)
 	if addressEndpoint == nil {
 		return false

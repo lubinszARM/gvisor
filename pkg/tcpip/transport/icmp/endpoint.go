@@ -26,6 +26,8 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// TODO(https://gvisor.dev/issues/5623): Unit test this package.
+
 // +stateify savable
 type icmpPacket struct {
 	icmpPacketEntry
@@ -414,15 +416,27 @@ func send4(r *stack.Route, ident uint16, data buffer.View, ttl uint8, owner tcpi
 		return &tcpip.ErrInvalidEndpointState{}
 	}
 
+	// Because this icmp endpoint is implemented in the transport layer, we can
+	// only increment the 'stack-wide' stats but we can't increment the
+	// 'per-NetworkEndpoint' stats.
+	sentStat := r.Stats().ICMP.V4.PacketsSent.EchoRequest
+
 	icmpv4.SetChecksum(0)
 	icmpv4.SetChecksum(^header.Checksum(icmpv4, header.Checksum(data, 0)))
 
-	pkt.Data = data.ToVectorisedView()
+	pkt.Data().AppendView(data)
 
 	if ttl == 0 {
 		ttl = r.DefaultTTL()
 	}
-	return r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv4ProtocolNumber, TTL: ttl, TOS: stack.DefaultTOS}, pkt)
+
+	if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv4ProtocolNumber, TTL: ttl, TOS: stack.DefaultTOS}, pkt); err != nil {
+		r.Stats().ICMP.V4.PacketsSent.Dropped.Increment()
+		return err
+	}
+
+	sentStat.Increment()
+	return nil
 }
 
 func send6(r *stack.Route, ident uint16, data buffer.View, ttl uint8) tcpip.Error {
@@ -444,15 +458,31 @@ func send6(r *stack.Route, ident uint16, data buffer.View, ttl uint8) tcpip.Erro
 	if icmpv6.Type() != header.ICMPv6EchoRequest || icmpv6.Code() != 0 {
 		return &tcpip.ErrInvalidEndpointState{}
 	}
+	// Because this icmp endpoint is implemented in the transport layer, we can
+	// only increment the 'stack-wide' stats but we can't increment the
+	// 'per-NetworkEndpoint' stats.
+	sentStat := r.Stats().ICMP.V6.PacketsSent.EchoRequest
 
-	dataVV := data.ToVectorisedView()
-	icmpv6.SetChecksum(header.ICMPv6Checksum(icmpv6, r.LocalAddress, r.RemoteAddress, dataVV))
-	pkt.Data = dataVV
+	pkt.Data().AppendView(data)
+	dataRange := pkt.Data().AsRange()
+	icmpv6.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header:      icmpv6,
+		Src:         r.LocalAddress,
+		Dst:         r.RemoteAddress,
+		PayloadCsum: dataRange.Checksum(),
+		PayloadLen:  dataRange.Size(),
+	}))
 
 	if ttl == 0 {
 		ttl = r.DefaultTTL()
 	}
-	return r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: ttl, TOS: stack.DefaultTOS}, pkt)
+
+	if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: ttl, TOS: stack.DefaultTOS}, pkt); err != nil {
+		r.Stats().ICMP.V6.PacketsSent.Dropped.Increment()
+	}
+
+	sentStat.Increment()
+	return nil
 }
 
 // checkV4MappedLocked determines the effective network protocol and converts
@@ -763,7 +793,7 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 
 	// ICMP socket's data includes ICMP header.
 	packet.data = pkt.TransportHeader().View().ToVectorisedView()
-	packet.data.Append(pkt.Data)
+	packet.data.Append(pkt.Data().ExtractVV())
 
 	e.rcvList.PushBack(packet)
 	e.rcvBufSize += packet.data.Size()

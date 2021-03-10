@@ -477,13 +477,15 @@ func createProcessArgs(id string, spec *specs.Spec, creds *auth.Credentials, k *
 // been closed. For that reason, this should NOT be called in a defer, because
 // a panic in a control server rpc would then hang forever.
 func (l *Loader) Destroy() {
-	if l.ctrl != nil {
-		l.ctrl.srv.Stop()
-	}
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}
 	l.watchdog.Stop()
+
+	// Stop the control server. This will indirectly stop any
+	// long-running control operations that are in flight, e.g.
+	// profiling operations.
+	l.ctrl.stop()
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
@@ -1055,9 +1057,6 @@ func (l *Loader) WaitExit() kernel.ExitStatus {
 	// Wait for container.
 	l.k.WaitExited()
 
-	// Stop the control server.
-	l.ctrl.stop()
-
 	// Check all references.
 	refs.OnExit()
 
@@ -1172,7 +1171,8 @@ func (f *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 // signal sends a signal to one or more processes in a container. If PID is 0,
 // then the container init process is used. Depending on the SignalDeliveryMode
 // option, the signal may be sent directly to the indicated process, to all
-// processes in the container, or to the foreground process group.
+// processes in the container, or to the foreground process group. pid is
+// relative to the root PID namespace, not the container's.
 func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) error {
 	if pid < 0 {
 		return fmt.Errorf("PID (%d) must be positive", pid)
@@ -1209,6 +1209,8 @@ func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) e
 	}
 }
 
+// signalProcess sends signal to process in the given container. tgid is
+// relative to the root PID namespace, not the container's.
 func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) error {
 	execTG, err := l.threadGroupFromID(execID{cid: cid, pid: tgid})
 	if err == nil {
@@ -1217,18 +1219,14 @@ func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) er
 	}
 
 	// The caller may be signaling a process not started directly via exec.
-	// In this case, find the process in the container's PID namespace and
-	// signal it.
-	initTG, err := l.threadGroupFromID(execID{cid: cid})
-	if err != nil {
-		return fmt.Errorf("no thread group found: %v", err)
-	}
-	tg := initTG.PIDNamespace().ThreadGroupWithID(tgid)
+	// In this case, find the process and check that the process belongs to the
+	// container in question.
+	tg := l.k.RootPIDNamespace().ThreadGroupWithID(tgid)
 	if tg == nil {
 		return fmt.Errorf("no such process with PID %d", tgid)
 	}
 	if tg.Leader().ContainerID() != cid {
-		return fmt.Errorf("process %d is part of a different container: %q", tgid, tg.Leader().ContainerID())
+		return fmt.Errorf("process %d belongs to a different container: %q", tgid, tg.Leader().ContainerID())
 	}
 	return l.k.SendExternalSignalThreadGroup(tg, &arch.SignalInfo{Signo: signo})
 }

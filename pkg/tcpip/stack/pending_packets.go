@@ -55,7 +55,7 @@ type pendingPacket struct {
 //
 // Once link resolution completes successfully, the packets will be written.
 type packetsPendingLinkResolution struct {
-	nic *NIC
+	nic *nic
 
 	mu struct {
 		sync.Mutex
@@ -82,7 +82,7 @@ func (f *packetsPendingLinkResolution) incrementOutgoingPacketErrors(proto tcpip
 	}
 }
 
-func (f *packetsPendingLinkResolution) init(nic *NIC) {
+func (f *packetsPendingLinkResolution) init(nic *nic) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nic = nic
@@ -91,9 +91,9 @@ func (f *packetsPendingLinkResolution) init(nic *NIC) {
 
 // dequeue any pending packets associated with ch.
 //
-// If success is true, packets will be written and sent to the given remote link
+// If err is nil, packets will be written and sent to the given remote link
 // address.
-func (f *packetsPendingLinkResolution) dequeue(ch <-chan struct{}, linkAddr tcpip.LinkAddress, success bool) {
+func (f *packetsPendingLinkResolution) dequeue(ch <-chan struct{}, linkAddr tcpip.LinkAddress, err tcpip.Error) {
 	f.mu.Lock()
 	packets, ok := f.mu.packets[ch]
 	delete(f.mu.packets, ch)
@@ -110,7 +110,7 @@ func (f *packetsPendingLinkResolution) dequeue(ch <-chan struct{}, linkAddr tcpi
 	f.mu.Unlock()
 
 	if ok {
-		f.dequeuePackets(packets, linkAddr, success)
+		f.dequeuePackets(packets, linkAddr, err)
 	}
 }
 
@@ -176,7 +176,7 @@ func (f *packetsPendingLinkResolution) enqueue(r *Route, gso *GSO, proto tcpip.N
 	if len(cancelledPackets) != 0 {
 		// Dequeue the pending packets in a new goroutine to not hold up the current
 		// goroutine as handing link resolution failures may be a costly operation.
-		go f.dequeuePackets(cancelledPackets, "" /* linkAddr */, false /* success */)
+		go f.dequeuePackets(cancelledPackets, "" /* linkAddr */, &tcpip.ErrAborted{})
 	}
 
 	return pkt.len(), nil
@@ -207,9 +207,9 @@ func (f *packetsPendingLinkResolution) newCancelChannelLocked(newCH <-chan struc
 	return packets
 }
 
-func (f *packetsPendingLinkResolution) dequeuePackets(packets []pendingPacket, linkAddr tcpip.LinkAddress, success bool) {
+func (f *packetsPendingLinkResolution) dequeuePackets(packets []pendingPacket, linkAddr tcpip.LinkAddress, err tcpip.Error) {
 	for _, p := range packets {
-		if success {
+		if err == nil {
 			p.routeInfo.RemoteLinkAddress = linkAddr
 			_, _ = f.nic.writePacketBuffer(p.routeInfo, p.gso, p.proto, p.pkt)
 		} else {

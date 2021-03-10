@@ -21,6 +21,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
+// LINT.IfChange
+
 // Mapping for tcpip.Error types.
 var (
 	ErrUnknownProtocol       = New((&tcpip.ErrUnknownProtocol{}).String(), linux.EINVAL)
@@ -48,6 +50,8 @@ var (
 	ErrBroadcastDisabled     = New((&tcpip.ErrBroadcastDisabled{}).String(), linux.EACCES)
 	ErrNotPermittedNet       = New((&tcpip.ErrNotPermitted{}).String(), linux.EPERM)
 	ErrBadBuffer             = New((&tcpip.ErrBadBuffer{}).String(), linux.EFAULT)
+	ErrMalformedHeader       = New((&tcpip.ErrMalformedHeader{}).String(), linux.EINVAL)
+	ErrInvalidPortRange      = New((&tcpip.ErrInvalidPortRange{}).String(), linux.EINVAL)
 )
 
 // TranslateNetstackError converts an error from the tcpip package to a sentry
@@ -130,7 +134,13 @@ func TranslateNetstackError(err tcpip.Error) *Error {
 		return ErrAddressFamilyNotSupported
 	case *tcpip.ErrBadBuffer:
 		return ErrBadBuffer
+	case *tcpip.ErrMalformedHeader:
+		return ErrMalformedHeader
+	case *tcpip.ErrInvalidPortRange:
+		return ErrInvalidPortRange
 	default:
 		panic(fmt.Sprintf("unknown error %T", err))
 	}
 }
+
+// LINT.ThenChange(../tcpip/errors.go)

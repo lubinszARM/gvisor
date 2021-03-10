@@ -68,7 +68,7 @@ type handshake struct {
 	ep     *endpoint
 	state  handshakeState
 	active bool
-	flags  uint8
+	flags  header.TCPFlags
 	ackNum seqnum.Value
 
 	// iss is the initial send sequence number, as defined in RFC 793.
@@ -606,7 +606,7 @@ func newBackoffTimer(timeout, maxTimeout time.Duration, f func()) (*backoffTimer
 
 func (bt *backoffTimer) reset() tcpip.Error {
 	bt.timeout *= 2
-	if bt.timeout > MaxRTO {
+	if bt.timeout > bt.maxTimeout {
 		return &tcpip.ErrTimeout{}
 	}
 	bt.t.Reset(bt.timeout)
@@ -700,7 +700,7 @@ type tcpFields struct {
 	id     stack.TransportEndpointID
 	ttl    uint8
 	tos    uint8
-	flags  byte
+	flags  header.TCPFlags
 	seq    seqnum.Value
 	ack    seqnum.Value
 	rcvWnd seqnum.Size
@@ -752,7 +752,7 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *sta
 		// header and data and get the right sum of the TCP packet.
 		tcp.SetChecksum(xsum)
 	} else if r.RequiresTXTransportChecksum() {
-		xsum = header.ChecksumVV(pkt.Data, xsum)
+		xsum = header.ChecksumCombine(xsum, pkt.Data().AsRange().Checksum())
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
 	}
 }
@@ -786,7 +786,7 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 		})
 		pkt.Hash = tf.txHash
 		pkt.Owner = owner
-		data.ReadToVV(&pkt.Data, packetSize)
+		pkt.Data().ReadFromVV(&data, packetSize)
 		buildTCPHdr(r, tf, pkt, gso)
 		tf.seq = tf.seq.Add(seqnum.Size(packetSize))
 		pkts.PushBack(pkt)
@@ -877,7 +877,7 @@ func (e *endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 }
 
 // sendRaw sends a TCP segment to the endpoint's peer.
-func (e *endpoint) sendRaw(data buffer.VectorisedView, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
+func (e *endpoint) sendRaw(data buffer.VectorisedView, flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
 	var sackBlocks []header.SACKBlock
 	if e.EndpointState() == StateEstablished && e.rcv.pendingRcvdSegments.Len() > 0 && (flags&header.TCPFlagAck != 0) {
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
@@ -1301,7 +1301,8 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 		// e.mu is expected to be hold upon entering this section.
 		if e.snd != nil {
 			e.snd.resendTimer.cleanup()
-			e.snd.rc.probeTimer.cleanup()
+			e.snd.probeTimer.cleanup()
+			e.snd.reorderTimer.cleanup()
 		}
 
 		if closeTimer != nil {
@@ -1396,7 +1397,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 			},
 		},
 		{
-			w: &e.snd.rc.probeWaker,
+			w: &e.snd.probeWaker,
 			f: e.snd.probeTimerExpired,
 		},
 		{
@@ -1474,6 +1475,10 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 
 				return nil
 			},
+		},
+		{
+			w: &e.snd.reorderWaker,
+			f: e.snd.rc.reorderTimerExpired,
 		},
 	}
 

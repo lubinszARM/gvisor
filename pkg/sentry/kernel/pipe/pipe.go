@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -244,14 +244,18 @@ func (p *Pipe) consumeLocked(n int64) {
 func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Can't write to a pipe with no readers.
 	if !p.HasReaders() {
-		return 0, syscall.EPIPE
+		return 0, unix.EPIPE
 	}
 
-	// POSIX requires that a write smaller than atomicIOBytes (PIPE_BUF) be
-	// atomic, but requires no atomicity for writes larger than this.
 	avail := p.max - p.size
+	if avail == 0 {
+		return 0, syserror.ErrWouldBlock
+	}
 	short := false
 	if count > avail {
+		// POSIX requires that a write smaller than atomicIOBytes
+		// (PIPE_BUF) be atomic, but requires no atomicity for writes
+		// larger than this.
 		if count <= atomicIOBytes {
 			return 0, syserror.ErrWouldBlock
 		}

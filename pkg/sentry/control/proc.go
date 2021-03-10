@@ -147,6 +147,10 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		args.Capabilities,
 		proc.Kernel.RootUserNamespace())
 
+	pidns := args.PIDNamespace
+	if pidns == nil {
+		pidns = proc.Kernel.RootPIDNamespace()
+	}
 	initArgs := kernel.CreateProcessArgs{
 		Filename:                args.Filename,
 		Argv:                    args.Argv,
@@ -163,7 +167,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		IPCNamespace:            proc.Kernel.RootIPCNamespace(),
 		AbstractSocketNamespace: proc.Kernel.RootAbstractSocketNamespace(),
 		ContainerID:             args.ContainerID,
-		PIDNamespace:            args.PIDNamespace,
+		PIDNamespace:            pidns,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
@@ -330,8 +334,8 @@ func PrintPIDsJSON(pl []*Process) (string, error) {
 func Processes(k *kernel.Kernel, containerID string, out *[]*Process) error {
 	ts := k.TaskSet()
 	now := k.RealtimeClock().Now()
-	for _, tg := range ts.Root.ThreadGroups() {
-		pidns := tg.PIDNamespace()
+	pidns := ts.Root
+	for _, tg := range pidns.ThreadGroups() {
 		pid := pidns.IDOfThreadGroup(tg)
 
 		// If tg has already been reaped ignore it.

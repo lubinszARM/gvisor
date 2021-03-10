@@ -760,6 +760,7 @@ func (e *endpoint) LockUser() {
 // protocol goroutine altogether.
 //
 // Precondition: e.LockUser() must have been called before calling e.UnlockUser()
+// +checklocks:e.mu
 func (e *endpoint) UnlockUser() {
 	// Lock segment queue before checking so that we avoid a race where
 	// segments can be queued between the time we check if queue is empty
@@ -800,6 +801,7 @@ func (e *endpoint) StopWork() {
 }
 
 // ResumeWork resumes packet processing. Only to be used in tests.
+// +checklocks:e.mu
 func (e *endpoint) ResumeWork() {
 	e.mu.Unlock()
 }
@@ -1552,10 +1554,11 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 				return nil, nil
 			}
 			v := make([]byte, avail)
-			if _, err := io.ReadFull(p, v); err != nil {
+			n, err := p.Read(v)
+			if err != nil && err != io.EOF {
 				return nil, &tcpip.ErrBadBuffer{}
 			}
-			return v, nil
+			return v[:n], nil
 		}()
 		if len(v) == 0 || err != nil {
 			return nil, 0, err
@@ -1586,7 +1589,9 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 
 		return e.drainSendQueueLocked(), len(v), nil
 	}()
-	if err != nil {
+	// Return if either we didn't queue anything or if an error occurred while
+	// attempting to queue data.
+	if n == 0 || err != nil {
 		return 0, err
 	}
 	e.sendData(nextSeg)
@@ -1698,11 +1703,7 @@ func (e *endpoint) OnCorkOptionSet(v bool) {
 }
 
 func (e *endpoint) getSendBufferSize() int {
-	sndBufSize, err := e.ops.GetSendBufferSize()
-	if err != nil {
-		panic(fmt.Sprintf("e.ops.GetSendBufferSize() = %s", err))
-	}
-	return int(sndBufSize)
+	return int(e.ops.GetSendBufferSize())
 }
 
 // SetSockOptInt sets a socket option.
@@ -2219,7 +2220,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) tcp
 		portBuf := make([]byte, 2)
 		binary.LittleEndian.PutUint16(portBuf, e.ID.RemotePort)
 		h.Write(portBuf)
-		portOffset := h.Sum32()
+		portOffset := uint16(h.Sum32())
 
 		var twReuse tcpip.TCPTimeWaitReuseOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &twReuse); err != nil {
@@ -2700,7 +2701,7 @@ func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 			Cause: transErr,
 			// Linux passes the payload with the TCP header. We don't know if the TCP
 			// header even exists, it may not for fragmented packets.
-			Payload: pkt.Data.ToView(),
+			Payload: pkt.Data().AsRange().ToOwnedView(),
 			Dst: tcpip.FullAddress{
 				NIC:  pkt.NICID,
 				Addr: e.ID.RemoteAddress,
