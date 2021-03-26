@@ -103,14 +103,14 @@ func addOverlay(ctx context.Context, conf *config.Config, lower *fs.Inode, name 
 
 // compileMounts returns the supported mounts from the mount spec, adding any
 // mandatory mounts that are required by the OCI specification.
-func compileMounts(spec *specs.Spec) []specs.Mount {
+func compileMounts(spec *specs.Spec, vfs2Enabled bool) []specs.Mount {
 	// Keep track of whether proc and sys were mounted.
 	var procMounted, sysMounted, devMounted, devptsMounted bool
 	var mounts []specs.Mount
 
 	// Mount all submounts from the spec.
 	for _, m := range spec.Mounts {
-		if !specutils.IsSupportedDevMount(m) {
+		if !vfs2Enabled && !specutils.IsVFS1SupportedDevMount(m) {
 			log.Warningf("ignoring dev mount at %q", m.Destination)
 			continue
 		}
@@ -572,10 +572,10 @@ type containerMounter struct {
 	hints *podMountHints
 }
 
-func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints) *containerMounter {
+func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints, vfs2Enabled bool) *containerMounter {
 	return &containerMounter{
 		root:   spec.Root,
-		mounts: compileMounts(spec),
+		mounts: compileMounts(spec, vfs2Enabled),
 		fds:    fdDispenser{fds: goferFDs},
 		k:      k,
 		hints:  hints,
@@ -792,7 +792,7 @@ func (c *containerMounter) getMountNameAndOptions(conf *config.Config, m specs.M
 	case bind:
 		fd := c.fds.remove()
 		fsName = gofervfs2.Name
-		opts = p9MountData(fd, c.getMountAccessType(m), conf.VFS2)
+		opts = p9MountData(fd, c.getMountAccessType(conf, m), conf.VFS2)
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
 
@@ -802,12 +802,11 @@ func (c *containerMounter) getMountNameAndOptions(conf *config.Config, m specs.M
 	return fsName, opts, useOverlay, nil
 }
 
-func (c *containerMounter) getMountAccessType(mount specs.Mount) config.FileAccessType {
+func (c *containerMounter) getMountAccessType(conf *config.Config, mount specs.Mount) config.FileAccessType {
 	if hint := c.hints.findMount(mount); hint != nil {
 		return hint.fileAccessType()
 	}
-	// Non-root bind mounts are always shared if no hints were provided.
-	return config.FileAccessShared
+	return conf.FileAccessMounts
 }
 
 // mountSubmount mounts volumes inside the container's root. Because mounts may

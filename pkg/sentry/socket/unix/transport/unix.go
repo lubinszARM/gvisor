@@ -376,13 +376,13 @@ func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, creds bool, num
 
 // RecvNotify implements Receiver.RecvNotify.
 func (q *queueReceiver) RecvNotify() {
-	q.readQueue.WriterQueue.Notify(waiter.EventOut)
+	q.readQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseNotify implements Receiver.CloseNotify.
 func (q *queueReceiver) CloseNotify() {
-	q.readQueue.ReaderQueue.Notify(waiter.EventIn)
-	q.readQueue.WriterQueue.Notify(waiter.EventOut)
+	q.readQueue.ReaderQueue.Notify(waiter.ReadableEvents)
+	q.readQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseRecv implements Receiver.CloseRecv.
@@ -692,13 +692,13 @@ func (e *connectedEndpoint) Send(ctx context.Context, data [][]byte, c ControlMe
 
 // SendNotify implements ConnectedEndpoint.SendNotify.
 func (e *connectedEndpoint) SendNotify() {
-	e.writeQueue.ReaderQueue.Notify(waiter.EventIn)
+	e.writeQueue.ReaderQueue.Notify(waiter.ReadableEvents)
 }
 
 // CloseNotify implements ConnectedEndpoint.CloseNotify.
 func (e *connectedEndpoint) CloseNotify() {
-	e.writeQueue.ReaderQueue.Notify(waiter.EventIn)
-	e.writeQueue.WriterQueue.Notify(waiter.EventOut)
+	e.writeQueue.ReaderQueue.Notify(waiter.ReadableEvents)
+	e.writeQueue.WriterQueue.Notify(waiter.WritableEvents)
 }
 
 // CloseSend implements ConnectedEndpoint.CloseSend.
@@ -816,19 +816,20 @@ func (e *baseEndpoint) Connected() bool {
 func (e *baseEndpoint) RecvMsg(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool, addr *tcpip.FullAddress) (int64, int64, ControlMessages, bool, *syserr.Error) {
 	e.Lock()
 
-	if e.receiver == nil {
+	receiver := e.receiver
+	if receiver == nil {
 		e.Unlock()
 		return 0, 0, ControlMessages{}, false, syserr.ErrNotConnected
 	}
 
-	recvLen, msgLen, cms, cmt, a, notify, err := e.receiver.Recv(ctx, data, creds, numRights, peek)
+	recvLen, msgLen, cms, cmt, a, notify, err := receiver.Recv(ctx, data, creds, numRights, peek)
 	e.Unlock()
 	if err != nil {
 		return 0, 0, ControlMessages{}, false, err
 	}
 
 	if notify {
-		e.receiver.RecvNotify()
+		receiver.RecvNotify()
 	}
 
 	if addr != nil {
@@ -850,11 +851,12 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 		return 0, syserr.ErrAlreadyConnected
 	}
 
-	n, notify, err := e.connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	connected := e.connected
+	n, notify, err := connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
 	e.Unlock()
 
 	if notify {
-		e.connected.SendNotify()
+		connected.SendNotify()
 	}
 
 	return n, err

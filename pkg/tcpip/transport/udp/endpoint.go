@@ -245,7 +245,16 @@ func (e *endpoint) Close() {
 	switch e.EndpointState() {
 	case StateBound, StateConnected:
 		e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, e.ID, e, e.boundPortFlags, e.boundBindToDevice)
-		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, e.boundPortFlags, e.boundBindToDevice, tcpip.FullAddress{})
+		portRes := ports.Reservation{
+			Networks:     e.effectiveNetProtos,
+			Transport:    ProtocolNumber,
+			Addr:         e.ID.LocalAddress,
+			Port:         e.ID.LocalPort,
+			Flags:        e.boundPortFlags,
+			BindToDevice: e.boundBindToDevice,
+			Dest:         tcpip.FullAddress{},
+		}
+		e.stack.ReleasePort(portRes)
 		e.boundBindToDevice = 0
 		e.boundPortFlags = ports.Flags{}
 	}
@@ -275,7 +284,7 @@ func (e *endpoint) Close() {
 
 	e.mu.Unlock()
 
-	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
+	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 }
 
 // ModerateRecvBuf implements tcpip.Endpoint.ModerateRecvBuf.
@@ -525,11 +534,11 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 		if so.GetRecvError() {
 			so.QueueLocalErr(
 				&tcpip.ErrMessageTooLong{},
-				route.NetProto,
+				route.NetProto(),
 				header.UDPMaximumPacketSize,
 				tcpip.FullAddress{
 					NIC:  route.NICID(),
-					Addr: route.RemoteAddress,
+					Addr: route.RemoteAddress(),
 					Port: dstPort,
 				},
 				v,
@@ -541,7 +550,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	ttl := e.ttl
 	useDefaultTTL := ttl == 0
 
-	if header.IsV4MulticastAddress(route.RemoteAddress) || header.IsV6MulticastAddress(route.RemoteAddress) {
+	if header.IsV4MulticastAddress(route.RemoteAddress()) || header.IsV6MulticastAddress(route.RemoteAddress()) {
 		ttl = e.multicastTTL
 		// Multicast allows a 0 TTL.
 		useDefaultTTL = false
@@ -852,7 +861,7 @@ func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort u
 	// transmitter skipped the checksum generation (RFC768).
 	// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
 	if r.RequiresTXTransportChecksum() &&
-		(!noChecksum || r.NetProto == header.IPv6ProtocolNumber) {
+		(!noChecksum || r.NetProto() == header.IPv6ProtocolNumber) {
 		xsum := r.PseudoHeaderChecksum(ProtocolNumber, length)
 		for _, v := range data.Views() {
 			xsum = header.Checksum(v, xsum)
@@ -920,7 +929,16 @@ func (e *endpoint) Disconnect() tcpip.Error {
 	} else {
 		if e.ID.LocalPort != 0 {
 			// Release the ephemeral port.
-			e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, boundPortFlags, e.boundBindToDevice, tcpip.FullAddress{})
+			portRes := ports.Reservation{
+				Networks:     e.effectiveNetProtos,
+				Transport:    ProtocolNumber,
+				Addr:         e.ID.LocalAddress,
+				Port:         e.ID.LocalPort,
+				Flags:        boundPortFlags,
+				BindToDevice: e.boundBindToDevice,
+				Dest:         tcpip.FullAddress{},
+			}
+			e.stack.ReleasePort(portRes)
 			e.boundPortFlags = ports.Flags{}
 		}
 		e.setEndpointState(StateInitial)
@@ -974,11 +992,11 @@ func (e *endpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 		LocalAddress:  e.ID.LocalAddress,
 		LocalPort:     localPort,
 		RemotePort:    addr.Port,
-		RemoteAddress: r.RemoteAddress,
+		RemoteAddress: r.RemoteAddress(),
 	}
 
 	if e.EndpointState() == StateInitial {
-		id.LocalAddress = r.LocalAddress
+		id.LocalAddress = r.LocalAddress()
 	}
 
 	// Even if we're connected, this endpoint can still be used to send
@@ -1052,7 +1070,7 @@ func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) tcpip.Error {
 		e.rcvMu.Unlock()
 
 		if !wasClosed {
-			e.waiterQueue.Notify(waiter.EventIn)
+			e.waiterQueue.Notify(waiter.ReadableEvents)
 		}
 	}
 
@@ -1072,7 +1090,16 @@ func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, tcpi
 func (e *endpoint) registerWithStack(netProtos []tcpip.NetworkProtocolNumber, id stack.TransportEndpointID) (stack.TransportEndpointID, tcpip.NICID, tcpip.Error) {
 	bindToDevice := tcpip.NICID(e.ops.GetBindToDevice())
 	if e.ID.LocalPort == 0 {
-		port, err := e.stack.ReservePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.portFlags, bindToDevice, tcpip.FullAddress{}, nil /* testPort */)
+		portRes := ports.Reservation{
+			Networks:     netProtos,
+			Transport:    ProtocolNumber,
+			Addr:         id.LocalAddress,
+			Port:         id.LocalPort,
+			Flags:        e.portFlags,
+			BindToDevice: bindToDevice,
+			Dest:         tcpip.FullAddress{},
+		}
+		port, err := e.stack.ReservePort(portRes, nil /* testPort */)
 		if err != nil {
 			return id, bindToDevice, err
 		}
@@ -1082,7 +1109,16 @@ func (e *endpoint) registerWithStack(netProtos []tcpip.NetworkProtocolNumber, id
 
 	err := e.stack.RegisterTransportEndpoint(netProtos, ProtocolNumber, id, e, e.boundPortFlags, bindToDevice)
 	if err != nil {
-		e.stack.ReleasePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.boundPortFlags, bindToDevice, tcpip.FullAddress{})
+		portRes := ports.Reservation{
+			Networks:     netProtos,
+			Transport:    ProtocolNumber,
+			Addr:         id.LocalAddress,
+			Port:         id.LocalPort,
+			Flags:        e.boundPortFlags,
+			BindToDevice: bindToDevice,
+			Dest:         tcpip.FullAddress{},
+		}
+		e.stack.ReleasePort(portRes)
 		e.boundPortFlags = ports.Flags{}
 	}
 	return id, bindToDevice, err
@@ -1168,7 +1204,7 @@ func (e *endpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 
 	addr := e.ID.LocalAddress
 	if e.EndpointState() == StateConnected {
-		addr = e.route.LocalAddress
+		addr = e.route.LocalAddress()
 	}
 
 	return tcpip.FullAddress{
@@ -1198,13 +1234,13 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
 // waiter.EventIn is set, the endpoint is immediately readable.
 func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 	// The endpoint is always writable.
-	result := waiter.EventOut & mask
+	result := waiter.WritableEvents & mask
 
 	// Determine if the endpoint is readable if requested.
-	if (mask & waiter.EventIn) != 0 {
+	if mask&waiter.ReadableEvents != 0 {
 		e.rcvMu.Lock()
 		if !e.rcvList.Empty() || e.rcvClosed {
-			result |= waiter.EventIn
+			result |= waiter.ReadableEvents
 		}
 		e.rcvMu.Unlock()
 	}
@@ -1313,7 +1349,7 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 
 	// Notify any waiters that there's data to be read now.
 	if wasEmpty {
-		e.waiterQueue.Notify(waiter.EventIn)
+		e.waiterQueue.Notify(waiter.ReadableEvents)
 	}
 }
 

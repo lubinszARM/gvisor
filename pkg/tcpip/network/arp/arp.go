@@ -38,6 +38,7 @@ const (
 
 var _ stack.DuplicateAddressDetector = (*endpoint)(nil)
 var _ stack.LinkAddressResolver = (*endpoint)(nil)
+var _ ip.DADProtocol = (*endpoint)(nil)
 
 // ARP endpoints need to implement stack.NetworkEndpoint because the stack
 // considers the layer above the link-layer a network layer; the only
@@ -82,7 +83,8 @@ func (*endpoint) DuplicateAddressProtocol() tcpip.NetworkProtocolNumber {
 	return header.IPv4ProtocolNumber
 }
 
-func (e *endpoint) SendDADMessage(addr tcpip.Address) tcpip.Error {
+// SendDADMessage implements ip.DADProtocol.
+func (e *endpoint) SendDADMessage(addr tcpip.Address, _ []byte) tcpip.Error {
 	return e.sendARPRequest(header.IPv4Any, addr, header.EthernetBroadcastAddress)
 }
 
@@ -284,9 +286,12 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, dispatcher stack.Tran
 
 	e.mu.Lock()
 	e.mu.dad.Init(&e.mu, p.options.DADConfigs, ip.DADOptions{
-		Clock:    p.stack.Clock(),
-		Protocol: e,
-		NICID:    nic.ID(),
+		Clock:     p.stack.Clock(),
+		SecureRNG: p.stack.SecureRNG(),
+		// ARP does not support sending nonce values.
+		NonceSize: 0,
+		Protocol:  e,
+		NICID:     nic.ID(),
 	})
 	e.mu.Unlock()
 
@@ -305,8 +310,6 @@ func (*endpoint) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 
 // LinkAddressRequest implements stack.LinkAddressResolver.LinkAddressRequest.
 func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress) tcpip.Error {
-	nicID := e.nic.ID()
-
 	stats := e.stats.arp
 
 	if len(remoteLinkAddr) == 0 {
@@ -314,9 +317,9 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 	}
 
 	if len(localAddr) == 0 {
-		addr, ok := e.protocol.stack.GetMainNICAddress(nicID, header.IPv4ProtocolNumber)
-		if !ok {
-			return &tcpip.ErrUnknownNICID{}
+		addr, err := e.nic.PrimaryAddress(header.IPv4ProtocolNumber)
+		if err != nil {
+			return err
 		}
 
 		if len(addr.Address) == 0 {

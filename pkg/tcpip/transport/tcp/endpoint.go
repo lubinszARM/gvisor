@@ -532,8 +532,8 @@ type endpoint struct {
 	segmentQueue segmentQueue `state:"wait"`
 
 	// synRcvdCount is the number of connections for this endpoint that are
-	// in SYN-RCVD state.
-	synRcvdCount int
+	// in SYN-RCVD state; this is only accessed atomically.
+	synRcvdCount int32
 
 	// userMSS if non-zero is the MSS value explicitly set by the user
 	// for this endpoint using the TCP_MAXSEG setsockopt.
@@ -960,30 +960,30 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 	case StateListen:
 		// Check if there's anything in the accepted channel.
-		if (mask & waiter.EventIn) != 0 {
+		if (mask & waiter.ReadableEvents) != 0 {
 			e.acceptMu.Lock()
 			if len(e.acceptedChan) > 0 {
-				result |= waiter.EventIn
+				result |= waiter.ReadableEvents
 			}
 			e.acceptMu.Unlock()
 		}
 	}
 	if e.EndpointState().connected() {
 		// Determine if the endpoint is writable if requested.
-		if (mask & waiter.EventOut) != 0 {
+		if (mask & waiter.WritableEvents) != 0 {
 			e.sndBufMu.Lock()
 			sndBufSize := e.getSendBufferSize()
 			if e.sndClosed || e.sndBufUsed < sndBufSize {
-				result |= waiter.EventOut
+				result |= waiter.WritableEvents
 			}
 			e.sndBufMu.Unlock()
 		}
 
 		// Determine if the endpoint is readable if requested.
-		if (mask & waiter.EventIn) != 0 {
+		if (mask & waiter.ReadableEvents) != 0 {
 			e.rcvListMu.Lock()
 			if e.rcvBufUsed > 0 || e.rcvClosed {
-				result |= waiter.EventIn
+				result |= waiter.ReadableEvents
 			}
 			e.rcvListMu.Unlock()
 		}
@@ -1097,7 +1097,16 @@ func (e *endpoint) closeNoShutdownLocked() {
 			e.isRegistered = false
 		}
 
-		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, e.boundPortFlags, e.boundBindToDevice, e.boundDest)
+		portRes := ports.Reservation{
+			Networks:     e.effectiveNetProtos,
+			Transport:    ProtocolNumber,
+			Addr:         e.ID.LocalAddress,
+			Port:         e.ID.LocalPort,
+			Flags:        e.boundPortFlags,
+			BindToDevice: e.boundBindToDevice,
+			Dest:         e.boundDest,
+		}
+		e.stack.ReleasePort(portRes)
 		e.isPortReserved = false
 		e.boundBindToDevice = 0
 		e.boundPortFlags = ports.Flags{}
@@ -1112,7 +1121,7 @@ func (e *endpoint) closeNoShutdownLocked() {
 		return
 	}
 
-	eventMask := waiter.EventIn | waiter.EventOut
+	eventMask := waiter.ReadableEvents | waiter.WritableEvents
 	// Either perform the local cleanup or kick the worker to make sure it
 	// knows it needs to cleanup.
 	if e.workerRunning {
@@ -1172,7 +1181,16 @@ func (e *endpoint) cleanupLocked() {
 	}
 
 	if e.isPortReserved {
-		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, e.boundPortFlags, e.boundBindToDevice, e.boundDest)
+		portRes := ports.Reservation{
+			Networks:     e.effectiveNetProtos,
+			Transport:    ProtocolNumber,
+			Addr:         e.ID.LocalAddress,
+			Port:         e.ID.LocalPort,
+			Flags:        e.boundPortFlags,
+			BindToDevice: e.boundBindToDevice,
+			Dest:         e.boundDest,
+		}
+		e.stack.ReleasePort(portRes)
 		e.isPortReserved = false
 	}
 	e.boundBindToDevice = 0
@@ -2115,7 +2133,7 @@ func (e *endpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 	if err != nil {
 		if !err.IgnoreStats() {
 			// Connect failed. Let's wake up any waiters.
-			e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
+			e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
 			e.stats.FailedConnectionAttempts.Increment()
 		}
@@ -2193,8 +2211,8 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) tcp
 	defer r.Release()
 
 	netProtos := []tcpip.NetworkProtocolNumber{netProto}
-	e.ID.LocalAddress = r.LocalAddress
-	e.ID.RemoteAddress = r.RemoteAddress
+	e.ID.LocalAddress = r.LocalAddress()
+	e.ID.RemoteAddress = r.RemoteAddress()
 	e.ID.RemotePort = addr.Port
 
 	if e.ID.LocalPort != 0 {
@@ -2242,7 +2260,16 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) tcp
 			if sameAddr && p == e.ID.RemotePort {
 				return false, nil
 			}
-			if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr, nil /* testPort */); err != nil {
+			portRes := ports.Reservation{
+				Networks:     netProtos,
+				Transport:    ProtocolNumber,
+				Addr:         e.ID.LocalAddress,
+				Port:         p,
+				Flags:        e.portFlags,
+				BindToDevice: bindToDevice,
+				Dest:         addr,
+			}
+			if _, err := e.stack.ReservePort(portRes, nil /* testPort */); err != nil {
 				if _, ok := err.(*tcpip.ErrPortInUse); !ok || !reuse {
 					return false, nil
 				}
@@ -2280,7 +2307,16 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) tcp
 				tcpEP.notifyProtocolGoroutine(notifyAbort)
 				tcpEP.UnlockUser()
 				// Now try and Reserve again if it fails then we skip.
-				if _, err := e.stack.ReservePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr, nil /* testPort */); err != nil {
+				portRes := ports.Reservation{
+					Networks:     netProtos,
+					Transport:    ProtocolNumber,
+					Addr:         e.ID.LocalAddress,
+					Port:         p,
+					Flags:        e.portFlags,
+					BindToDevice: bindToDevice,
+					Dest:         addr,
+				}
+				if _, err := e.stack.ReservePort(portRes, nil /* testPort */); err != nil {
 					return false, nil
 				}
 			}
@@ -2288,7 +2324,16 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) tcp
 			id := e.ID
 			id.LocalPort = p
 			if err := e.stack.RegisterTransportEndpoint(netProtos, ProtocolNumber, id, e, e.portFlags, bindToDevice); err != nil {
-				e.stack.ReleasePort(netProtos, ProtocolNumber, e.ID.LocalAddress, p, e.portFlags, bindToDevice, addr)
+				portRes := ports.Reservation{
+					Networks:     netProtos,
+					Transport:    ProtocolNumber,
+					Addr:         e.ID.LocalAddress,
+					Port:         p,
+					Flags:        e.portFlags,
+					BindToDevice: bindToDevice,
+					Dest:         addr,
+				}
+				e.stack.ReleasePort(portRes)
 				if _, ok := err.(*tcpip.ErrPortInUse); ok {
 					return false, nil
 				}
@@ -2418,7 +2463,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 			e.rcvListMu.Unlock()
 			e.closePendingAcceptableConnectionsLocked()
 			// Notify waiters that the endpoint is shutdown.
-			e.waiterQueue.Notify(waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr)
+			e.waiterQueue.Notify(waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 		}
 		return nil
 	default:
@@ -2604,7 +2649,16 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err tcpip.Error) {
 	}
 
 	bindToDevice := tcpip.NICID(e.ops.GetBindToDevice())
-	port, err := e.stack.ReservePort(netProtos, ProtocolNumber, addr.Addr, addr.Port, e.portFlags, bindToDevice, tcpip.FullAddress{}, func(p uint16) bool {
+	portRes := ports.Reservation{
+		Networks:     netProtos,
+		Transport:    ProtocolNumber,
+		Addr:         addr.Addr,
+		Port:         addr.Port,
+		Flags:        e.portFlags,
+		BindToDevice: bindToDevice,
+		Dest:         tcpip.FullAddress{},
+	}
+	port, err := e.stack.ReservePort(portRes, func(p uint16) (bool, tcpip.Error) {
 		id := e.ID
 		id.LocalPort = p
 		// CheckRegisterTransportEndpoint should only return an error if there is a
@@ -2616,9 +2670,9 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err tcpip.Error) {
 		// address/port. Hence this will only return an error if there is a matching
 		// listening endpoint.
 		if err := e.stack.CheckRegisterTransportEndpoint(netProtos, ProtocolNumber, id, e.portFlags, bindToDevice); err != nil {
-			return false
+			return false, nil
 		}
-		return true
+		return true, nil
 	})
 	if err != nil {
 		return err
@@ -2757,7 +2811,7 @@ func (e *endpoint) updateSndBufferUsage(v int) {
 	e.sndBufMu.Unlock()
 
 	if notify {
-		e.waiterQueue.Notify(waiter.EventOut)
+		e.waiterQueue.Notify(waiter.WritableEvents)
 	}
 }
 
@@ -2774,7 +2828,7 @@ func (e *endpoint) readyToRead(s *segment) {
 		e.rcvClosed = true
 	}
 	e.rcvListMu.Unlock()
-	e.waiterQueue.Notify(waiter.EventIn)
+	e.waiterQueue.Notify(waiter.ReadableEvents)
 }
 
 // receiveBufferAvailableLocked calculates how many bytes are still available
@@ -3048,7 +3102,7 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 
 func (e *endpoint) initHardwareGSO() {
 	gso := &stack.GSO{}
-	switch e.route.NetProto {
+	switch e.route.NetProto() {
 	case header.IPv4ProtocolNumber:
 		gso.Type = stack.GSOTCPv4
 		gso.L3HdrLen = header.IPv4MinimumSize

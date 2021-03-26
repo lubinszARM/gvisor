@@ -15,7 +15,9 @@
 package gofer
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -781,7 +783,15 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	creds := rp.Credentials()
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, name string, _ **[]*dentry) error {
-		if _, err := parent.file.mkdir(ctx, name, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID)); err != nil {
+		// If the parent is a setgid directory, use the parent's GID
+		// rather than the caller's and enable setgid.
+		kgid := creds.EffectiveKGID
+		mode := opts.Mode
+		if atomic.LoadUint32(&parent.mode)&linux.S_ISGID != 0 {
+			kgid = auth.KGID(atomic.LoadUint32(&parent.gid))
+			mode |= linux.S_ISGID
+		}
+		if _, err := parent.file.mkdir(ctx, name, p9.FileMode(mode), (p9.UID)(creds.EffectiveKUID), p9.GID(kgid)); err != nil {
 			if !opts.ForSyntheticMountpoint || err == syserror.EEXIST {
 				return err
 			}
@@ -1143,7 +1153,15 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	name := rp.Component()
 	// We only want the access mode for creating the file.
 	createFlags := p9.OpenFlags(opts.Flags) & p9.OpenFlagsModeMask
-	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
+
+	// If the parent is a setgid directory, use the parent's GID rather
+	// than the caller's.
+	kgid := creds.EffectiveKGID
+	if atomic.LoadUint32(&d.mode)&linux.S_ISGID != 0 {
+		kgid = auth.KGID(atomic.LoadUint32(&d.gid))
+	}
+
+	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, p9.FileMode(opts.Mode), (p9.UID)(creds.EffectiveKUID), p9.GID(kgid))
 	if err != nil {
 		dirfile.close(ctx)
 		return nil, err
@@ -1607,4 +1625,59 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
+}
+
+type mopt struct {
+	key   string
+	value interface{}
+}
+
+func (m mopt) String() string {
+	if m.value == nil {
+		return fmt.Sprintf("%s", m.key)
+	}
+	return fmt.Sprintf("%s=%v", m.key, m.value)
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	optsKV := []mopt{
+		{moptTransport, transportModeFD}, // Only valid value, currently.
+		{moptReadFD, fs.opts.fd},         // Currently, read and write FD are the same.
+		{moptWriteFD, fs.opts.fd},        // Currently, read and write FD are the same.
+		{moptAname, fs.opts.aname},
+		{moptDfltUID, fs.opts.dfltuid},
+		{moptDfltGID, fs.opts.dfltgid},
+		{moptMsize, fs.opts.msize},
+		{moptVersion, fs.opts.version},
+		{moptDentryCacheLimit, fs.opts.maxCachedDentries},
+	}
+
+	switch fs.opts.interop {
+	case InteropModeExclusive:
+		optsKV = append(optsKV, mopt{moptCache, cacheFSCache})
+	case InteropModeWritethrough:
+		optsKV = append(optsKV, mopt{moptCache, cacheFSCacheWritethrough})
+	case InteropModeShared:
+		if fs.opts.regularFilesUseSpecialFileFD {
+			optsKV = append(optsKV, mopt{moptCache, cacheNone})
+		} else {
+			optsKV = append(optsKV, mopt{moptCache, cacheRemoteRevalidating})
+		}
+	}
+	if fs.opts.forcePageCache {
+		optsKV = append(optsKV, mopt{moptForcePageCache, nil})
+	}
+	if fs.opts.limitHostFDTranslation {
+		optsKV = append(optsKV, mopt{moptLimitHostFDTranslation, nil})
+	}
+	if fs.opts.overlayfsStaleRead {
+		optsKV = append(optsKV, mopt{moptOverlayfsStaleRead, nil})
+	}
+
+	opts := make([]string, 0, len(optsKV))
+	for _, opt := range optsKV {
+		opts = append(opts, opt.String())
+	}
+	return strings.Join(opts, ",")
 }

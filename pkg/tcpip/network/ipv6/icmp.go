@@ -369,6 +369,18 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			return
 		}
 
+		var it header.NDPOptionIterator
+		{
+			var err error
+			it, err = ns.Options().Iter(false /* check */)
+			if err != nil {
+				// Options are not valid as per the wire format, silently drop the
+				// packet.
+				received.invalid.Increment()
+				return
+			}
+		}
+
 		if e.hasTentativeAddr(targetAddr) {
 			// If the target address is tentative and the source of the packet is a
 			// unicast (specified) address, then the source of the packet is
@@ -382,6 +394,22 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			// stack know so it can handle such a scenario and do nothing further with
 			// the NS.
 			if srcAddr == header.IPv6Any {
+				var nonce []byte
+				for {
+					opt, done, err := it.Next()
+					if err != nil {
+						received.invalid.Increment()
+						return
+					}
+					if done {
+						break
+					}
+					if n, ok := opt.(header.NDPNonceOption); ok {
+						nonce = n.Nonce()
+						break
+					}
+				}
+
 				// Since this is a DAD message we know the sender does not actually hold
 				// the target address so there is no "holder".
 				var holderLinkAddress tcpip.LinkAddress
@@ -397,7 +425,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 				//
 				// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
 				// address is detected for an assigned address.
-				switch err := e.dupTentativeAddrDetected(targetAddr, holderLinkAddress); err.(type) {
+				switch err := e.dupTentativeAddrDetected(targetAddr, holderLinkAddress, nonce); err.(type) {
 				case nil, *tcpip.ErrBadAddress, *tcpip.ErrInvalidEndpointState:
 				default:
 					panic(fmt.Sprintf("unexpected error handling duplicate tentative address: %s", err))
@@ -418,21 +446,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			return
 		}
 
-		var sourceLinkAddr tcpip.LinkAddress
-		{
-			it, err := ns.Options().Iter(false /* check */)
-			if err != nil {
-				// Options are not valid as per the wire format, silently drop the
-				// packet.
-				received.invalid.Increment()
-				return
-			}
-
-			sourceLinkAddr, ok = getSourceLinkAddr(it)
-			if !ok {
-				received.invalid.Increment()
-				return
-			}
+		sourceLinkAddr, ok := getSourceLinkAddr(it)
+		if !ok {
+			received.invalid.Increment()
+			return
 		}
 
 		// As per RFC 4861 section 4.3, the Source Link-Layer Address Option MUST
@@ -537,8 +554,8 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		na.Options().Serialize(optsSerializer)
 		packet.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 			Header: packet,
-			Src:    r.LocalAddress,
-			Dst:    r.RemoteAddress,
+			Src:    r.LocalAddress(),
+			Dst:    r.RemoteAddress(),
 		}))
 
 		// RFC 4861 Neighbor Discovery for IP version 6 (IPv6)
@@ -586,6 +603,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		e.dad.mu.Unlock()
 
 		if e.hasTentativeAddr(targetAddr) {
+			// We only send a nonce value in DAD messages to check for loopedback
+			// messages so we use the empty nonce value here.
+			var nonce []byte
+
 			// We just got an NA from a node that owns an address we are performing
 			// DAD on, implying the address is not unique. In this case we let the
 			// stack know so it can handle such a scenario and do nothing furthur with
@@ -602,7 +623,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			//
 			// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
 			// address is detected for an assigned address.
-			switch err := e.dupTentativeAddrDetected(targetAddr, targetLinkAddr); err.(type) {
+			switch err := e.dupTentativeAddrDetected(targetAddr, targetLinkAddr, nonce); err.(type) {
 			case nil, *tcpip.ErrBadAddress, *tcpip.ErrInvalidEndpointState:
 				return
 			default:
@@ -678,8 +699,8 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		dataRange := replyPkt.Data().AsRange()
 		icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 			Header:      icmp,
-			Src:         r.LocalAddress,
-			Dst:         r.RemoteAddress,
+			Src:         r.LocalAddress(),
+			Dst:         r.RemoteAddress(),
 			PayloadCsum: dataRange.Checksum(),
 			PayloadLen:  dataRange.Size(),
 		}))
@@ -899,13 +920,16 @@ func (e *endpoint) LinkAddressRequest(targetAddr, localAddr tcpip.Address, remot
 	}
 
 	if len(localAddr) == 0 {
+		// Find an address that we can use as our source address.
 		addressEndpoint := e.AcquireOutgoingPrimaryAddress(remoteAddr, false /* allowExpired */)
 		if addressEndpoint == nil {
 			return &tcpip.ErrNetworkUnreachable{}
 		}
 
 		localAddr = addressEndpoint.AddressWithPrefix().Address
-	} else if e.protocol.stack.CheckLocalAddress(e.nic.ID(), ProtocolNumber, localAddr) == 0 {
+		addressEndpoint.DecRef()
+	} else if !e.checkLocalAddress(localAddr) {
+		// The provided local address is not assigned to us.
 		return &tcpip.ErrBadLocalAddress{}
 	}
 
@@ -1137,8 +1161,8 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 	dataRange := newPkt.Data().AsRange()
 	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 		Header:      icmpHdr,
-		Src:         route.LocalAddress,
-		Dst:         route.RemoteAddress,
+		Src:         route.LocalAddress(),
+		Dst:         route.RemoteAddress(),
 		PayloadCsum: dataRange.Checksum(),
 		PayloadLen:  dataRange.Size(),
 	}))

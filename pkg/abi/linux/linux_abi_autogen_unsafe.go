@@ -1,5 +1,11 @@
 // Automatically generated marshal implementation. See tools/go_marshal.
 
+// If there are issues with build tag aggregation, see
+// tools/go_marshal/gomarshal/generator.go:writeHeader(). The build tags here
+// come from the input set of files used to generate this file. This input set
+// is filtered based on pre-defined file suffixes related to build tags, see 
+// tools/defs.bzl:calculate_sets().
+
 package linux
 
 import (
@@ -5572,6 +5578,7 @@ func (i *IPTIP) WriteTo(writer io.Writer) (int64, error) {
 // Packed implements marshal.Marshallable.Packed.
 //go:nosplit
 func (ke *KernelIPTEntry) Packed() bool {
+    // Type KernelIPTEntry is dynamic so it might have slice/string headers. Hence, it is not packed.
     return false
 }
 
@@ -5626,6 +5633,7 @@ func (ke *KernelIPTEntry) WriteTo(writer io.Writer) (int64, error) {
 // Packed implements marshal.Marshallable.Packed.
 //go:nosplit
 func (ke *KernelIPTGetEntries) Packed() bool {
+    // Type KernelIPTGetEntries is dynamic so it might have slice/string headers. Hence, it is not packed.
     return false
 }
 
@@ -6508,6 +6516,7 @@ func (i *IP6TReplace) WriteTo(writer io.Writer) (int64, error) {
 // Packed implements marshal.Marshallable.Packed.
 //go:nosplit
 func (ke *KernelIP6TGetEntries) Packed() bool {
+    // Type KernelIP6TGetEntries is dynamic so it might have slice/string headers. Hence, it is not packed.
     return false
 }
 

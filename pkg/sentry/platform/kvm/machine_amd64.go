@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -70,7 +71,7 @@ type vCPUArchState struct {
 
 	// floatingPointState is the floating point state buffer used in guest
 	// to host transitions. See usage in bluepill_amd64.go.
-	floatingPointState *arch.FloatingPointData
+	floatingPointState fpu.State
 }
 
 const (
@@ -151,7 +152,7 @@ func (c *vCPU) initArchState() error {
 	// This will be saved prior to leaving the guest, and we restore from
 	// this always. We cannot use the pointer in the context alone because
 	// we don't know how large the area there is in reality.
-	c.floatingPointState = arch.NewFloatingPointData()
+	c.floatingPointState = fpu.NewState()
 
 	// Set the time offset to the host native time.
 	return c.setSystemTime()
@@ -293,6 +294,28 @@ func (c *vCPU) fault(signal int32, info *arch.SignalInfo) (usermem.AccessType, e
 	return accessType, platform.ErrContextSignal
 }
 
+//go:nosplit
+//go:noinline
+func loadByte(ptr *byte) byte {
+	return *ptr
+}
+
+// prefaultFloatingPointState touches each page of the floating point state to
+// be sure that its physical pages are mapped.
+//
+// Otherwise the kernel can trigger KVM_EXIT_MMIO and an instruction that
+// triggered a fault will be emulated by the kvm kernel code, but it can't
+// emulate instructions like xsave and xrstor.
+//
+//go:nosplit
+func prefaultFloatingPointState(data *fpu.State) {
+	size := len(*data)
+	for i := 0; i < size; i += usermem.PageSize {
+		loadByte(&(*data)[i])
+	}
+	loadByte(&(*data)[size-1])
+}
+
 // SwitchToUser unpacks architectural-details.
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) (usermem.AccessType, error) {
 	// Check for canonical addresses.
@@ -323,6 +346,7 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	// allocations occur.
 	entersyscall()
 	bluepill(c)
+	prefaultFloatingPointState(switchOpts.FloatingPointState)
 	vector = c.CPU.SwitchToUser(switchOpts)
 	exitsyscall()
 
