@@ -31,6 +31,9 @@ func FlushTlbByVA(addr uintptr)
 // FlushTlbByASID invalidates tlb by ASID/Inner-Shareable.
 func FlushTlbByASID(asid uintptr)
 
+// LocalFlushTlbByASID invalidates tlb by ASID.
+func LocalFlushTlbByASID(asid uintptr)
+
 // FlushTlbAll invalidates all tlb.
 func FlushTlbAll()
 
@@ -62,9 +65,10 @@ func LoadFloatingPoint(*byte)
 // SaveFloatingPoint saves floating point state.
 func SaveFloatingPoint(*byte)
 
+// FPSIMDDisableTrap disables fpsimd.
 func FPSIMDDisableTrap()
 
-// DisableVFP disables fpsimd.
+// FPSIMDEnableTrap enables fpsimd.
 func FPSIMDEnableTrap()
 
 // Init sets function pointers based on architectural features.

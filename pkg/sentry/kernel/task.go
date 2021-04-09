@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
@@ -33,7 +34,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -470,7 +470,7 @@ type Task struct {
 	// ThreadID to 0, and wake any futex waiters.
 	//
 	// cleartid is exclusive to the task goroutine.
-	cleartid usermem.Addr
+	cleartid hostarch.Addr
 
 	// This is mostly a fake cpumask just for sched_set/getaffinity as we
 	// don't really control the affinity.
@@ -540,12 +540,12 @@ type Task struct {
 	// oldRSeqCPUAddr is a pointer to the userspace old rseq CPU variable.
 	//
 	// oldRSeqCPUAddr is exclusive to the task goroutine.
-	oldRSeqCPUAddr usermem.Addr
+	oldRSeqCPUAddr hostarch.Addr
 
 	// rseqAddr is a pointer to the userspace linux.RSeq structure.
 	//
 	// rseqAddr is exclusive to the task goroutine.
-	rseqAddr usermem.Addr
+	rseqAddr hostarch.Addr
 
 	// rseqSignature is the signature that the rseq abort IP must be signed
 	// with.
@@ -575,7 +575,7 @@ type Task struct {
 
 	// robustList is a pointer to the head of the tasks's robust futex
 	// list.
-	robustList usermem.Addr
+	robustList hostarch.Addr
 
 	// startTime is the real time at which the task started. It is set when
 	// a Task is created or invokes execve(2).
@@ -587,6 +587,12 @@ type Task struct {
 	//
 	// kcov is exclusive to the task goroutine.
 	kcov *Kcov
+
+	// cgroups is the set of cgroups this task belongs to. This may be empty if
+	// no cgroup controllers are enabled. Protected by mu.
+	//
+	// +checklocks:mu
+	cgroups map[Cgroup]struct{}
 }
 
 func (t *Task) savePtraceTracer() *Task {
@@ -652,7 +658,7 @@ func (t *Task) Kernel() *Kernel {
 // SetClearTID sets t's cleartid.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) SetClearTID(addr usermem.Addr) {
+func (t *Task) SetClearTID(addr hostarch.Addr) {
 	t.cleartid = addr
 }
 

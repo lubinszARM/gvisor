@@ -16,6 +16,7 @@ package boot
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
@@ -29,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
 	"gvisor.dev/gvisor/pkg/sentry/fs/user"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/fuse"
@@ -37,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/verity"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -50,6 +53,10 @@ func registerFilesystems(k *kernel.Kernel) error {
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
 
+	vfsObj.MustRegisterFilesystemType(cgroupfs.Name, &cgroupfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
 	vfsObj.MustRegisterFilesystemType(devpts.Name, &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList: true,
 		// TODO(b/29356795): Users may mount this once the terminals are in a
@@ -57,6 +64,10 @@ func registerFilesystems(k *kernel.Kernel) error {
 		AllowUserMount: false,
 	})
 	vfsObj.MustRegisterFilesystemType(devtmpfs.Name, &devtmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
@@ -79,9 +90,9 @@ func registerFilesystems(k *kernel.Kernel) error {
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(fuse.Name, &fuse.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
+	vfsObj.MustRegisterFilesystemType(verity.Name, &verity.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList:  true,
+		AllowUserMount: true,
 	})
 
 	// Setup files in devtmpfs.
@@ -472,6 +483,12 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 	var data []string
 	var iopts interface{}
 
+	verityData, verityOpts, verityRequested, remainingMOpts, err := parseVerityMountOptions(m.Options)
+	if err != nil {
+		return "", nil, false, err
+	}
+	m.Options = remainingMOpts
+
 	// Find filesystem name and FS specific data field.
 	switch m.Type {
 	case devpts.Name, devtmpfs.Name, proc.Name, sys.Name:
@@ -502,6 +519,13 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
 
+	case cgroupfs.Name:
+		var err error
+		data, err = parseAndFilterOptions(m.Options, cgroupfs.SupportedMountOptions...)
+		if err != nil {
+			return "", nil, false, err
+		}
+
 	default:
 		log.Warningf("ignoring unknown filesystem type %q", m.Type)
 		return "", nil, false, nil
@@ -530,7 +554,73 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 		}
 	}
 
+	if verityRequested {
+		verityData = verityData + "root_name=" + path.Base(m.Mount.Destination)
+		verityOpts.LowerName = fsName
+		verityOpts.LowerGetFSOptions = opts.GetFilesystemOptions
+		fsName = verity.Name
+		opts = &vfs.MountOptions{
+			GetFilesystemOptions: vfs.GetFilesystemOptions{
+				Data:         verityData,
+				InternalData: verityOpts,
+			},
+			InternalMount: true,
+		}
+	}
+
 	return fsName, opts, useOverlay, nil
+}
+
+func parseKeyValue(s string) (string, string, bool) {
+	tokens := strings.SplitN(s, "=", 2)
+	if len(tokens) < 2 {
+		return "", "", false
+	}
+	return strings.TrimSpace(tokens[0]), strings.TrimSpace(tokens[1]), true
+}
+
+// parseAndFilterOptions scans the provided mount options for verity-related
+// mount options. It returns the parsed set of verity mount options, as well as
+// the filtered set of mount options unrelated to verity.
+func parseVerityMountOptions(mopts []string) (string, verity.InternalFilesystemOptions, bool, []string, error) {
+	nonVerity := []string{}
+	found := false
+	var rootHash string
+	verityOpts := verity.InternalFilesystemOptions{
+		Action: verity.PanicOnViolation,
+	}
+	for _, o := range mopts {
+		if !strings.HasPrefix(o, "verity.") {
+			nonVerity = append(nonVerity, o)
+			continue
+		}
+
+		k, v, ok := parseKeyValue(o)
+		if !ok {
+			return "", verityOpts, found, nonVerity, fmt.Errorf("invalid verity mount option with no value: %q", o)
+		}
+
+		found = true
+		switch k {
+		case "verity.roothash":
+			rootHash = v
+		case "verity.action":
+			switch v {
+			case "error":
+				verityOpts.Action = verity.ErrorOnViolation
+			case "panic":
+				verityOpts.Action = verity.PanicOnViolation
+			default:
+				log.Warningf("Invalid verity action %q", v)
+				verityOpts.Action = verity.PanicOnViolation
+			}
+		default:
+			return "", verityOpts, found, nonVerity, fmt.Errorf("unknown verity mount option: %q", k)
+		}
+	}
+	verityOpts.AllowRuntimeEnable = len(rootHash) == 0
+	verityData := "root_hash=" + rootHash + ","
+	return verityData, verityOpts, found, nonVerity, nil
 }
 
 // mountTmpVFS2 mounts an internal tmpfs at '/tmp' if it's safe to do so.

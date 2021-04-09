@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -28,7 +29,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // +stateify savable
@@ -270,7 +270,7 @@ func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	anon := snapshot.Anonymous + snapshot.Tmpfs
 	file := snapshot.PageCache + snapshot.Mapped
 	// We don't actually have active/inactive LRUs, so just make up numbers.
-	activeFile := (file / 2) &^ (usermem.PageSize - 1)
+	activeFile := (file / 2) &^ (hostarch.PageSize - 1)
 	inactiveFile := file - activeFile
 
 	fmt.Fprintf(buf, "MemTotal:       %8d kB\n", totalSize/1024)
@@ -382,5 +382,21 @@ var _ dynamicInode = (*filesystemsData)(nil)
 func (d *filesystemsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	k := kernel.KernelFromContext(ctx)
 	k.VFS().GenerateProcFilesystems(buf)
+	return nil
+}
+
+// cgroupsData backs /proc/cgroups.
+//
+// +stateify savable
+type cgroupsData struct {
+	dynamicBytesFileSetAttr
+}
+
+var _ dynamicInode = (*cgroupsData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*cgroupsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	r := kernel.KernelFromContext(ctx).CgroupRegistry()
+	r.GenerateProcCgroups(buf)
 	return nil
 }

@@ -17,6 +17,7 @@ package kernel
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -25,7 +26,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // TaskConfig defines the configuration of a new Task (see below).
@@ -86,7 +86,7 @@ type TaskConfig struct {
 	MountNamespaceVFS2 *vfs.MountNamespace
 
 	// RSeqAddr is a pointer to the the userspace linux.RSeq structure.
-	RSeqAddr usermem.Addr
+	RSeqAddr hostarch.Addr
 
 	// RSeqSignature is the signature that the rseq abort IP must be signed
 	// with.
@@ -151,6 +151,7 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		rseqSignature:      cfg.RSeqSignature,
 		futexWaiter:        futex.NewWaiter(),
 		containerID:        cfg.ContainerID,
+		cgroups:            make(map[Cgroup]struct{}),
 	}
 	t.creds.Store(cfg.Credentials)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
@@ -187,6 +188,10 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	}
 	if t.parent != nil {
 		t.parent.children[t] = struct{}{}
+	}
+
+	if VFS2Enabled {
+		t.EnterInitialCgroups(t.parent)
 	}
 
 	if tg.leader == nil {

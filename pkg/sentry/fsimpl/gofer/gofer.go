@@ -44,6 +44,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
 	refs_vfs1 "gvisor.dev/gvisor/pkg/refs"
@@ -60,7 +61,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/unet"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Name is the default filesystem name.
@@ -872,7 +872,7 @@ func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, ma
 		mode:      uint32(attr.Mode),
 		uid:       uint32(fs.opts.dfltuid),
 		gid:       uint32(fs.opts.dfltgid),
-		blockSize: usermem.PageSize,
+		blockSize: hostarch.PageSize,
 		readFD:    -1,
 		writeFD:   -1,
 		mmapFD:    -1,
@@ -1104,24 +1104,27 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	defer d.metadataMu.Unlock()
 
 	// As with Linux, if the UID, GID, or file size is changing, we have to
-	// clear permission bits. Note that when set, clearSGID causes
-	// permissions to be updated, but does not modify stat.Mask, as
-	// modification would cause an extra inotify flag to be set.
-	clearSGID := stat.Mask&linux.STATX_UID != 0 && stat.UID != atomic.LoadUint32(&d.uid) ||
-		stat.Mask&linux.STATX_GID != 0 && stat.GID != atomic.LoadUint32(&d.gid) ||
+	// clear permission bits. Note that when set, clearSGID may cause
+	// permissions to be updated.
+	clearSGID := (stat.Mask&linux.STATX_UID != 0 && stat.UID != atomic.LoadUint32(&d.uid)) ||
+		(stat.Mask&linux.STATX_GID != 0 && stat.GID != atomic.LoadUint32(&d.gid)) ||
 		stat.Mask&linux.STATX_SIZE != 0
 	if clearSGID {
 		if stat.Mask&linux.STATX_MODE != 0 {
 			stat.Mode = uint16(vfs.ClearSUIDAndSGID(uint32(stat.Mode)))
 		} else {
-			stat.Mode = uint16(vfs.ClearSUIDAndSGID(atomic.LoadUint32(&d.mode)))
+			oldMode := atomic.LoadUint32(&d.mode)
+			if updatedMode := vfs.ClearSUIDAndSGID(oldMode); updatedMode != oldMode {
+				stat.Mode = uint16(updatedMode)
+				stat.Mask |= linux.STATX_MODE
+			}
 		}
 	}
 
 	if !d.isSynthetic() {
 		if stat.Mask != 0 {
 			if err := d.file.setAttr(ctx, p9.SetAttrMask{
-				Permissions:        stat.Mask&linux.STATX_MODE != 0 || clearSGID,
+				Permissions:        stat.Mask&linux.STATX_MODE != 0,
 				UID:                stat.Mask&linux.STATX_UID != 0,
 				GID:                stat.Mask&linux.STATX_GID != 0,
 				Size:               stat.Mask&linux.STATX_SIZE != 0,
@@ -1156,7 +1159,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			return nil
 		}
 	}
-	if stat.Mask&linux.STATX_MODE != 0 || clearSGID {
+	if stat.Mask&linux.STATX_MODE != 0 {
 		atomic.StoreUint32(&d.mode, d.fileType()|uint32(stat.Mode))
 	}
 	if stat.Mask&linux.STATX_UID != 0 {
@@ -1217,8 +1220,8 @@ func (d *dentry) updateSizeLocked(newSize uint64) {
 	// so we can't race with Write or another truncate.)
 	d.dataMu.Unlock()
 	if d.size < oldSize {
-		oldpgend, _ := usermem.PageRoundUp(oldSize)
-		newpgend, _ := usermem.PageRoundUp(d.size)
+		oldpgend, _ := hostarch.PageRoundUp(oldSize)
+		newpgend, _ := hostarch.PageRoundUp(d.size)
 		if oldpgend != newpgend {
 			d.mapsMu.Lock()
 			d.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{

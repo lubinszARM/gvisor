@@ -410,12 +410,14 @@ func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address, holderLinkAddr t
 //
 // Must only be called when the forwarding status changes.
 func (e *endpoint) transitionForwarding(forwarding bool) {
+	allRoutersGroups := [...]tcpip.Address{
+		header.IPv6AllRoutersInterfaceLocalMulticastAddress,
+		header.IPv6AllRoutersLinkLocalMulticastAddress,
+		header.IPv6AllRoutersSiteLocalMulticastAddress,
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	if !e.Enabled() {
-		return
-	}
 
 	if forwarding {
 		// When transitioning into an IPv6 router, host-only state (NDP discovered
@@ -423,9 +425,50 @@ func (e *endpoint) transitionForwarding(forwarding bool) {
 		// cleaned up/invalidated and NDP router solicitations are stopped.
 		e.mu.ndp.stopSolicitingRouters()
 		e.mu.ndp.cleanupState(true /* hostOnly */)
-	} else {
-		// When transitioning into an IPv6 host, NDP router solicitations are
-		// started.
+
+		// As per RFC 4291 section 2.8:
+		//
+		//   A router is required to recognize all addresses that a host is
+		//   required to recognize, plus the following addresses as identifying
+		//   itself:
+		//
+		//      o The All-Routers multicast addresses defined in Section 2.7.1.
+		//
+		// As per RFC 4291 section 2.7.1,
+		//
+		//      All Routers Addresses:   FF01:0:0:0:0:0:0:2
+		//                               FF02:0:0:0:0:0:0:2
+		//                               FF05:0:0:0:0:0:0:2
+		//
+		//   The above multicast addresses identify the group of all IPv6 routers,
+		//   within scope 1 (interface-local), 2 (link-local), or 5 (site-local).
+		for _, g := range allRoutersGroups {
+			if err := e.joinGroupLocked(g); err != nil {
+				// joinGroupLocked only returns an error if the group address is not a
+				// valid IPv6 multicast address.
+				panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", g, err))
+			}
+		}
+
+		return
+	}
+
+	for _, g := range allRoutersGroups {
+		switch err := e.leaveGroupLocked(g).(type) {
+		case nil:
+		case *tcpip.ErrBadLocalAddress:
+			// The endpoint may have already left the multicast group.
+		default:
+			panic(fmt.Sprintf("e.leaveGroupLocked(%s): %s", g, err))
+		}
+	}
+
+	// When transitioning into an IPv6 host, NDP router solicitations are
+	// started if the endpoint is enabled.
+	//
+	// If the endpoint is not currently enabled, routers will be solicited when
+	// the endpoint becomes enabled (if it is still a host).
+	if e.Enabled() {
 		e.mu.ndp.startSolicitingRouters()
 	}
 }
@@ -573,7 +616,7 @@ func (e *endpoint) disableLocked() {
 	e.mu.ndp.cleanupState(false /* hostOnly */)
 
 	// The endpoint may have already left the multicast group.
-	switch err := e.leaveGroupLocked(header.IPv6AllNodesMulticastAddress); err.(type) {
+	switch err := e.leaveGroupLocked(header.IPv6AllNodesMulticastAddress).(type) {
 	case nil, *tcpip.ErrBadLocalAddress:
 	default:
 		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv6AllNodesMulticastAddress, err))
@@ -869,6 +912,16 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 // forwardPacket attempts to forward a packet to its final destination.
 func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	h := header.IPv6(pkt.NetworkHeader().View())
+
+	dstAddr := h.DestinationAddress()
+	if header.IsV6LinkLocalAddress(h.SourceAddress()) || header.IsV6LinkLocalAddress(dstAddr) || header.IsV6LinkLocalMulticastAddress(dstAddr) {
+		// As per RFC 4291 section 2.5.6,
+		//
+		//   Routers must not forward any packets with Link-Local source or
+		//   destination addresses to other links.
+		return nil
+	}
+
 	hopLimit := h.HopLimit()
 	if hopLimit <= 1 {
 		// As per RFC 4443 section 3.3,
@@ -880,8 +933,6 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 		//   too small an initial Hop Limit value.
 		return e.protocol.returnError(&icmpReasonHopLimitExceeded{}, pkt)
 	}
-
-	dstAddr := h.DestinationAddress()
 
 	// Check if the destination is owned by the stack.
 	if ep := e.protocol.findEndpointWithAddress(dstAddr); ep != nil {
@@ -1979,9 +2030,9 @@ func (p *protocol) Forwarding() bool {
 // Returns true if the forwarding status was updated.
 func (p *protocol) setForwarding(v bool) bool {
 	if v {
-		return atomic.SwapUint32(&p.forwarding, 1) == 0
+		return atomic.CompareAndSwapUint32(&p.forwarding, 0 /* old */, 1 /* new */)
 	}
-	return atomic.SwapUint32(&p.forwarding, 0) == 1
+	return atomic.CompareAndSwapUint32(&p.forwarding, 1 /* old */, 0 /* new */)
 }
 
 // SetForwarding implements stack.ForwardingNetworkProtocol.

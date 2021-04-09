@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64 386
+package verity
 
-package usermem
+import (
+	"sync/atomic"
 
-import "encoding/binary"
-
-const (
-	// PageSize is the system page size.
-	PageSize = 1 << PageShift
-
-	// HugePageSize is the system huge page size.
-	HugePageSize = 1 << HugePageShift
-
-	// PageShift is the binary log of the system page size.
-	PageShift = 12
-
-	// HugePageShift is the binary log of the system huge page size.
-	HugePageShift = 21
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 )
 
-var (
-	// ByteOrder is the native byte order (little endian).
-	ByteOrder = binary.LittleEndian
-)
+func (d *dentry) afterLoad() {
+	if atomic.LoadInt64(&d.refs) != -1 {
+		refsvfs2.Register(d)
+	}
+}

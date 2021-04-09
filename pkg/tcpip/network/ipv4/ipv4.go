@@ -150,6 +150,38 @@ func (p *protocol) forgetEndpoint(nicID tcpip.NICID) {
 	delete(p.mu.eps, nicID)
 }
 
+// transitionForwarding transitions the endpoint's forwarding status to
+// forwarding.
+//
+// Must only be called when the forwarding status changes.
+func (e *endpoint) transitionForwarding(forwarding bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if forwarding {
+		// There does not seem to be an RFC requirement for a node to join the all
+		// routers multicast address but
+		// https://www.iana.org/assignments/multicast-addresses/multicast-addresses.xhtml
+		// specifies the address as a group for all routers on a subnet so we join
+		// the group here.
+		if err := e.joinGroupLocked(header.IPv4AllRoutersGroup); err != nil {
+			// joinGroupLocked only returns an error if the group address is not a
+			// valid IPv4 multicast address.
+			panic(fmt.Sprintf("e.joinGroupLocked(%s): %s", header.IPv4AllRoutersGroup, err))
+		}
+
+		return
+	}
+
+	switch err := e.leaveGroupLocked(header.IPv4AllRoutersGroup).(type) {
+	case nil:
+	case *tcpip.ErrBadLocalAddress:
+		// The endpoint may have already left the multicast group.
+	default:
+		panic(fmt.Sprintf("e.leaveGroupLocked(%s): %s", header.IPv4AllRoutersGroup, err))
+	}
+}
+
 // Enable implements stack.NetworkEndpoint.
 func (e *endpoint) Enable() tcpip.Error {
 	e.mu.Lock()
@@ -226,7 +258,7 @@ func (e *endpoint) disableLocked() {
 	}
 
 	// The endpoint may have already left the multicast group.
-	switch err := e.leaveGroupLocked(header.IPv4AllSystems); err.(type) {
+	switch err := e.leaveGroupLocked(header.IPv4AllSystems).(type) {
 	case nil, *tcpip.ErrBadLocalAddress:
 	default:
 		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv4AllSystems, err))
@@ -551,6 +583,22 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 // forwardPacket attempts to forward a packet to its final destination.
 func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	h := header.IPv4(pkt.NetworkHeader().View())
+
+	dstAddr := h.DestinationAddress()
+	if header.IsV4LinkLocalUnicastAddress(h.SourceAddress()) || header.IsV4LinkLocalUnicastAddress(dstAddr) || header.IsV4LinkLocalMulticastAddress(dstAddr) {
+		// As per RFC 3927 section 7,
+		//
+		//   A router MUST NOT forward a packet with an IPv4 Link-Local source or
+		//   destination address, irrespective of the router's default route
+		//   configuration or routes obtained from dynamic routing protocols.
+		//
+		//   A router which receives a packet with an IPv4 Link-Local source or
+		//   destination address MUST NOT forward the packet.  This prevents
+		//   forwarding of packets back onto the network segment from which they
+		//   originated, or to any other segment.
+		return nil
+	}
+
 	ttl := h.TTL()
 	if ttl == 0 {
 		// As per RFC 792 page 6, Time Exceeded Message,
@@ -588,8 +636,6 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 			opts[i] = byte(header.IPv4OptionListEndType)
 		}
 	}
-
-	dstAddr := h.DestinationAddress()
 
 	// Check if the destination is owned by the stack.
 	if ep := e.protocol.findEndpointWithAddress(dstAddr); ep != nil {
@@ -1168,12 +1214,27 @@ func (p *protocol) Forwarding() bool {
 	return uint8(atomic.LoadUint32(&p.forwarding)) == 1
 }
 
+// setForwarding sets the forwarding status for the protocol.
+//
+// Returns true if the forwarding status was updated.
+func (p *protocol) setForwarding(v bool) bool {
+	if v {
+		return atomic.CompareAndSwapUint32(&p.forwarding, 0 /* old */, 1 /* new */)
+	}
+	return atomic.CompareAndSwapUint32(&p.forwarding, 1 /* old */, 0 /* new */)
+}
+
 // SetForwarding implements stack.ForwardingNetworkProtocol.
 func (p *protocol) SetForwarding(v bool) {
-	if v {
-		atomic.StoreUint32(&p.forwarding, 1)
-	} else {
-		atomic.StoreUint32(&p.forwarding, 0)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.setForwarding(v) {
+		return
+	}
+
+	for _, ep := range p.mu.eps {
+		ep.transitionForwarding(v)
 	}
 }
 

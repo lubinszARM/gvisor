@@ -20,13 +20,13 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Linux kernel errnos which "should never be seen by user programs", but will
@@ -69,7 +69,7 @@ type thread struct {
 // threadPool is a collection of threads.
 type threadPool struct {
 	// mu protects below.
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// threads is the collection of threads.
 	//
@@ -85,30 +85,42 @@ type threadPool struct {
 //
 // Precondition: the runtime OS thread must be locked.
 func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread) *thread {
-	tp.mu.Lock()
+	// The overwhelming common case is that the thread is already created.
+	// Optimistically attempt the lookup by only locking for reading.
+	tp.mu.RLock()
 	t, ok := tp.threads[currentTID]
-	if !ok {
-		// Before creating a new thread, see if we can find a thread
-		// whose system tid has disappeared.
-		//
-		// TODO(b/77216482): Other parts of this package depend on
-		// threads never exiting.
-		for origTID, t := range tp.threads {
-			// Signal zero is an easy existence check.
-			if err := unix.Tgkill(unix.Getpid(), int(origTID), 0); err != nil {
-				// This thread has been abandoned; reuse it.
-				delete(tp.threads, origTID)
-				tp.threads[currentTID] = t
-				tp.mu.Unlock()
-				return t
-			}
-		}
-
-		// Create a new thread.
-		t = newThread()
-		tp.threads[currentTID] = t
+	tp.mu.RUnlock()
+	if ok {
+		return t
 	}
-	tp.mu.Unlock()
+
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	// Another goroutine might have created the thread for currentTID in between
+	// mu.RUnlock() and mu.Lock().
+	if t, ok = tp.threads[currentTID]; ok {
+		return t
+	}
+
+	// Before creating a new thread, see if we can find a thread
+	// whose system tid has disappeared.
+	//
+	// TODO(b/77216482): Other parts of this package depend on
+	// threads never exiting.
+	for origTID, t := range tp.threads {
+		// Signal zero is an easy existence check.
+		if err := unix.Tgkill(unix.Getpid(), int(origTID), 0); err != nil {
+			// This thread has been abandoned; reuse it.
+			delete(tp.threads, origTID)
+			tp.threads[currentTID] = t
+			return t
+		}
+	}
+
+	// Create a new thread.
+	t = newThread()
+	tp.threads[currentTID] = t
 	return t
 }
 
@@ -228,7 +240,7 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 func (s *subprocess) unmap() {
 	s.Unmap(0, uint64(stubStart))
 	if maximumUserAddress != stubEnd {
-		s.Unmap(usermem.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+		s.Unmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
 	}
 }
 
@@ -615,7 +627,7 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
-func (s *subprocess) MapFile(addr usermem.Addr, f memmap.File, fr memmap.FileRange, at usermem.AccessType, precommit bool) error {
+func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE
@@ -632,7 +644,7 @@ func (s *subprocess) MapFile(addr usermem.Addr, f memmap.File, fr memmap.FileRan
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
-func (s *subprocess) Unmap(addr usermem.Addr, length uint64) {
+func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 	ar, ok := addr.ToRange(length)
 	if !ok {
 		panic(fmt.Sprintf("addr %#x + length %#x overflows", addr, length))
