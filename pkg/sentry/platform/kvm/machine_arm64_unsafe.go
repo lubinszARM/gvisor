@@ -174,9 +174,39 @@ func (c *vCPU) setTSC(value uint64) error {
 	return nil
 }
 
-// setSystemTime sets the vCPU to the system time.
-func (c *vCPU) setSystemTime() error {
-	return c.setSystemTimeLegacy()
+func (c *vCPU) getTSCFreq() (uintptr, error) {
+	// _KVM_ARM64_REGS_CNTFRQ_EL0
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_CNTFRQ_EL0
+
+	if err := c.getOneRegister(&reg); err != nil {
+		return 0, err
+	}
+
+	return uintptr(data), nil
+}
+
+// setTSCFreq sets the TSC frequency.
+func (c *vCPU) setTSCFreq(value uintptr) error {
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_CNTFRQ_EL0
+	data = uint64(value)
+
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 //go:nosplit

@@ -100,6 +100,16 @@ func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
 	return phyRegions
 }
 
+// bitsForScaling returns the bits available for storing the fraction component
+// of the TSC scaling ratio. This allows us to replicate the (bad) math done by
+// the kernel below in scaledTSC, and ensure we can compute an exact zero
+// offset in setSystemTime.
+//
+// These constants correspond to kvm_tsc_scaling_ratio_frac_bits.
+var bitsForScaling = func() int64 {
+	return 31
+}()
+
 // Get all available physicalRegions.
 func availableRegionsForSetMem() (phyRegions []physicalRegion) {
 	var excludeRegions []region
