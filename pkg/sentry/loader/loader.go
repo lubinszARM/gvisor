@@ -36,6 +36,10 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// BBLU: TODO.
+// This is temporarily used as a poc, and will be modified in the future.
+var GBuf = make([]byte, 140)
+
 // LoadArgs holds specifications for an executable file to be loaded.
 type LoadArgs struct {
 	// MemoryManager is the memory manager to load the executable into.
@@ -98,7 +102,7 @@ func openPath(ctx context.Context, args LoadArgs) (fsbridge.File, error) {
 	// ptrace and procfs.
 	opts := vfs.OpenOptions{
 		Flags:    linux.O_RDONLY,
-		FileExec: true,
+		FileExec: false, //true,
 	}
 	return args.Opener.OpenPath(ctx, args.Filename, opts, args.RemainingTraversals, args.ResolveFinal)
 }
@@ -196,6 +200,26 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, arch.Context
 			}
 			// Refresh the traversal limit for the interpreter.
 			*args.RemainingTraversals = linux.MaxSymlinkTraversals
+
+		case bytes.Equal(hdr[1:4], []byte(interpreterWasmMagic)):
+			loaded, ac, err := loadELF(ctx, args)
+			if err != nil {
+				ctx.Infof("Error loading ELF: %v", err)
+				return loadedELF{}, nil, nil, nil, err
+			}
+
+			//var binaryCode [140]byte
+			/*      var buf = make([]byte, 140)
+			 */
+			_, err = args.File.ReadFull(ctx, usermem.BytesIOSequence(GBuf[:]), 0)
+			if err != nil {
+				// The entire ident array always exists.
+				return loadedELF{}, nil, nil, nil, syserror.ENOEXEC
+			}
+
+			// An ELF is always terminal. Hold on to file.
+			args.File.IncRef()
+			return loaded, ac, args.File, args.Argv, err
 
 		default:
 			ctx.Infof("Unknown magic: %v", hdr)

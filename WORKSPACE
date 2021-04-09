@@ -1466,3 +1466,10 @@ go_repository(
     sum = "h1:LhYJRs+L4fBtjZUfuSZIKGeVu0QRy8e5Xi7D17UxZ74=",
     version = "v1.2.0",
 )
+
+go_repository(
+    name = "com_github_bytecodealliance_wasmtime_go",
+    importpath = "github.com/bytecodealliance/wasmtime-go",
+    sum = "h1:wHOt9u+irLBCUjotanqDwVbnNmTJ1gWQxY2+q+XeMp4=",
+    version = "v0.26.0",
+)

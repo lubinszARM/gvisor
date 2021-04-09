@@ -12,22 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package platforms imports all available platform packages.
-package platforms
+package wasm
 
 import (
-	// Import platforms that runsc might use.
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/wasm"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-const (
-	// Ptrace runs the sandbox with the ptrace platform.
-	Ptrace = "ptrace"
-
-	// KVM runs the sandbox with the KVM platform.
-	KVM = "kvm"
-
-	WASM = "wasm"
-)
+// SyscallFilters returns syscalls made exclusively by the wasm platform.
+func (*WASM) SyscallFilters() seccomp.SyscallRules {
+	return seccomp.SyscallRules{
+		unix.SYS_TGKILL: {},
+		unix.SYS_WAIT4:  {},
+	}
+}

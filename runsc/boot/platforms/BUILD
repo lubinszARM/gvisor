@@ -11,5 +11,6 @@ go_library(
     deps = [
         "//pkg/sentry/platform/kvm",
         "//pkg/sentry/platform/ptrace",
+        "//pkg/sentry/platform/wasm",
     ],
 )

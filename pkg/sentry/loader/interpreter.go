@@ -28,6 +28,9 @@ const (
 	// interpreterScriptMagic identifies an interpreter script.
 	interpreterScriptMagic = "#!"
 
+	// interpreterWasmMagic identifies an  wasm file.
+	interpreterWasmMagic = "asm"
+
 	// interpMaxLineLength is the maximum length for the first line of an
 	// interpreter script.
 	//

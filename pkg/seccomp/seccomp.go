@@ -50,39 +50,41 @@ const (
 // However, it will leave a SECCOMP audit event trail behind. In any case, the
 // syscall is still blocked from executing.
 func Install(rules SyscallRules) error {
-	defaultAction, err := defaultAction()
-	if err != nil {
-		return err
-	}
-
-	// Uncomment to get stack trace when there is a violation.
-	// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
-
-	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
-
-	instrs, err := BuildProgram([]RuleSet{
-		{
-			Rules:  rules,
-			Action: linux.SECCOMP_RET_ALLOW,
-		},
-	}, defaultAction, defaultAction)
-	if log.IsLogging(log.Debug) {
-		programStr, errDecode := bpf.DecodeInstructions(instrs)
-		if errDecode != nil {
-			programStr = fmt.Sprintf("Error: %v\n%s", errDecode, programStr)
+	// BBLU: Comment out temporarily.
+	/*	defaultAction, err := defaultAction()
+		if err != nil {
+			return err
 		}
-		log.Debugf("Seccomp program dump:\n%s", programStr)
-	}
-	if err != nil {
-		return err
-	}
 
-	// Perform the actual installation.
-	if errno := SetFilter(instrs); errno != 0 {
-		return fmt.Errorf("failed to set filter: %v", errno)
-	}
+		// Uncomment to get stack trace when there is a violation.
+		// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
 
-	log.Infof("Seccomp filters installed.")
+		log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
+
+		instrs, err := BuildProgram([]RuleSet{
+			{
+				Rules:  rules,
+				Action: linux.SECCOMP_RET_ALLOW,
+			},
+		}, defaultAction, defaultAction)
+		if log.IsLogging(log.Debug) {
+			programStr, errDecode := bpf.DecodeInstructions(instrs)
+			if errDecode != nil {
+				programStr = fmt.Sprintf("Error: %v\n%s", errDecode, programStr)
+			}
+			log.Debugf("Seccomp program dump:\n%s", programStr)
+		}
+		if err != nil {
+			return err
+		}
+
+		// Perform the actual installation.
+		if errno := SetFilter(instrs); errno != 0 {
+			return fmt.Errorf("failed to set filter: %v", errno)
+		}
+
+		log.Infof("Seccomp filters installed.")
+	*/
 	return nil
 }
 

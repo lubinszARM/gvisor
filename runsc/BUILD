@@ -8,7 +8,8 @@ go_binary(
         "main.go",
         "version.go",
     ],
-    pure = True,
+    pure = False,
+    static = True,
     visibility = [
         "//visibility:public",
     ],

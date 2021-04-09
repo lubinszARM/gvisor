@@ -4,6 +4,7 @@
 platforms = {
     "ptrace": [],
     "kvm": [],
+    "wasm": [],
 }
 
 default_platform = "ptrace"
