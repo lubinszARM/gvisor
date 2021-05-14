@@ -25,6 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+var _ stack.LinkEndpoint = (*endpoint)(nil)
+var _ stack.GSOEndpoint = (*endpoint)(nil)
+
 // endpoint represents a LinkEndpoint which implements a FIFO queue for all
 // outgoing packets. endpoint can have 1 or more underlying queueDispatchers.
 // All outgoing packets are consistenly hashed to a single underlying queue
@@ -91,7 +94,7 @@ func (q *queueDispatcher) dispatchLoop() {
 			}
 			// We pass a protocol of zero here because each packet carries its
 			// NetworkProtocol.
-			q.lower.WritePackets(stack.RouteInfo{}, nil /* gso */, batch, 0 /* protocol */)
+			q.lower.WritePackets(stack.RouteInfo{}, batch, 0 /* protocol */)
 			for pkt := batch.Front(); pkt != nil; pkt = pkt.Next() {
 				batch.Remove(pkt)
 			}
@@ -141,7 +144,7 @@ func (e *endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.lower.LinkAddress()
 }
 
-// GSOMaxSize returns the maximum GSO packet size.
+// GSOMaxSize implements stack.GSOEndpoint.
 func (e *endpoint) GSOMaxSize() uint32 {
 	if gso, ok := e.lower.(stack.GSOEndpoint); ok {
 		return gso.GSOMaxSize()
@@ -149,13 +152,21 @@ func (e *endpoint) GSOMaxSize() uint32 {
 	return 0
 }
 
+// SupportedGSO implements stack.GSOEndpoint.
+func (e *endpoint) SupportedGSO() stack.SupportedGSO {
+	if gso, ok := e.lower.(stack.GSOEndpoint); ok {
+		return gso.SupportedGSO()
+	}
+	return stack.GSONotSupported
+}
+
 // WritePacket implements stack.LinkEndpoint.WritePacket.
-func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	// WritePacket caller's do not set the following fields in PacketBuffer
-	// so we populate them here.
-	pkt.EgressRoute = r
-	pkt.GSOOptions = gso
-	pkt.NetworkProtocolNumber = protocol
+//
+// The packet must have the following fields populated:
+//  - pkt.EgressRoute
+//  - pkt.GSOOptions
+//  - pkt.NetworkProtocolNumber
+func (e *endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	d := e.dispatchers[int(pkt.Hash)%len(e.dispatchers)]
 	if !d.q.enqueue(pkt) {
 		return &tcpip.ErrNoBufferSpace{}
@@ -166,12 +177,12 @@ func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
 //
-// Being a batch API, each packet in pkts should have the following
-// fields populated:
+// Each packet in the packet buffer list must have the following fields
+// populated:
 //  - pkt.EgressRoute
 //  - pkt.GSOOptions
 //  - pkt.NetworkProtocolNumber
-func (e *endpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	enqueued := 0
 	for pkt := pkts.Front(); pkt != nil; {
 		d := e.dispatchers[int(pkt.Hash)%len(e.dispatchers)]

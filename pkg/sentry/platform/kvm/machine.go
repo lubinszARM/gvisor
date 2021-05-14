@@ -67,11 +67,17 @@ type machine struct {
 	// maxSlots is the maximum number of memory slots supported by the machine.
 	maxSlots int
 
+	// tscControl checks whether cpu supports TSC scaling
+	tscControl bool
+
 	// usedSlots is the set of used physical addresses (sorted).
 	usedSlots []uintptr
 
 	// nextID is the next vCPU ID.
 	nextID uint32
+
+	// machineArchState is the architecture-specific state.
+	machineArchState
 }
 
 const (
@@ -193,12 +199,7 @@ func newMachine(vm int) (*machine, error) {
 	m.available.L = &m.mu
 
 	// Pull the maximum vCPUs.
-	maxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
-	if errno != 0 {
-		m.maxVCPUs = _KVM_NR_VCPUS
-	} else {
-		m.maxVCPUs = int(maxVCPUs)
-	}
+	m.getMaxVCPU()
 	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
 	m.vCPUsByTID = make(map[uint64]*vCPU)
 	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
@@ -213,6 +214,11 @@ func newMachine(vm int) (*machine, error) {
 	}
 	log.Debugf("The maximum number of slots is %d.", m.maxSlots)
 	m.usedSlots = make([]uintptr, m.maxSlots)
+
+	// Check TSC Scaling
+	hasTSCControl, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
+	m.tscControl = errno == 0 && hasTSCControl == 1
+	log.Debugf("TSC scaling support: %t.", m.tscControl)
 
 	// Create the upper shared pagetables and kernel(sentry) pagetables.
 	m.upperSharedPageTables = pagetables.New(newAllocator())
@@ -419,9 +425,8 @@ func (m *machine) Get() *vCPU {
 			}
 		}
 
-		// Create a new vCPU (maybe).
-		if int(m.nextID) < m.maxVCPUs {
-			c := m.newVCPU()
+		// Get a new vCPU (maybe).
+		if c := m.getNewVCPU(); c != nil {
 			c.lock()
 			m.vCPUsByTID[tid] = c
 			m.mu.Unlock()

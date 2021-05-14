@@ -140,6 +140,15 @@ func (s *segment) clone() *segment {
 	return t
 }
 
+// merge merges data in oth and clears oth.
+func (s *segment) merge(oth *segment) {
+	s.data.Append(oth.data)
+	s.dataMemSize = s.data.Size()
+
+	oth.data = buffer.VectorisedView{}
+	oth.dataMemSize = oth.data.Size()
+}
+
 // flagIsSet checks if at least one flag in flags is set in s.flags.
 func (s *segment) flagIsSet(flags header.TCPFlags) bool {
 	return s.flags&flags != 0
@@ -236,20 +245,14 @@ func (s *segment) parse(skipChecksumValidation bool) bool {
 
 	s.options = []byte(s.hdr[header.TCPMinimumSize:])
 	s.parsedOptions = header.ParseTCPOptions(s.options)
-
-	verifyChecksum := true
 	if skipChecksumValidation {
 		s.csumValid = true
-		verifyChecksum = false
-	}
-	if verifyChecksum {
+	} else {
 		s.csum = s.hdr.Checksum()
-		xsum := header.PseudoHeaderChecksum(ProtocolNumber, s.srcAddr, s.dstAddr, uint16(s.data.Size()+len(s.hdr)))
-		xsum = s.hdr.CalculateChecksum(xsum)
-		xsum = header.ChecksumVV(s.data, xsum)
-		s.csumValid = xsum == 0xffff
+		payloadChecksum := header.ChecksumVV(s.data, 0)
+		payloadLength := uint16(s.data.Size())
+		s.csumValid = s.hdr.IsChecksumValid(s.srcAddr, s.dstAddr, payloadChecksum, payloadLength)
 	}
-
 	s.sequenceNumber = seqnum.Value(s.hdr.SequenceNumber())
 	s.ackNumber = seqnum.Value(s.hdr.AckNumber())
 	s.flags = s.hdr.Flags()

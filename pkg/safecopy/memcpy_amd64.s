@@ -51,8 +51,8 @@ TEXT ·memcpy(SB), NOSPLIT, $0-36
 	// handleMemcpyFault will store a different value in this address.
 	MOVL	$0, sig+32(FP)
 
-	MOVQ	to+0(FP), DI
-	MOVQ	from+8(FP), SI
+	MOVQ	dst+0(FP), DI
+	MOVQ	src+8(FP), SI
 	MOVQ	n+16(FP), BX
 
 tail:
@@ -216,4 +216,10 @@ move_129through256:
 	MOVOU	X14, -32(DI)(BX*1)
 	MOVOU	-16(SI)(BX*1), X15
 	MOVOU	X15, -16(DI)(BX*1)
+	RET
+
+// func addrOfMemcpy() uintptr
+TEXT ·addrOfMemcpy(SB), $0-8
+	MOVQ	$·memcpy(SB), AX
+	MOVQ	AX, ret+0(FP)
 	RET

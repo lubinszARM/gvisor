@@ -30,7 +30,6 @@ import (
 type PacketInfo struct {
 	Pkt   *stack.PacketBuffer
 	Proto tcpip.NetworkProtocolNumber
-	GSO   *stack.GSO
 	Route stack.RouteInfo
 }
 
@@ -124,6 +123,9 @@ func (q *queue) RemoveNotify(handle *NotificationHandle) {
 	q.notify = notify
 }
 
+var _ stack.LinkEndpoint = (*Endpoint)(nil)
+var _ stack.GSOEndpoint = (*Endpoint)(nil)
+
 // Endpoint is link layer endpoint that stores outbound packets in a channel
 // and allows injection of inbound packets.
 type Endpoint struct {
@@ -131,6 +133,7 @@ type Endpoint struct {
 	mtu                uint32
 	linkAddr           tcpip.LinkAddress
 	LinkEPCapabilities stack.LinkEndpointCapabilities
+	SupportedGSOKind   stack.SupportedGSO
 
 	// Outbound packet queue.
 	q *queue
@@ -212,9 +215,14 @@ func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return e.LinkEPCapabilities
 }
 
-// GSOMaxSize returns the maximum GSO packet size.
+// GSOMaxSize implements stack.GSOEndpoint.
 func (*Endpoint) GSOMaxSize() uint32 {
 	return 1 << 15
+}
+
+// SupportedGSO implements stack.GSOEndpoint.
+func (e *Endpoint) SupportedGSO() stack.SupportedGSO {
+	return e.SupportedGSOKind
 }
 
 // MaxHeaderLength returns the maximum size of the link layer header. Given it
@@ -229,11 +237,10 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // WritePacket stores outbound packets into the channel.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *Endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	p := PacketInfo{
 		Pkt:   pkt,
 		Proto: protocol,
-		GSO:   gso,
 		Route: r,
 	}
 
@@ -243,13 +250,12 @@ func (e *Endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip
 }
 
 // WritePackets stores outbound packets into the channel.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	n := 0
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		p := PacketInfo{
 			Pkt:   pkt,
 			Proto: protocol,
-			GSO:   gso,
 			Route: r,
 		}
 

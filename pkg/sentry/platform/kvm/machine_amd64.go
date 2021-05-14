@@ -63,6 +63,9 @@ func (m *machine) initArchState() error {
 	return nil
 }
 
+type machineArchState struct {
+}
+
 type vCPUArchState struct {
 	// PCIDs is the set of PCIDs for this vCPU.
 	//
@@ -213,6 +216,11 @@ func (c *vCPU) setSystemTime() error {
 	// capabilities as it is emulated in KVM. We don't actually use this
 	// capability, but it means that this method should be robust to
 	// different hardware configurations.
+
+	// if tsc scaling is not supported, fallback to legacy mode
+	if !c.machine.tscControl {
+		return c.setSystemTimeLegacy()
+	}
 	rawFreq, err := c.getTSCFreq()
 	if err != nil {
 		return c.setSystemTimeLegacy()
@@ -346,6 +354,10 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	// allocations occur.
 	entersyscall()
 	bluepill(c)
+	// The root table physical page has to be mapped to not fault in iret
+	// or sysret after switching into a user address space.  sysret and
+	// iret are in the upper half that is global and already mapped.
+	switchOpts.PageTables.PrefaultRootTable()
 	prefaultFloatingPointState(switchOpts.FloatingPointState)
 	vector = c.CPU.SwitchToUser(switchOpts)
 	exitsyscall()
@@ -489,4 +501,23 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 			pagetables.MapOpts{AccessType: hostarch.ReadWrite},
 			physical)
 	}
+}
+
+// getMaxVCPU get max vCPU number
+func (m *machine) getMaxVCPU() {
+	maxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	if errno != 0 {
+		m.maxVCPUs = _KVM_NR_VCPUS
+	} else {
+		m.maxVCPUs = int(maxVCPUs)
+	}
+}
+
+// getNewVCPU create a new vCPU (maybe)
+func (m *machine) getNewVCPU() *vCPU {
+	if int(m.nextID) < m.maxVCPUs {
+		c := m.newVCPU()
+		return c
+	}
+	return nil
 }

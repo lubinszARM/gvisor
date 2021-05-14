@@ -163,10 +163,12 @@ func (e *endpoint) handleControl(errInfo stack.TransportError, pkt *stack.Packet
 		return
 	}
 
-	// Skip the ip header, then deliver the error.
-	pkt.Data().TrimFront(hlen)
+	// Keep needed information before trimming header.
 	p := hdr.TransportProtocol()
-	e.dispatcher.DeliverTransportError(srcAddr, hdr.DestinationAddress(), ProtocolNumber, p, errInfo, pkt)
+	dstAddr := hdr.DestinationAddress()
+	// Skip the ip header, then deliver the error.
+	pkt.Data().DeleteFront(hlen)
+	e.dispatcher.DeliverTransportError(srcAddr, dstAddr, ProtocolNumber, p, errInfo, pkt)
 }
 
 func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
@@ -336,14 +338,16 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 	case header.ICMPv4DstUnreachable:
 		received.dstUnreachable.Increment()
 
-		pkt.Data().TrimFront(header.ICMPv4MinimumSize)
-		switch h.Code() {
+		mtu := h.MTU()
+		code := h.Code()
+		pkt.Data().DeleteFront(header.ICMPv4MinimumSize)
+		switch code {
 		case header.ICMPv4HostUnreachable:
 			e.handleControl(&icmpv4DestinationHostUnreachableSockError{}, pkt)
 		case header.ICMPv4PortUnreachable:
 			e.handleControl(&icmpv4DestinationPortUnreachableSockError{}, pkt)
 		case header.ICMPv4FragmentationNeeded:
-			networkMTU, err := calculateNetworkMTU(uint32(h.MTU()), header.IPv4MinimumSize)
+			networkMTU, err := calculateNetworkMTU(uint32(mtu), header.IPv4MinimumSize)
 			if err != nil {
 				networkMTU = 0
 			}
@@ -383,6 +387,8 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 // icmpReason is a marker interface for IPv4 specific ICMP errors.
 type icmpReason interface {
 	isICMPReason()
+	// isForwarding indicates whether or not the error arose while attempting to
+	// forward a packet.
 	isForwarding() bool
 }
 
@@ -440,6 +446,39 @@ type icmpReasonParamProblem struct {
 func (*icmpReasonParamProblem) isICMPReason() {}
 func (r *icmpReasonParamProblem) isForwarding() bool {
 	return r.forwarding
+}
+
+// icmpReasonNetworkUnreachable is an error in which the network specified in
+// the internet destination field of the datagram is unreachable.
+type icmpReasonNetworkUnreachable struct{}
+
+func (*icmpReasonNetworkUnreachable) isICMPReason() {}
+func (*icmpReasonNetworkUnreachable) isForwarding() bool {
+	// If we hit a Net Unreachable error, then we know we are operating as
+	// a router. As per RFC 792 page 5, Destination Unreachable Message,
+	//
+	//  If, according to the information in the gateway's routing tables,
+	//  the network specified in the internet destination field of a
+	//  datagram is unreachable, e.g., the distance to the network is
+	//  infinity, the gateway may send a destination unreachable message to
+	//  the internet source host of the datagram.
+	return true
+}
+
+// icmpReasonFragmentationNeeded is an error where a packet requires
+// fragmentation while also having the Don't Fragment flag set, as per RFC 792
+// page 3, Destination Unreachable Message.
+type icmpReasonFragmentationNeeded struct{}
+
+func (*icmpReasonFragmentationNeeded) isICMPReason() {}
+func (*icmpReasonFragmentationNeeded) isForwarding() bool {
+	// If we hit a Don't Fragment error, then we know we are operating as a router.
+	// As per RFC 792 page 4, Destination Unreachable Message,
+	//
+	//   Another case is when a datagram must be fragmented to be forwarded by a
+	//   gateway yet the Don't Fragment flag is on. In this case the gateway must
+	//   discard the datagram and may return a destination unreachable message.
+	return true
 }
 
 // returnError takes an error descriptor and generates the appropriate ICMP
@@ -610,6 +649,14 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 		icmpHdr.SetType(header.ICMPv4DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv4ProtoUnreachable)
 		counter = sent.dstUnreachable
+	case *icmpReasonNetworkUnreachable:
+		icmpHdr.SetType(header.ICMPv4DstUnreachable)
+		icmpHdr.SetCode(header.ICMPv4NetUnreachable)
+		counter = sent.dstUnreachable
+	case *icmpReasonFragmentationNeeded:
+		icmpHdr.SetType(header.ICMPv4DstUnreachable)
+		icmpHdr.SetCode(header.ICMPv4FragmentationNeeded)
+		counter = sent.dstUnreachable
 	case *icmpReasonTTLExceeded:
 		icmpHdr.SetType(header.ICMPv4TimeExceeded)
 		icmpHdr.SetCode(header.ICMPv4TTLExceeded)
@@ -629,7 +676,6 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, icmpPkt.Data().AsRange().Checksum()))
 
 	if err := route.WritePacket(
-		nil, /* gso */
 		stack.NetworkHeaderParams{
 			Protocol: header.ICMPv4ProtocolNumber,
 			TTL:      route.DefaultTTL(),

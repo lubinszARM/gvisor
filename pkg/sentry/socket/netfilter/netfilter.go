@@ -22,7 +22,6 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -121,7 +120,7 @@ func GetEntries4(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		nflog("couldn't read entries: %v", err)
 		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
 	}
-	if binary.Size(entries) > uintptr(outLen) {
+	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
 		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
 	}
@@ -146,7 +145,7 @@ func GetEntries6(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		nflog("couldn't read entries: %v", err)
 		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
 	}
-	if binary.Size(entries) > uintptr(outLen) {
+	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
 		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
 	}
@@ -179,7 +178,7 @@ func SetEntries(stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 	var replace linux.IPTReplace
 	replaceBuf := optVal[:linux.SizeOfIPTReplace]
 	optVal = optVal[linux.SizeOfIPTReplace:]
-	binary.Unmarshal(replaceBuf, hostarch.ByteOrder, &replace)
+	replace.UnmarshalBytes(replaceBuf)
 
 	// TODO(gvisor.dev/issue/170): Support other tables.
 	var table stack.Table
@@ -274,10 +273,10 @@ func SetEntries(stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 	}
 
 	// TODO(gvisor.dev/issue/170): Support other chains.
-	// Since we only support modifying the INPUT, PREROUTING and OUTPUT chain right now,
-	// make sure all other chains point to ACCEPT rules.
+	// Since we don't support FORWARD, yet, make sure all other chains point to
+	// ACCEPT rules.
 	for hook, ruleIdx := range table.BuiltinChains {
-		if hook := stack.Hook(hook); hook == stack.Forward || hook == stack.Postrouting {
+		if hook := stack.Hook(hook); hook == stack.Forward {
 			if ruleIdx == stack.HookUnset {
 				continue
 			}
@@ -309,8 +308,8 @@ func parseMatchers(filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher,
 			return nil, fmt.Errorf("optVal has insufficient size for entry match: %d", len(optVal))
 		}
 		var match linux.XTEntryMatch
-		buf := optVal[:linux.SizeOfXTEntryMatch]
-		binary.Unmarshal(buf, hostarch.ByteOrder, &match)
+		buf := optVal[:match.SizeBytes()]
+		match.UnmarshalUnsafe(buf)
 		nflog("set entries: parsed entry match %q: %+v", match.Name.String(), match)
 
 		// Check some invariants.

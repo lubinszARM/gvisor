@@ -26,6 +26,7 @@ package netstack
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -35,7 +36,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
@@ -199,6 +199,15 @@ var Metrics = tcpip.Stats{
 		OptionRecordRouteReceived:           mustCreateMetric("/netstack/ip/options/record_route_received", "Number of record route options found in received IP packets."),
 		OptionRouterAlertReceived:           mustCreateMetric("/netstack/ip/options/router_alert_received", "Number of router alert options found in received IP packets."),
 		OptionUnknownReceived:               mustCreateMetric("/netstack/ip/options/unknown_received", "Number of unknown options found in received IP packets."),
+		Forwarding: tcpip.IPForwardingStats{
+			Unrouteable:            mustCreateMetric("/netstack/ip/forwarding/unrouteable", "Number of IP packets received which couldn't be routed and thus were not forwarded."),
+			ExhaustedTTL:           mustCreateMetric("/netstack/ip/forwarding/exhausted_ttl", "Number of IP packets received which could not be forwarded due to an exhausted TTL."),
+			LinkLocalSource:        mustCreateMetric("/netstack/ip/forwarding/link_local_source_address", "Number of IP packets received which could not be forwarded due to a link-local source address."),
+			LinkLocalDestination:   mustCreateMetric("/netstack/ip/forwarding/link_local_destination_address", "Number of IP packets received which could not be forwarded due to a link-local destination address."),
+			ExtensionHeaderProblem: mustCreateMetric("/netstack/ip/forwarding/extension_header_problem", "Number of IP packets received which could not be forwarded due to a problem processing their IPv6 extension headers."),
+			PacketTooBig:           mustCreateMetric("/netstack/ip/forwarding/packet_too_big", "Number of IP packets received which could not fit within the outgoing MTU."),
+			Errors:                 mustCreateMetric("/netstack/ip/forwarding/errors", "Number of IP packets which couldn't be forwarded."),
+		},
 	},
 	ARP: tcpip.ARPStats{
 		PacketsReceived:                                 mustCreateMetric("/netstack/arp/packets_received", "Number of ARP packets received from the link layer."),
@@ -242,6 +251,7 @@ var Metrics = tcpip.Stats{
 		FastRetransmit:                     mustCreateMetric("/netstack/tcp/fast_retransmit", "Number of TCP segments which were fast retransmitted."),
 		Timeouts:                           mustCreateMetric("/netstack/tcp/timeouts", "Number of times RTO expired."),
 		ChecksumErrors:                     mustCreateMetric("/netstack/tcp/checksum_errors", "Number of segments dropped due to bad checksums."),
+		FailedPortReservations:             mustCreateMetric("/netstack/tcp/failed_port_reservations", "Number of time TCP failed to reserve a port."),
 	},
 	UDP: tcpip.UDPStats{
 		PacketsReceived:          mustCreateMetric("/netstack/udp/packets_received", "Number of UDP datagrams received via HandlePacket."),
@@ -374,9 +384,9 @@ func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue 
 	}), nil
 }
 
-var sockAddrInetSize = int(binary.Size(linux.SockAddrInet{}))
-var sockAddrInet6Size = int(binary.Size(linux.SockAddrInet6{}))
-var sockAddrLinkSize = int(binary.Size(linux.SockAddrLink{}))
+var sockAddrInetSize = (*linux.SockAddrInet)(nil).SizeBytes()
+var sockAddrInet6Size = (*linux.SockAddrInet6)(nil).SizeBytes()
+var sockAddrLinkSize = (*linux.SockAddrLink)(nil).SizeBytes()
 
 // bytesToIPAddress converts an IPv4 or IPv6 address from the user to the
 // netstack representation taking any addresses into account.
@@ -612,7 +622,7 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 		if len(sockaddr) < sockAddrLinkSize {
 			return syserr.ErrInvalidArgument
 		}
-		binary.Unmarshal(sockaddr[:sockAddrLinkSize], hostarch.ByteOrder, &a)
+		a.UnmarshalBytes(sockaddr[:sockAddrLinkSize])
 
 		if a.Protocol != uint16(s.protocol) {
 			return syserr.ErrInvalidArgument
@@ -842,7 +852,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return &optP, nil
 		}
 
-		optP := primitive.Int32(syserr.TranslateNetstackError(err).ToLinux().Number())
+		optP := primitive.Int32(syserr.TranslateNetstackError(err).ToLinux())
 		return &optP, nil
 
 	case linux.SO_PEERCRED:
@@ -885,10 +895,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		size, err := ep.GetSockOptInt(tcpip.ReceiveBufferSizeOption)
-		if err != nil {
-			return nil, syserr.TranslateNetstackError(err)
-		}
+		size := ep.SocketOptions().GetReceiveBufferSize()
 
 		if size > math.MaxInt32 {
 			size = math.MaxInt32
@@ -1314,7 +1321,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		return &v, nil
 
 	case linux.IP6T_ORIGINAL_DST:
-		if outLen < int(binary.Size(linux.SockAddrInet6{})) {
+		if outLen < sockAddrInet6Size {
 			return nil, syserr.ErrInvalidArgument
 		}
 
@@ -1511,7 +1518,7 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		return &v, nil
 
 	case linux.SO_ORIGINAL_DST:
-		if outLen < int(binary.Size(linux.SockAddrInet{})) {
+		if outLen < sockAddrInetSize {
 			return nil, syserr.ErrInvalidArgument
 		}
 
@@ -1661,7 +1668,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := hostarch.ByteOrder.Uint32(optVal)
-		ep.SocketOptions().SetSendBufferSize(int64(v), true)
+		ep.SocketOptions().SetSendBufferSize(int64(v), true /* notify */)
 		return nil
 
 	case linux.SO_RCVBUF:
@@ -1670,7 +1677,8 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		v := hostarch.ByteOrder.Uint32(optVal)
-		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.ReceiveBufferSizeOption, int(v)))
+		ep.SocketOptions().SetReceiveBufferSize(int64(v), true /* notify */)
+		return nil
 
 	case linux.SO_REUSEADDR:
 		if len(optVal) < sizeOfInt32 {
@@ -1743,7 +1751,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		var v linux.Timeval
-		binary.Unmarshal(optVal[:linux.SizeOfTimeval], hostarch.ByteOrder, &v)
+		v.UnmarshalBytes(optVal[:linux.SizeOfTimeval])
 		if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
 			return syserr.ErrDomain
 		}
@@ -1756,7 +1764,7 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		var v linux.Timeval
-		binary.Unmarshal(optVal[:linux.SizeOfTimeval], hostarch.ByteOrder, &v)
+		v.UnmarshalBytes(optVal[:linux.SizeOfTimeval])
 		if v.Usec < 0 || v.Usec >= int64(time.Second/time.Microsecond) {
 			return syserr.ErrDomain
 		}
@@ -1792,7 +1800,11 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 
 		var v linux.Linger
-		binary.Unmarshal(optVal[:linux.SizeOfLinger], hostarch.ByteOrder, &v)
+		v.UnmarshalBytes(optVal[:linux.SizeOfLinger])
+
+		if v != (linux.Linger{}) {
+			socket.SetSockOptEmitUnimplementedEvent(t, name)
+		}
 
 		ep.SocketOptions().SetLinger(tcpip.LingerOption{
 			Enabled: v.OnOff != 0,
@@ -2091,9 +2103,9 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 }
 
 var (
-	inetMulticastRequestSize        = int(binary.Size(linux.InetMulticastRequest{}))
-	inetMulticastRequestWithNICSize = int(binary.Size(linux.InetMulticastRequestWithNIC{}))
-	inet6MulticastRequestSize       = int(binary.Size(linux.Inet6MulticastRequest{}))
+	inetMulticastRequestSize        = (*linux.InetMulticastRequest)(nil).SizeBytes()
+	inetMulticastRequestWithNICSize = (*linux.InetMulticastRequestWithNIC)(nil).SizeBytes()
+	inet6MulticastRequestSize       = (*linux.Inet6MulticastRequest)(nil).SizeBytes()
 )
 
 // copyInMulticastRequest copies in a variable-size multicast request. The
@@ -2118,12 +2130,12 @@ func copyInMulticastRequest(optVal []byte, allowAddr bool) (linux.InetMulticastR
 
 	if len(optVal) >= inetMulticastRequestWithNICSize {
 		var req linux.InetMulticastRequestWithNIC
-		binary.Unmarshal(optVal[:inetMulticastRequestWithNICSize], hostarch.ByteOrder, &req)
+		req.UnmarshalUnsafe(optVal[:inetMulticastRequestWithNICSize])
 		return req, nil
 	}
 
 	var req linux.InetMulticastRequestWithNIC
-	binary.Unmarshal(optVal[:inetMulticastRequestSize], hostarch.ByteOrder, &req.InetMulticastRequest)
+	req.InetMulticastRequest.UnmarshalUnsafe(optVal[:inetMulticastRequestSize])
 	return req, nil
 }
 
@@ -2133,7 +2145,7 @@ func copyInMulticastV6Request(optVal []byte) (linux.Inet6MulticastRequest, *syse
 	}
 
 	var req linux.Inet6MulticastRequest
-	binary.Unmarshal(optVal[:inet6MulticastRequestSize], hostarch.ByteOrder, &req)
+	req.UnmarshalUnsafe(optVal[:inet6MulticastRequestSize])
 	return req, nil
 }
 
@@ -3102,8 +3114,8 @@ func interfaceIoctl(ctx context.Context, io usermem.IO, arg int, ifr *linux.IFRe
 				continue
 			}
 			// Populate ifr.ifr_netmask (type sockaddr).
-			hostarch.ByteOrder.PutUint16(ifr.Data[0:2], uint16(linux.AF_INET))
-			hostarch.ByteOrder.PutUint16(ifr.Data[2:4], 0)
+			hostarch.ByteOrder.PutUint16(ifr.Data[0:], uint16(linux.AF_INET))
+			hostarch.ByteOrder.PutUint16(ifr.Data[2:], 0)
 			var mask uint32 = 0xffffffff << (32 - addr.PrefixLen)
 			// Netmask is expected to be returned as a big endian
 			// value.

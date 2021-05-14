@@ -55,6 +55,9 @@ type NetworkPacketInfo struct {
 	// LocalAddressBroadcast is true if the packet's local address is a broadcast
 	// address.
 	LocalAddressBroadcast bool
+
+	// IsForwardedPacket is true if the packet is being forwarded.
+	IsForwardedPacket bool
 }
 
 // TransportErrorKind enumerates error types that are handled by the transport
@@ -537,14 +540,14 @@ type NetworkInterface interface {
 	CheckLocalAddress(tcpip.NetworkProtocolNumber, tcpip.Address) bool
 
 	// WritePacketToRemote writes the packet to the given remote link address.
-	WritePacketToRemote(tcpip.LinkAddress, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
+	WritePacketToRemote(tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
 
 	// WritePacket writes a packet with the given protocol through the given
 	// route.
 	//
 	// WritePacket takes ownership of the packet buffer. The packet buffer's
 	// network and transport header must be set.
-	WritePacket(*Route, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
+	WritePacket(*Route, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
 
 	// WritePackets writes packets with the given protocol through the given
 	// route. Must not be called with an empty list of packet buffers.
@@ -554,7 +557,7 @@ type NetworkInterface interface {
 	// Right now, WritePackets is used only when the software segmentation
 	// offload is enabled. If it will be used for something else, syscall filters
 	// may need to be updated.
-	WritePackets(*Route, *GSO, PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error)
+	WritePackets(*Route, PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error)
 
 	// HandleNeighborProbe processes an incoming neighbor probe (e.g. ARP
 	// request or NDP Neighbor Solicitation).
@@ -610,12 +613,12 @@ type NetworkEndpoint interface {
 	// WritePacket writes a packet to the given destination address and
 	// protocol. It takes ownership of pkt. pkt.TransportHeader must have
 	// already been set.
-	WritePacket(r *Route, gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error
+	WritePacket(r *Route, params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error
 
 	// WritePackets writes packets to the given destination address and
 	// protocol. pkts must not be zero length. It takes ownership of pkts and
 	// underlying packets.
-	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, params NetworkHeaderParams) (int, tcpip.Error)
+	WritePackets(r *Route, pkts PacketBufferList, params NetworkHeaderParams) (int, tcpip.Error)
 
 	// WriteHeaderIncludedPacket writes a packet that includes a network
 	// header to the given destination address. It takes ownership of pkt.
@@ -756,11 +759,6 @@ const (
 	CapabilitySaveRestore
 	CapabilityDisconnectOk
 	CapabilityLoopback
-	CapabilityHardwareGSO
-
-	// CapabilitySoftwareGSO indicates the link endpoint supports of sending
-	// multiple packets using a single call (LinkEndpoint.WritePackets).
-	CapabilitySoftwareGSO
 )
 
 // NetworkLinkEndpoint is a data-link layer that supports sending network
@@ -832,7 +830,7 @@ type LinkEndpoint interface {
 	// To participate in transparent bridging, a LinkEndpoint implementation
 	// should call eth.Encode with header.EthernetFields.SrcAddr set to
 	// r.LocalLinkAddress if it is provided.
-	WritePacket(RouteInfo, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
+	WritePacket(RouteInfo, tcpip.NetworkProtocolNumber, *PacketBuffer) tcpip.Error
 
 	// WritePackets writes packets with the given protocol and route. Must not be
 	// called with an empty list of packet buffers.
@@ -842,7 +840,7 @@ type LinkEndpoint interface {
 	// Right now, WritePackets is used only when the software segmentation
 	// offload is enabled. If it will be used for something else, syscall filters
 	// may need to be updated.
-	WritePackets(RouteInfo, *GSO, PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error)
+	WritePackets(RouteInfo, PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error)
 }
 
 // InjectableLinkEndpoint is a LinkEndpoint where inbound packets are
@@ -1047,10 +1045,29 @@ type GSO struct {
 	MaxSize uint32
 }
 
+// SupportedGSO returns the type of segmentation offloading supported.
+type SupportedGSO int
+
+const (
+	// GSONotSupported indicates that segmentation offloading is not supported.
+	GSONotSupported SupportedGSO = iota
+
+	// HWGSOSupported indicates that segmentation offloading may be performed by
+	// the hardware.
+	HWGSOSupported
+
+	// SWGSOSupported indicates that segmentation offloading may be performed in
+	// software.
+	SWGSOSupported
+)
+
 // GSOEndpoint provides access to GSO properties.
 type GSOEndpoint interface {
 	// GSOMaxSize returns the maximum GSO packet size.
 	GSOMaxSize() uint32
+
+	// SupportedGSO returns the supported segmentation offloading.
+	SupportedGSO() SupportedGSO
 }
 
 // SoftwareGSOMaxSize is a maximum allowed size of a software GSO segment.

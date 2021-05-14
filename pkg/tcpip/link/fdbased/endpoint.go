@@ -45,7 +45,6 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/iovec"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -98,6 +97,9 @@ func (p PacketDispatchMode) String() string {
 	}
 }
 
+var _ stack.LinkEndpoint = (*endpoint)(nil)
+var _ stack.GSOEndpoint = (*endpoint)(nil)
+
 type endpoint struct {
 	// fds is the set of file descriptors each identifying one inbound/outbound
 	// channel. The endpoint will dispatch from all inbound channels as well as
@@ -134,6 +136,9 @@ type endpoint struct {
 
 	// wg keeps track of running goroutines.
 	wg sync.WaitGroup
+
+	// gsoKind is the supported kind of GSO.
+	gsoKind stack.SupportedGSO
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -255,9 +260,9 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		if isSocket {
 			if opts.GSOMaxSize != 0 {
 				if opts.SoftwareGSOEnabled {
-					e.caps |= stack.CapabilitySoftwareGSO
+					e.gsoKind = stack.SWGSOSupported
 				} else {
-					e.caps |= stack.CapabilityHardwareGSO
+					e.gsoKind = stack.HWGSOSupported
 				}
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
@@ -403,6 +408,35 @@ type virtioNetHdr struct {
 	csumOffset uint16
 }
 
+// marshal serializes h to a newly-allocated byte slice, in little-endian byte
+// order.
+//
+// Note: Virtio v1.0 onwards specifies little-endian as the byte ordering used
+// for general serialization. This makes it difficult to use go-marshal for
+// virtio types, as go-marshal implicitly uses the native byte ordering.
+func (h *virtioNetHdr) marshal() []byte {
+	buf := [virtioNetHdrSize]byte{
+		0: byte(h.flags),
+		1: byte(h.gsoType),
+
+		// Manually lay out the fields in little-endian byte order. Little endian =>
+		// least significant bit goes to the lower address.
+
+		2: byte(h.hdrLen),
+		3: byte(h.hdrLen >> 8),
+
+		4: byte(h.gsoSize),
+		5: byte(h.gsoSize >> 8),
+
+		6: byte(h.csumStart),
+		7: byte(h.csumStart >> 8),
+
+		8: byte(h.csumOffset),
+		9: byte(h.csumOffset >> 8),
+	}
+	return buf[:]
+}
+
 // These constants are declared in linux/virtio_net.h.
 const (
 	_VIRTIO_NET_HDR_F_NEEDS_CSUM = 1
@@ -433,7 +467,7 @@ func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.Net
 
 // WritePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
-func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	if e.hdrSize > 0 {
 		e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
 	}
@@ -441,29 +475,29 @@ func (e *endpoint) WritePacket(r stack.RouteInfo, gso *stack.GSO, protocol tcpip
 	var builder iovec.Builder
 
 	fd := e.fds[pkt.Hash%uint32(len(e.fds))]
-	if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
+	if e.gsoKind == stack.HWGSOSupported {
 		vnetHdr := virtioNetHdr{}
-		if gso != nil {
+		if pkt.GSOOptions.Type != stack.GSONone {
 			vnetHdr.hdrLen = uint16(pkt.HeaderSize())
-			if gso.NeedsCsum {
+			if pkt.GSOOptions.NeedsCsum {
 				vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
-				vnetHdr.csumStart = header.EthernetMinimumSize + gso.L3HdrLen
-				vnetHdr.csumOffset = gso.CsumOffset
+				vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
+				vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
 			}
-			if gso.Type != stack.GSONone && uint16(pkt.Data().Size()) > gso.MSS {
-				switch gso.Type {
+			if pkt.GSOOptions.Type != stack.GSONone && uint16(pkt.Data().Size()) > pkt.GSOOptions.MSS {
+				switch pkt.GSOOptions.Type {
 				case stack.GSOTCPv4:
 					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
 				case stack.GSOTCPv6:
 					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV6
 				default:
-					panic(fmt.Sprintf("Unknown gso type: %v", gso.Type))
+					panic(fmt.Sprintf("Unknown gso type: %v", pkt.GSOOptions.Type))
 				}
-				vnetHdr.gsoSize = gso.MSS
+				vnetHdr.gsoSize = pkt.GSOOptions.MSS
 			}
 		}
 
-		vnetHdrBuf := binary.Marshal(make([]byte, 0, virtioNetHdrSize), binary.LittleEndian, vnetHdr)
+		vnetHdrBuf := vnetHdr.marshal()
 		builder.Add(vnetHdrBuf)
 	}
 
@@ -482,9 +516,9 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, tcp
 		}
 
 		var vnetHdrBuf []byte
-		if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
+		if e.gsoKind == stack.HWGSOSupported {
 			vnetHdr := virtioNetHdr{}
-			if pkt.GSOOptions != nil {
+			if pkt.GSOOptions.Type != stack.GSONone {
 				vnetHdr.hdrLen = uint16(pkt.HeaderSize())
 				if pkt.GSOOptions.NeedsCsum {
 					vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
@@ -503,7 +537,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, tcp
 					vnetHdr.gsoSize = pkt.GSOOptions.MSS
 				}
 			}
-			vnetHdrBuf = binary.Marshal(make([]byte, 0, virtioNetHdrSize), binary.LittleEndian, vnetHdr)
+			vnetHdrBuf = vnetHdr.marshal()
 		}
 
 		var builder iovec.Builder
@@ -540,7 +574,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, tcp
 //  - pkt.EgressRoute
 //  - pkt.GSOOptions
 //  - pkt.NetworkProtocolNumber
-func (e *endpoint) WritePackets(_ stack.RouteInfo, _ *stack.GSO, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *endpoint) WritePackets(_ stack.RouteInfo, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
 	// Preallocate to avoid repeated reallocation as we append to batch.
 	// batchSz is 47 because when SWGSO is in use then a single 65KB TCP
 	// segment can get split into 46 segments of 1420 bytes and a single 216
@@ -602,9 +636,14 @@ func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) tcpip.Error {
 	}
 }
 
-// GSOMaxSize returns the maximum GSO packet size.
+// GSOMaxSize implements stack.GSOEndpoint.
 func (e *endpoint) GSOMaxSize() uint32 {
 	return e.gsoMaxSize
+}
+
+// SupportsHWGSO implements stack.GSOEndpoint.
+func (e *endpoint) SupportedGSO() stack.SupportedGSO {
+	return e.gsoKind
 }
 
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.

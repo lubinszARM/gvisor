@@ -1,4 +1,4 @@
-// Copyright 2020 The gVisor Authors.
+// Copyright 2021 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package tcp
+package cmd
 
 import (
-	"time"
+	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/mitigate"
 )
 
-// saveXmitTime is invoked by stateify.
-func (rc *rackControl) saveXmitTime() unixTime {
-	return unixTime{rc.xmitTime.Unix(), rc.xmitTime.UnixNano()}
+// usage returns any extra bits of the usage string.
+func (m *Mitigate) usage() string {
+	return ""
 }
 
-// loadXmitTime is invoked by stateify.
-func (rc *rackControl) loadXmitTime(unix unixTime) {
-	rc.xmitTime = time.Unix(unix.second, unix.nano)
+// setFlags sets extra flags for the command Mitigate.
+func (m *Mitigate) setFlags(f *flag.FlagSet) {}
+
+// postMitigate handles any postMitigate actions.
+func (m *Mitigate) postMitigate(_ mitigate.CPUSet) error {
+	return nil
 }

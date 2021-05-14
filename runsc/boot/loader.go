@@ -29,10 +29,12 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/refsvfs2"
@@ -216,6 +218,8 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("setting up memory usage: %v", err)
 	}
 
+	metric.CreateSentryMetrics()
+
 	// Is this a VFSv2 kernel?
 	if args.Conf.VFS2 {
 		kernel.VFS2Enabled = true
@@ -224,6 +228,33 @@ func New(args Args) (*Loader, error) {
 		}
 
 		vfs2.Override()
+	}
+
+	// Make host FDs stable between invocations. Host FDs must map to the exact
+	// same number when the sandbox is restored. Otherwise the wrong FD will be
+	// used.
+	info := containerInfo{}
+	newfd := startingStdioFD
+
+	for _, stdioFD := range args.StdioFDs {
+		// Check that newfd is unused to avoid clobbering over it.
+		if _, err := unix.FcntlInt(uintptr(newfd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			if err != nil {
+				return nil, fmt.Errorf("error checking for FD (%d) conflict: %w", newfd, err)
+			}
+			return nil, fmt.Errorf("unable to remap stdios, FD %d is already in use", newfd)
+		}
+
+		err := unix.Dup3(stdioFD, newfd, unix.O_CLOEXEC)
+		if err != nil {
+			return nil, fmt.Errorf("dup3 of stdios failed: %w", err)
+		}
+		info.stdioFDs = append(info.stdioFDs, fd.New(newfd))
+		_ = unix.Close(stdioFD)
+		newfd++
+	}
+	for _, goferFD := range args.GoferFDs {
+		info.goferFDs = append(info.goferFDs, fd.New(goferFD))
 	}
 
 	// Create kernel and platform.
@@ -345,6 +376,7 @@ func New(args Args) (*Loader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating init process for root container: %v", err)
 	}
+	info.procArgs = procArgs
 
 	if err := initCompatLogs(args.UserLogFD); err != nil {
 		return nil, fmt.Errorf("initializing compat logs: %v", err)
@@ -354,6 +386,9 @@ func New(args Args) (*Loader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating pod mount hints: %v", err)
 	}
+
+	info.conf = args.Conf
+	info.spec = args.Spec
 
 	if kernel.VFS2Enabled {
 		// Set up host mount that will be used for imported fds.
@@ -367,37 +402,6 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("failed to create hostfs mount: %v", err)
 		}
 		k.SetHostMount(hostMount)
-	}
-
-	info := containerInfo{
-		conf:     args.Conf,
-		spec:     args.Spec,
-		procArgs: procArgs,
-	}
-
-	// Make host FDs stable between invocations. Host FDs must map to the exact
-	// same number when the sandbox is restored. Otherwise the wrong FD will be
-	// used.
-	newfd := startingStdioFD
-	for _, stdioFD := range args.StdioFDs {
-		// Check that newfd is unused to avoid clobbering over it.
-		if _, err := unix.FcntlInt(uintptr(newfd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-			if err != nil {
-				return nil, fmt.Errorf("error checking for FD (%d) conflict: %w", newfd, err)
-			}
-			return nil, fmt.Errorf("unable to remap stdios, FD %d is already in use", newfd)
-		}
-
-		err := unix.Dup3(stdioFD, newfd, unix.O_CLOEXEC)
-		if err != nil {
-			return nil, fmt.Errorf("dup3 of stdios failed: %w", err)
-		}
-		info.stdioFDs = append(info.stdioFDs, fd.New(newfd))
-		_ = unix.Close(stdioFD)
-		newfd++
-	}
-	for _, goferFD := range args.GoferFDs {
-		info.goferFDs = append(info.goferFDs, fd.New(goferFD))
 	}
 
 	eid := execID{cid: args.ID}
@@ -490,10 +494,6 @@ func (l *Loader) Destroy() {
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
 	l.k.Release()
-
-	// All sentry-created resources should have been released at this point;
-	// check for reference leaks.
-	refsvfs2.DoLeakCheck()
 
 	// In the success case, stdioFDs and goferFDs will only contain
 	// released/closed FDs that ownership has been passed over to host FDs and
@@ -1000,6 +1000,15 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	// consider the container exited.
 	ws := l.wait(tg)
 	*waitStatus = ws
+
+	// Check for leaks and write coverage report after the root container has
+	// exited. This guarantees that the report is written in cases where the
+	// sandbox is killed by a signal after the ContainerWait request is completed.
+	if l.root.procArgs.ContainerID == cid {
+		// All sentry-created resources should have been released at this point.
+		refsvfs2.DoLeakCheck()
+		coverage.Report()
+	}
 	return nil
 }
 

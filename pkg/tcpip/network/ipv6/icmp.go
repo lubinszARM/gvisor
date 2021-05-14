@@ -181,10 +181,13 @@ func (e *endpoint) handleControl(transErr stack.TransportError, pkt *stack.Packe
 		return
 	}
 
+	// Keep needed information before trimming header.
+	p := hdr.TransportProtocol()
+	dstAddr := hdr.DestinationAddress()
+
 	// Skip the IP header, then handle the fragmentation header if there
 	// is one.
-	pkt.Data().TrimFront(header.IPv6MinimumSize)
-	p := hdr.TransportProtocol()
+	pkt.Data().DeleteFront(header.IPv6MinimumSize)
 	if p == header.IPv6FragmentHeader {
 		f, ok := pkt.Data().PullUp(header.IPv6FragmentHeaderSize)
 		if !ok {
@@ -196,14 +199,14 @@ func (e *endpoint) handleControl(transErr stack.TransportError, pkt *stack.Packe
 			// because they don't have the transport headers.
 			return
 		}
+		p = fragHdr.TransportProtocol()
 
 		// Skip fragmentation header and find out the actual protocol
 		// number.
-		pkt.Data().TrimFront(header.IPv6FragmentHeaderSize)
-		p = fragHdr.TransportProtocol()
+		pkt.Data().DeleteFront(header.IPv6FragmentHeaderSize)
 	}
 
-	e.dispatcher.DeliverTransportError(srcAddr, hdr.DestinationAddress(), ProtocolNumber, p, transErr, pkt)
+	e.dispatcher.DeliverTransportError(srcAddr, dstAddr, ProtocolNumber, p, transErr, pkt)
 }
 
 // getLinkAddrOption searches NDP options for a given link address option using
@@ -273,7 +276,7 @@ func isMLDValid(pkt *stack.PacketBuffer, iph header.IPv6, routerAlert *header.IP
 	if iph.HopLimit() != header.MLDHopLimit {
 		return false
 	}
-	if !header.IsV6LinkLocalAddress(iph.SourceAddress()) {
+	if !header.IsV6LinkLocalUnicastAddress(iph.SourceAddress()) {
 		return false
 	}
 	return true
@@ -327,11 +330,11 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			received.invalid.Increment()
 			return
 		}
-		pkt.Data().TrimFront(header.ICMPv6PacketTooBigMinimumSize)
 		networkMTU, err := calculateNetworkMTU(header.ICMPv6(hdr).MTU(), header.IPv6MinimumSize)
 		if err != nil {
 			networkMTU = 0
 		}
+		pkt.Data().DeleteFront(header.ICMPv6PacketTooBigMinimumSize)
 		e.handleControl(&icmpv6PacketTooBigSockError{mtu: networkMTU}, pkt)
 
 	case header.ICMPv6DstUnreachable:
@@ -341,8 +344,9 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			received.invalid.Increment()
 			return
 		}
-		pkt.Data().TrimFront(header.ICMPv6DstUnreachableMinimumSize)
-		switch header.ICMPv6(hdr).Code() {
+		code := header.ICMPv6(hdr).Code()
+		pkt.Data().DeleteFront(header.ICMPv6DstUnreachableMinimumSize)
+		switch code {
 		case header.ICMPv6NetworkUnreachable:
 			e.handleControl(&icmpv6DestinationNetworkUnreachableSockError{}, pkt)
 		case header.ICMPv6PortUnreachable:
@@ -564,7 +568,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		//
 		// The IP Hop Limit field has a value of 255, i.e., the packet
 		// could not possibly have been forwarded by a router.
-		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: header.NDPHopLimit, TOS: stack.DefaultTOS}, pkt); err != nil {
+		if err := r.WritePacket(stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: header.NDPHopLimit, TOS: stack.DefaultTOS}, pkt); err != nil {
 			sent.dropped.Increment()
 			return
 		}
@@ -704,7 +708,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 			PayloadCsum: dataRange.Checksum(),
 			PayloadLen:  dataRange.Size(),
 		}))
-		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+		if err := r.WritePacket(stack.NetworkHeaderParams{
 			Protocol: header.ICMPv6ProtocolNumber,
 			TTL:      r.DefaultTTL(),
 			TOS:      stack.DefaultTOS,
@@ -804,7 +808,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		routerAddr := srcAddr
 
 		// Is the IP Source Address a link-local address?
-		if !header.IsV6LinkLocalAddress(routerAddr) {
+		if !header.IsV6LinkLocalUnicastAddress(routerAddr) {
 			// ...No, silently drop the packet.
 			received.invalid.Increment()
 			return
@@ -951,24 +955,25 @@ func (*endpoint) ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bo
 // icmpReason is a marker interface for IPv6 specific ICMP errors.
 type icmpReason interface {
 	isICMPReason()
+	// isForwarding indicates whether or not the error arose while attempting to
+	// forward a packet.
+	isForwarding() bool
+	// respondToMulticast indicates whether this error falls under the exception
+	// outlined by RFC 4443 section 2.4 point e.3 exception 2:
+	//
+	//   (e.3) A packet destined to an IPv6 multicast address. (There are two
+	//   exceptions to this rule: (1) the Packet Too Big Message (Section 3.2) to
+	//   allow Path MTU discovery to work for IPv6 multicast, and (2) the Parameter
+	//   Problem Message, Code 2 (Section 3.4) reporting an unrecognized IPv6
+	//   option (see Section 4.2 of [IPv6]) that has the Option Type highest-
+	//   order two bits set to 10).
+	respondsToMulticast() bool
 }
 
 // icmpReasonParameterProblem is an error during processing of extension headers
 // or the fixed header defined in RFC 4443 section 3.4.
 type icmpReasonParameterProblem struct {
 	code header.ICMPv6Code
-
-	// respondToMulticast indicates that we are sending a packet that falls under
-	// the exception outlined by RFC 4443 section 2.4 point e.3 exception 2:
-	//
-	//       (e.3) A packet destined to an IPv6 multicast address.  (There are
-	//             two exceptions to this rule: (1) the Packet Too Big Message
-	//             (Section 3.2) to allow Path MTU discovery to work for IPv6
-	//             multicast, and (2) the Parameter Problem Message, Code 2
-	//             (Section 3.4) reporting an unrecognized IPv6 option (see
-	//             Section 4.2 of [IPv6]) that has the Option Type highest-
-	//             order two bits set to 10).
-	respondToMulticast bool
 
 	// pointer is defined in the RFC 4443 setion 3.4 which reads:
 	//
@@ -979,9 +984,20 @@ type icmpReasonParameterProblem struct {
 	//                  packet if the field in error is beyond what can fit
 	//                  in the maximum size of an ICMPv6 error message.
 	pointer uint32
+
+	forwarding bool
+
+	respondToMulticast bool
 }
 
 func (*icmpReasonParameterProblem) isICMPReason() {}
+func (p *icmpReasonParameterProblem) isForwarding() bool {
+	return p.forwarding
+}
+
+func (p *icmpReasonParameterProblem) respondsToMulticast() bool {
+	return p.respondToMulticast
+}
 
 // icmpReasonPortUnreachable is an error where the transport protocol has no
 // listener and no alternative means to inform the sender.
@@ -989,11 +1005,75 @@ type icmpReasonPortUnreachable struct{}
 
 func (*icmpReasonPortUnreachable) isICMPReason() {}
 
+func (*icmpReasonPortUnreachable) isForwarding() bool {
+	return false
+}
+
+func (*icmpReasonPortUnreachable) respondsToMulticast() bool {
+	return false
+}
+
+// icmpReasonNetUnreachable is an error where no route can be found to the
+// network of the final destination.
+type icmpReasonNetUnreachable struct{}
+
+func (*icmpReasonNetUnreachable) isICMPReason() {}
+
+func (*icmpReasonNetUnreachable) isForwarding() bool {
+	// If we hit a Network Unreachable error, then we also know we are
+	// operating as a router. As per RFC 4443 section 3.1:
+	//
+	//   If the reason for the failure to deliver is lack of a matching
+	//   entry in the forwarding node's routing table, the Code field is
+	//   set to 0 (Network Unreachable).
+	return true
+}
+
+func (*icmpReasonNetUnreachable) respondsToMulticast() bool {
+	return false
+}
+
+// icmpReasonFragmentationNeeded is an error where a packet is to big to be sent
+// out through the outgoing MTU, as per RFC 4443 page 9, Packet Too Big Message.
+type icmpReasonPacketTooBig struct{}
+
+func (*icmpReasonPacketTooBig) isICMPReason() {}
+
+func (*icmpReasonPacketTooBig) isForwarding() bool {
+	// If we hit a Packet Too Big error, then we know we are operating as a router.
+	// As per RFC 4443 section 3.2:
+	//
+	//   A Packet Too Big MUST be sent by a router in response to a packet that it
+	//   cannot forward because the packet is larger than the MTU of the outgoing
+	//   link.
+	return true
+}
+
+func (*icmpReasonPacketTooBig) respondsToMulticast() bool {
+	return true
+}
+
 // icmpReasonHopLimitExceeded is an error where a packet's hop limit exceeded in
 // transit to its final destination, as per RFC 4443 section 3.3.
 type icmpReasonHopLimitExceeded struct{}
 
 func (*icmpReasonHopLimitExceeded) isICMPReason() {}
+
+func (*icmpReasonHopLimitExceeded) isForwarding() bool {
+	// If we hit a Hop Limit Exceeded error, then we know we are operating
+	// as a router. As per RFC 4443 section 3.3:
+	//
+	//   If a router receives a packet with a Hop Limit of zero, or if a
+	//   router decrements a packet's Hop Limit to zero, it MUST discard
+	//   the packet and originate an ICMPv6 Time Exceeded message with Code
+	//   0 to the source of the packet.  This indicates either a routing
+	//   loop or too small an initial Hop Limit value.
+	return true
+}
+
+func (*icmpReasonHopLimitExceeded) respondsToMulticast() bool {
+	return false
+}
 
 // icmpReasonReassemblyTimeout is an error where insufficient fragments are
 // received to complete reassembly of a packet within a configured time after
@@ -1001,6 +1081,14 @@ func (*icmpReasonHopLimitExceeded) isICMPReason() {}
 type icmpReasonReassemblyTimeout struct{}
 
 func (*icmpReasonReassemblyTimeout) isICMPReason() {}
+
+func (*icmpReasonReassemblyTimeout) isForwarding() bool {
+	return false
+}
+
+func (*icmpReasonReassemblyTimeout) respondsToMulticast() bool {
+	return false
+}
 
 // returnError takes an error descriptor and generates the appropriate ICMP
 // error packet for IPv6 and sends it.
@@ -1030,25 +1118,12 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 	//             Section 4.2 of [IPv6]) that has the Option Type highest-
 	//             order two bits set to 10).
 	//
-	var allowResponseToMulticast bool
-	if reason, ok := reason.(*icmpReasonParameterProblem); ok {
-		allowResponseToMulticast = reason.respondToMulticast
-	}
-
+	allowResponseToMulticast := reason.respondsToMulticast()
 	isOrigDstMulticast := header.IsV6MulticastAddress(origIPHdrDst)
 	if (!allowResponseToMulticast && isOrigDstMulticast) || origIPHdrSrc == header.IPv6Any {
 		return nil
 	}
 
-	// If we hit a Hop Limit Exceeded error, then we know we are operating as a
-	// router. As per RFC 4443 section 3.3:
-	//
-	//   If a router receives a packet with a Hop Limit of zero, or if a
-	//   router decrements a packet's Hop Limit to zero, it MUST discard the
-	//   packet and originate an ICMPv6 Time Exceeded message with Code 0 to
-	//   the source of the packet.  This indicates either a routing loop or
-	//   too small an initial Hop Limit value.
-	//
 	// If we are operating as a router, do not use the packet's destination
 	// address as the response's source address as we should not own the
 	// destination address of a packet we are forwarding.
@@ -1058,7 +1133,7 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 	// packet as "multicast addresses must not be used as source addresses in IPv6
 	// packets", as per RFC 4291 section 2.7.
 	localAddr := origIPHdrDst
-	if _, ok := reason.(*icmpReasonHopLimitExceeded); ok || isOrigDstMulticast {
+	if reason.isForwarding() || isOrigDstMulticast {
 		localAddr = ""
 	}
 	// Even if we were able to receive a packet from some remote, we may not have
@@ -1147,6 +1222,14 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 		icmpHdr.SetType(header.ICMPv6DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv6PortUnreachable)
 		counter = sent.dstUnreachable
+	case *icmpReasonNetUnreachable:
+		icmpHdr.SetType(header.ICMPv6DstUnreachable)
+		icmpHdr.SetCode(header.ICMPv6NetworkUnreachable)
+		counter = sent.dstUnreachable
+	case *icmpReasonPacketTooBig:
+		icmpHdr.SetType(header.ICMPv6PacketTooBig)
+		icmpHdr.SetCode(header.ICMPv6UnusedCode)
+		counter = sent.packetTooBig
 	case *icmpReasonHopLimitExceeded:
 		icmpHdr.SetType(header.ICMPv6TimeExceeded)
 		icmpHdr.SetCode(header.ICMPv6HopLimitExceeded)
@@ -1167,7 +1250,6 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) tcpip
 		PayloadLen:  dataRange.Size(),
 	}))
 	if err := route.WritePacket(
-		nil, /* gso */
 		stack.NetworkHeaderParams{
 			Protocol: header.ICMPv6ProtocolNumber,
 			TTL:      route.DefaultTTL(),

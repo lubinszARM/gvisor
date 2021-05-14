@@ -908,6 +908,7 @@ func (so *SocketOptions) StateFields() []string {
 		"errQueue",
 		"bindToDevice",
 		"sendBufferSize",
+		"receiveBufferSize",
 		"linger",
 	}
 }
@@ -938,7 +939,8 @@ func (so *SocketOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(18, &so.errQueue)
 	stateSinkObject.Save(19, &so.bindToDevice)
 	stateSinkObject.Save(20, &so.sendBufferSize)
-	stateSinkObject.Save(21, &so.linger)
+	stateSinkObject.Save(21, &so.receiveBufferSize)
+	stateSinkObject.Save(22, &so.linger)
 }
 
 func (so *SocketOptions) afterLoad() {}
@@ -966,7 +968,8 @@ func (so *SocketOptions) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(18, &so.errQueue)
 	stateSourceObject.Load(19, &so.bindToDevice)
 	stateSourceObject.Load(20, &so.sendBufferSize)
-	stateSourceObject.Load(21, &so.linger)
+	stateSourceObject.Load(21, &so.receiveBufferSize)
+	stateSourceObject.Load(22, &so.linger)
 }
 
 func (l *LocalSockError) StateTypeName() string {
@@ -1035,6 +1038,30 @@ func (s *SockError) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &s.Dst)
 	stateSourceObject.Load(5, &s.Offender)
 	stateSourceObject.Load(6, &s.NetProto)
+}
+
+func (s *stdClock) StateTypeName() string {
+	return "pkg/tcpip.stdClock"
+}
+
+func (s *stdClock) StateFields() []string {
+	return []string{
+		"maxMonotonic",
+	}
+}
+
+func (s *stdClock) beforeSave() {}
+
+// +checklocksignore
+func (s *stdClock) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.maxMonotonic)
+}
+
+// +checklocksignore
+func (s *stdClock) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.maxMonotonic)
+	stateSourceObject.AfterLoad(s.afterLoad)
 }
 
 func (f *FullAddress) StateTypeName() string {
@@ -1261,6 +1288,7 @@ func init() {
 	state.Register((*SocketOptions)(nil))
 	state.Register((*LocalSockError)(nil))
 	state.Register((*SockError)(nil))
+	state.Register((*stdClock)(nil))
 	state.Register((*FullAddress)(nil))
 	state.Register((*ControlMessages)(nil))
 	state.Register((*LinkPacketInfo)(nil))

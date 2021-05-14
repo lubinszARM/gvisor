@@ -37,9 +37,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -73,7 +73,7 @@ type Clock interface {
 	// nanoseconds since the Unix epoch.
 	NowNanoseconds() int64
 
-	// NowMonotonic returns a monotonic time value.
+	// NowMonotonic returns a monotonic time value at nanosecond resolution.
 	NowMonotonic() int64
 
 	// AfterFunc waits for the duration to elapse and then calls f in its own
@@ -691,10 +691,6 @@ const (
 	// number of unread bytes in the input buffer should be returned.
 	ReceiveQueueSizeOption
 
-	// ReceiveBufferSizeOption is used by SetSockOptInt/GetSockOptInt to
-	// specify the receive buffer size option.
-	ReceiveBufferSizeOption
-
 	// SendQueueSizeOption is used in GetSockOptInt to specify that the
 	// number of unread bytes in the output buffer should be returned.
 	SendQueueSizeOption
@@ -1111,6 +1107,7 @@ const (
 // LingerOption is used by SetSockOpt/GetSockOpt to set/get the
 // duration for which a socket lingers before returning from Close.
 //
+// +marshal
 // +stateify savable
 type LingerOption struct {
 	Enabled bool
@@ -1144,12 +1141,37 @@ type SendBufferSizeOption struct {
 	Max int
 }
 
+// ReceiveBufferSizeOption is used by stack.(Stack*).Option/SetOption to
+// get/set the default, min and max receive buffer sizes.
+type ReceiveBufferSizeOption struct {
+	// Min is the minimum size for send buffer.
+	Min int
+
+	// Default is the default size for send buffer.
+	Default int
+
+	// Max is the maximum size for send buffer.
+	Max int
+}
+
 // GetSendBufferLimits is used to get the send buffer size limits.
 type GetSendBufferLimits func(StackHandler) SendBufferSizeOption
 
 // GetStackSendBufferLimits is used to get default, min and max send buffer size.
 func GetStackSendBufferLimits(so StackHandler) SendBufferSizeOption {
 	var ss SendBufferSizeOption
+	if err := so.Option(&ss); err != nil {
+		panic(fmt.Sprintf("s.Option(%#v) = %s", ss, err))
+	}
+	return ss
+}
+
+// GetReceiveBufferLimits is used to get the send buffer size limits.
+type GetReceiveBufferLimits func(StackHandler) ReceiveBufferSizeOption
+
+// GetStackReceiveBufferLimits is used to get default, min and max send buffer size.
+func GetStackReceiveBufferLimits(so StackHandler) ReceiveBufferSizeOption {
+	var ss ReceiveBufferSizeOption
 	if err := so.Option(&ss); err != nil {
 		panic(fmt.Sprintf("s.Option(%#v) = %s", ss, err))
 	}
@@ -1198,7 +1220,7 @@ type NetworkProtocolNumber uint32
 
 // A StatCounter keeps track of a statistic.
 type StatCounter struct {
-	count uint64
+	count atomicbitops.AlignedAtomicUint64
 }
 
 // Increment adds one to the counter.
@@ -1212,13 +1234,13 @@ func (s *StatCounter) Decrement() {
 }
 
 // Value returns the current value of the counter.
-func (s *StatCounter) Value() uint64 {
-	return atomic.LoadUint64(&s.count)
+func (s *StatCounter) Value(name ...string) uint64 {
+	return s.count.Load()
 }
 
 // IncrementBy increments the counter by v.
 func (s *StatCounter) IncrementBy(v uint64) {
-	atomic.AddUint64(&s.count, v)
+	s.count.Add(v)
 }
 
 func (s *StatCounter) String() string {
@@ -1506,12 +1528,52 @@ type IGMPStats struct {
 	// LINT.ThenChange(network/ipv4/stats.go:multiCounterIGMPStats)
 }
 
+// IPForwardingStats collects stats related to IP forwarding (both v4 and v6).
+type IPForwardingStats struct {
+	// LINT.IfChange(IPForwardingStats)
+
+	// Unrouteable is the number of IP packets received which were dropped
+	// because a route to their destination could not be constructed.
+	Unrouteable *StatCounter
+
+	// ExhaustedTTL is the number of IP packets received which were dropped
+	// because their TTL was exhausted.
+	ExhaustedTTL *StatCounter
+
+	// LinkLocalSource is the number of IP packets which were dropped
+	// because they contained a link-local source address.
+	LinkLocalSource *StatCounter
+
+	// LinkLocalDestination is the number of IP packets which were dropped
+	// because they contained a link-local destination address.
+	LinkLocalDestination *StatCounter
+
+	// PacketTooBig is the number of IP packets which were dropped because they
+	// were too big for the outgoing MTU.
+	PacketTooBig *StatCounter
+
+	// ExtensionHeaderProblem is the number of IP packets which were dropped
+	// because of a problem encountered when processing an IPv6 extension
+	// header.
+	ExtensionHeaderProblem *StatCounter
+
+	// Errors is the number of IP packets received which could not be
+	// successfully forwarded.
+	Errors *StatCounter
+
+	// LINT.ThenChange(network/internal/ip/stats.go:multiCounterIPForwardingStats)
+}
+
 // IPStats collects IP-specific stats (both v4 and v6).
 type IPStats struct {
 	// LINT.IfChange(IPStats)
 
 	// PacketsReceived is the number of IP packets received from the link layer.
 	PacketsReceived *StatCounter
+
+	// ValidPacketsReceived is the number of valid IP packets that reached the IP
+	// layer.
+	ValidPacketsReceived *StatCounter
 
 	// DisabledPacketsReceived is the number of IP packets received from the link
 	// layer when the IP layer is disabled.
@@ -1552,9 +1614,17 @@ type IPStats struct {
 	// chain.
 	IPTablesInputDropped *StatCounter
 
+	// IPTablesForwardDropped is the number of IP packets dropped in the Forward
+	// chain.
+	IPTablesForwardDropped *StatCounter
+
 	// IPTablesOutputDropped is the number of IP packets dropped in the Output
 	// chain.
 	IPTablesOutputDropped *StatCounter
+
+	// IPTablesPostroutingDropped is the number of IP packets dropped in the
+	// Postrouting chain.
+	IPTablesPostroutingDropped *StatCounter
 
 	// TODO(https://gvisor.dev/issues/5529): Move the IPv4-only option stats out
 	// of IPStats.
@@ -1569,6 +1639,9 @@ type IPStats struct {
 
 	// OptionUnknownReceived is the number of unknown IP options seen.
 	OptionUnknownReceived *StatCounter
+
+	// Forwarding collects stats related to IP forwarding.
+	Forwarding IPForwardingStats
 
 	// LINT.ThenChange(network/internal/ip/stats.go:MultiCounterIPStats)
 }
@@ -1728,6 +1801,10 @@ type TCPStats struct {
 
 	// ChecksumErrors is the number of segments dropped due to bad checksums.
 	ChecksumErrors *StatCounter
+
+	// FailedPortReservations is the number of times TCP failed to reserve
+	// a port.
+	FailedPortReservations *StatCounter
 }
 
 // UDPStats collects UDP-specific stats.

@@ -48,7 +48,7 @@ const (
 
 	// defaultHandleRAs is the default configuration for whether or not to
 	// handle incoming Router Advertisements as a host.
-	defaultHandleRAs = true
+	defaultHandleRAs = HandlingRAsEnabledWhenForwardingDisabled
 
 	// defaultDiscoverDefaultRouters is the default configuration for
 	// whether or not to discover default routers from incoming Router
@@ -301,10 +301,60 @@ type NDPDispatcher interface {
 	OnDHCPv6Configuration(tcpip.NICID, DHCPv6ConfigurationFromNDPRA)
 }
 
+var _ fmt.Stringer = HandleRAsConfiguration(0)
+
+// HandleRAsConfiguration enumerates when RAs may be handled.
+type HandleRAsConfiguration int
+
+const (
+	// HandlingRAsDisabled indicates that Router Advertisements will not be
+	// handled.
+	HandlingRAsDisabled HandleRAsConfiguration = iota
+
+	// HandlingRAsEnabledWhenForwardingDisabled indicates that router
+	// advertisements will only be handled when forwarding is disabled.
+	HandlingRAsEnabledWhenForwardingDisabled
+
+	// HandlingRAsAlwaysEnabled indicates that Router Advertisements will always
+	// be handled, even when forwarding is enabled.
+	HandlingRAsAlwaysEnabled
+)
+
+// String implements fmt.Stringer.
+func (c HandleRAsConfiguration) String() string {
+	switch c {
+	case HandlingRAsDisabled:
+		return "HandlingRAsDisabled"
+	case HandlingRAsEnabledWhenForwardingDisabled:
+		return "HandlingRAsEnabledWhenForwardingDisabled"
+	case HandlingRAsAlwaysEnabled:
+		return "HandlingRAsAlwaysEnabled"
+	default:
+		return fmt.Sprintf("HandleRAsConfiguration(%d)", c)
+	}
+}
+
+// enabled returns true iff Router Advertisements may be handled given the
+// specified forwarding status.
+func (c HandleRAsConfiguration) enabled(forwarding bool) bool {
+	switch c {
+	case HandlingRAsDisabled:
+		return false
+	case HandlingRAsEnabledWhenForwardingDisabled:
+		return !forwarding
+	case HandlingRAsAlwaysEnabled:
+		return true
+	default:
+		panic(fmt.Sprintf("unhandled HandleRAsConfiguration = %d", c))
+	}
+}
+
 // NDPConfigurations is the NDP configurations for the netstack.
 type NDPConfigurations struct {
 	// The number of Router Solicitation messages to send when the IPv6 endpoint
 	// becomes enabled.
+	//
+	// Ignored unless configured to handle Router Advertisements.
 	MaxRtrSolicitations uint8
 
 	// The amount of time between transmitting Router Solicitation messages.
@@ -318,8 +368,9 @@ type NDPConfigurations struct {
 	// Must be greater than or equal to 0s.
 	MaxRtrSolicitationDelay time.Duration
 
-	// HandleRAs determines whether or not Router Advertisements are processed.
-	HandleRAs bool
+	// HandleRAs is the configuration for when Router Advertisements should be
+	// handled.
+	HandleRAs HandleRAsConfiguration
 
 	// DiscoverDefaultRouters determines whether or not default routers are
 	// discovered from Router Advertisements, as per RFC 4861 section 6. This
@@ -654,7 +705,8 @@ func (ndp *ndpState) handleRA(ip tcpip.Address, ra header.NDPRouterAdvert) {
 	// per-interface basis; it is a protocol-wide configuration, so we check the
 	// protocol's forwarding flag to determine if the IPv6 endpoint is forwarding
 	// packets.
-	if !ndp.configs.HandleRAs || ndp.ep.protocol.Forwarding() {
+	if !ndp.configs.HandleRAs.enabled(ndp.ep.protocol.Forwarding()) {
+		ndp.ep.stats.localStats.UnhandledRouterAdvertisements.Increment()
 		return
 	}
 
@@ -737,7 +789,7 @@ func (ndp *ndpState) handleRA(ip tcpip.Address, ra header.NDPRouterAdvert) {
 			prefix := opt.Subnet()
 
 			// Is the prefix a link-local?
-			if header.IsV6LinkLocalAddress(prefix.ID()) {
+			if header.IsV6LinkLocalUnicastAddress(prefix.ID()) {
 				// ...Yes, skip as per RFC 4861 section 6.3.4,
 				// and RFC 4862 section 5.5.3.b (for SLAAC).
 				continue
@@ -1609,44 +1661,16 @@ func (ndp *ndpState) cleanupTempSLAACAddrResourcesAndNotifyInner(tempAddrs map[t
 	delete(tempAddrs, tempAddr)
 }
 
-// removeSLAACAddresses removes all SLAAC addresses.
-//
-// If keepLinkLocal is false, the SLAAC generated link-local address is removed.
-//
-// The IPv6 endpoint that ndp belongs to MUST be locked.
-func (ndp *ndpState) removeSLAACAddresses(keepLinkLocal bool) {
-	linkLocalSubnet := header.IPv6LinkLocalPrefix.Subnet()
-	var linkLocalPrefixes int
-	for prefix, state := range ndp.slaacPrefixes {
-		// RFC 4862 section 5 states that routers are also expected to generate a
-		// link-local address so we do not invalidate them if we are cleaning up
-		// host-only state.
-		if keepLinkLocal && prefix == linkLocalSubnet {
-			linkLocalPrefixes++
-			continue
-		}
-
-		ndp.invalidateSLAACPrefix(prefix, state)
-	}
-
-	if got := len(ndp.slaacPrefixes); got != linkLocalPrefixes {
-		panic(fmt.Sprintf("ndp: still have non-linklocal SLAAC prefixes after cleaning up; found = %d prefixes, of which %d are link-local", got, linkLocalPrefixes))
-	}
-}
-
 // cleanupState cleans up ndp's state.
-//
-// If hostOnly is true, then only host-specific state is cleaned up.
 //
 // This function invalidates all discovered on-link prefixes, discovered
 // routers, and auto-generated addresses.
 //
-// If hostOnly is true, then the link-local auto-generated address aren't
-// invalidated as routers are also expected to generate a link-local address.
-//
 // The IPv6 endpoint that ndp belongs to MUST be locked.
-func (ndp *ndpState) cleanupState(hostOnly bool) {
-	ndp.removeSLAACAddresses(hostOnly /* keepLinkLocal */)
+func (ndp *ndpState) cleanupState() {
+	for prefix, state := range ndp.slaacPrefixes {
+		ndp.invalidateSLAACPrefix(prefix, state)
+	}
 
 	for prefix := range ndp.onLinkPrefixes {
 		ndp.invalidateOnLinkPrefix(prefix)
@@ -1670,6 +1694,10 @@ func (ndp *ndpState) cleanupState(hostOnly bool) {
 // startSolicitingRouters starts soliciting routers, as per RFC 4861 section
 // 6.3.7. If routers are already being solicited, this function does nothing.
 //
+// If ndp is not configured to handle Router Advertisements, routers will not
+// be solicited as there is no point soliciting routers if we don't handle their
+// advertisements.
+//
 // The IPv6 endpoint that ndp belongs to MUST be locked.
 func (ndp *ndpState) startSolicitingRouters() {
 	if ndp.rtrSolicitTimer.timer != nil {
@@ -1679,6 +1707,10 @@ func (ndp *ndpState) startSolicitingRouters() {
 
 	remaining := ndp.configs.MaxRtrSolicitations
 	if remaining == 0 {
+		return
+	}
+
+	if !ndp.configs.HandleRAs.enabled(ndp.ep.protocol.Forwarding()) {
 		return
 	}
 
@@ -1746,7 +1778,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 				panic(fmt.Sprintf("failed to add IP header: %s", err))
 			}
 
-			if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersLinkLocalMulticastAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
+			if err := ndp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(header.IPv6AllRoutersLinkLocalMulticastAddress), ProtocolNumber, pkt); err != nil {
 				sent.dropped.Increment()
 				// Don't send any more messages if we had an error.
 				remaining = 0
@@ -1771,6 +1803,32 @@ func (ndp *ndpState) startSolicitingRouters() {
 
 			ndp.rtrSolicitTimer.timer.Reset(ndp.configs.RtrSolicitationInterval)
 		}),
+	}
+}
+
+// forwardingChanged handles a change in forwarding configuration.
+//
+// If transitioning to a host, router solicitation will be started. Otherwise,
+// router solicitation will be stopped if NDP is not configured to handle RAs
+// as a router.
+//
+// Precondition: ndp.ep.mu must be locked.
+func (ndp *ndpState) forwardingChanged(forwarding bool) {
+	if forwarding {
+		if ndp.configs.HandleRAs.enabled(forwarding) {
+			return
+		}
+
+		ndp.stopSolicitingRouters()
+		return
+	}
+
+	// Solicit routers when transitioning to a host.
+	//
+	// If the endpoint is not currently enabled, routers will be solicited when
+	// the endpoint becomes enabled (if it is still a host).
+	if ndp.ep.Enabled() {
+		ndp.startSolicitingRouters()
 	}
 }
 
@@ -1839,7 +1897,7 @@ func (e *endpoint) sendNDPNS(srcAddr, dstAddr, targetAddr tcpip.Address, remoteL
 	}
 
 	sent := e.stats.icmp.packetsSent
-	err := e.nic.WritePacketToRemote(remoteLinkAddr, nil /* gso */, ProtocolNumber, pkt)
+	err := e.nic.WritePacketToRemote(remoteLinkAddr, ProtocolNumber, pkt)
 	if err != nil {
 		sent.dropped.Increment()
 	} else {

@@ -68,9 +68,6 @@ const (
 	// DefaultSynRetries is the default value for the number of SYN retransmits
 	// before a connect is aborted.
 	DefaultSynRetries = 6
-
-	// MaxListenBacklog is the maximum limit of listen backlog supported.
-	MaxListenBacklog = 1024
 )
 
 const (
@@ -162,8 +159,8 @@ func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, 
 // replyWithReset replies to the given segment with a reset segment.
 //
 // If the passed TTL is 0, then the route's default TTL will be used.
-func replyWithReset(stack *stack.Stack, s *segment, tos, ttl uint8) tcpip.Error {
-	route, err := stack.FindRoute(s.nicID, s.dstAddr, s.srcAddr, s.netProto, false /* multicastLoop */)
+func replyWithReset(st *stack.Stack, s *segment, tos, ttl uint8) tcpip.Error {
+	route, err := st.FindRoute(s.nicID, s.dstAddr, s.srcAddr, s.netProto, false /* multicastLoop */)
 	if err != nil {
 		return err
 	}
@@ -203,7 +200,7 @@ func replyWithReset(stack *stack.Stack, s *segment, tos, ttl uint8) tcpip.Error 
 		seq:    seq,
 		ack:    ack,
 		rcvWnd: 0,
-	}, buffer.VectorisedView{}, nil /* gso */, nil /* PacketOwner */)
+	}, buffer.VectorisedView{}, stack.GSO{}, nil /* PacketOwner */)
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
