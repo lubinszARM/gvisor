@@ -106,29 +106,29 @@
 
 // Loads the application's fpstate.
 #define FPSTATE_EL0_LOAD() \
-  MRS TPIDR_EL1, RSV_REG; \
-  MOVD CPU_FPSTATE_EL0(RSV_REG), RSV_REG; \
-  MOVD 0(RSV_REG), RSV_REG_APP; \
-  MOVD RSV_REG_APP, FPSR; \
-  MOVD 8(RSV_REG), RSV_REG_APP; \
-  MOVD RSV_REG_APP, FPCR; \
-  ADD $16, RSV_REG, RSV_REG; \
-  WORD $0xad400640; \ // ldp q0, q1, [x18]
-  WORD $0xad410e42; \
-  WORD $0xad421644; \
-  WORD $0xad431e46; \
-  WORD $0xad442648; \
-  WORD $0xad452e4a; \
-  WORD $0xad46364c; \
-  WORD $0xad473e4e; \
-  WORD $0xad484650; \
-  WORD $0xad494e52; \
-  WORD $0xad4a5654; \
-  WORD $0xad4b5e56; \
-  WORD $0xad4c6658; \
-  WORD $0xad4d6e5a; \
-  WORD $0xad4e765c; \
-  WORD $0xad4f7e5e;
+  MRS TPIDR_EL1, R24; \
+  MOVD CPU_FPSTATE_EL0(R24), R24; \
+  MOVD 0(R24), R25; \
+  MOVD R25, FPSR; \
+  MOVD 8(R24), R25; \
+  MOVD R25, FPCR; \
+  ADD $16, R24, R24; \
+  WORD $0xad400700; \ //    ldp q0, q1, [x24]
+  WORD $0xad410f02; \ //    ldp q2, q3, [x24, #32]
+  WORD $0xad421704; \ //    ldp q4, q5, [x24, #64]
+  WORD $0xad431f06; \ //    ldp q6, q7, [x24, #96]
+  WORD $0xad442708; \ //    ldp q8, q9, [x24, #128]
+  WORD $0xad452f0a; \ //    ldp q10, q11, [x24, #160]
+  WORD $0xad46370c; \ //    ldp q12, q13, [x24, #192]
+  WORD $0xad473f0e; \ //    ldp q14, q15, [x24, #224]
+  WORD $0xad484710; \ //    ldp q16, q17, [x24, #256]
+  WORD $0xad494f12; \ //    ldp q18, q19, [x24, #288]
+  WORD $0xad4a5714; \ //    ldp q20, q21, [x24, #320]
+  WORD $0xad4b5f16; \ //    ldp q22, q23, [x24, #352]
+  WORD $0xad4c6718; \ //    ldp q24, q25, [x24, #384]
+  WORD $0xad4d6f1a; \ //    ldp q26, q27, [x24, #416]
+  WORD $0xad4e771c; \ //    ldp q28, q29, [x24, #448]
+  WORD $0xad4f7f1e;  //    ldp q30, q31, [x24, #480]
 
 #define ESR_ELx_EC_UNKNOWN	(0x00)
 #define ESR_ELx_EC_WFx		(0x01)
@@ -579,17 +579,25 @@ TEXT ·El1_error_invalid(SB),NOSPLIT,$0
 
 // El1_sync is the handler for El1_sync.
 TEXT ·El1_sync(SB),NOSPLIT,$0
-	KERNEL_ENTRY_FROM_EL1
+	// Handle the excption triggered by fp first.
+	WORD $0xa9bf67f8    // stp x24, x25, [sp, #-16]!
+	MRS ESR_EL1, R25
+	LSR  $ESR_ELx_EC_SHIFT, R25, R24
+	CMP $ESR_ELx_EC_FP_ASIMD, R24
+	BEQ el1_fpsimd_acc                // FP/ASIMD access
+	CMP $ESR_ELx_EC_SVE, R24
+	BEQ el1_sve_acc                   // SVE access
+
+	// restore r24/r25.
+	WORD $0xa8c167f8    // ldp x24, s25, [sp], #16
+
+	KERNEL_ENTRY_FROM_EL1             // context switching
 	MRS ESR_EL1, R25                  // read the syndrome register
 	LSR  $ESR_ELx_EC_SHIFT, R25, R24  // exception class
 	CMP $ESR_ELx_EC_DABT_CUR, R24
 	BEQ el1_da                        // data abort in EL1
 	CMP $ESR_ELx_EC_IABT_CUR, R24
 	BEQ el1_ia                        // instruction abort in EL1
-	CMP $ESR_ELx_EC_FP_ASIMD, R24
-	BEQ el1_fpsimd_acc                // FP/ASIMD access
-	CMP $ESR_ELx_EC_SVE, R24
-	BEQ el1_sve_acc                   // SVE access
 	CMP $ESR_ELx_EC_SP_ALIGN, R24
 	BEQ el1_sp_pc                     // stack alignment exception
 	CMP $ESR_ELx_EC_PC_ALIGN, R24
@@ -616,18 +624,10 @@ el1_dbg:
 	EXCEPTION_EL1(El1SyncDbg)
 el1_fpsimd_acc:
 el1_sve_acc:
-	FPSIMD_DISABLE_TRAP(RSV_REG)
+	FPSIMD_DISABLE_TRAP(R24)
 
-	// Restore context.
-	MRS TPIDR_EL1, RSV_REG
-
-	// Restore sp.
-	MOVD CPU_REGISTERS+PTRACE_SP(RSV_REG), R1
-	MOVD R1, RSP
-
-	// Restore common registers.
-	REGISTERS_LOAD(RSV_REG, CPU_REGISTERS)
-	MOVD CPU_REGISTERS+PTRACE_R19(RSV_REG), RSV_REG_APP
+	// restore context.
+	WORD $0xa8c167f8    // ldp x24, s25, [sp], #16
 
 	ERET()	// return to el1.
 
@@ -648,7 +648,19 @@ TEXT ·El1_error(SB),NOSPLIT,$0
 
 // El0_sync is the handler for El0_sync.
 TEXT ·El0_sync(SB),NOSPLIT,$0
-	KERNEL_ENTRY_FROM_EL0
+	// Handle the excption triggered by fp first.
+	WORD $0xa9bf67f8    // stp x24, x25, [sp, #-16]!
+	MRS ESR_EL1, R25
+	LSR  $ESR_ELx_EC_SHIFT, R25, R24
+	CMP $ESR_ELx_EC_FP_ASIMD, R24
+	BEQ el0_fpsimd_acc                // FP/ASIMD access
+	CMP $ESR_ELx_EC_SVE, R24
+	BEQ el0_sve_acc                   // SVE access
+
+	// restore r24/r25.
+	WORD $0xa8c167f8    // ldp x24, s25, [sp], #16
+
+	KERNEL_ENTRY_FROM_EL0             // context switching
 	MRS ESR_EL1, R25                  // read the syndrome register
 	LSR  $ESR_ELx_EC_SHIFT, R25, R24  // exception class
 	CMP $ESR_ELx_EC_SVC64, R24
@@ -657,10 +669,6 @@ TEXT ·El0_sync(SB),NOSPLIT,$0
 	BEQ el0_da                        // data abort in EL0
 	CMP $ESR_ELx_EC_IABT_LOW, R24
 	BEQ el0_ia                        // instruction abort in EL0
-	CMP $ESR_ELx_EC_FP_ASIMD, R24
-	BEQ el0_fpsimd_acc                // FP/ASIMD access
-	CMP $ESR_ELx_EC_SVE, R24
-	BEQ el0_sve_acc                   // SVE access
 	CMP $ESR_ELx_EC_FP_EXC64, R24
 	BEQ el0_fpsimd_exc                // FP/ASIMD exception
 	CMP $ESR_ELx_EC_SP_ALIGN, R24
@@ -695,19 +703,13 @@ el0_ia:
 	EXCEPTION_EL0(PageFault)
 el0_fpsimd_acc:
 el0_sve_acc:
-	FPSIMD_DISABLE_TRAP(RSV_REG)
+	FPSIMD_DISABLE_TRAP(R24)
 	FPSTATE_EL0_LOAD()
 
-	// Restore context.
-	MRS TPIDR_EL1, RSV_REG
-	MOVD CPU_APP_ADDR(RSV_REG), RSV_REG_APP
-
-	// Restore R0-R30
-	REGISTERS_LOAD(RSV_REG_APP, 0)
-	MOVD PTRACE_R18(RSV_REG_APP), RSV_REG
-	MOVD PTRACE_R19(RSV_REG_APP), RSV_REG_APP
-
+	// restore r24/r25.
+	WORD $0xa8c167f8    // ldp x24, s25, [sp], #16
 	ERET()  // return to el0.
+
 el0_fpsimd_exc:
 	EXCEPTION_EL0(El0SyncFpsimdExc)
 el0_sp_pc:
