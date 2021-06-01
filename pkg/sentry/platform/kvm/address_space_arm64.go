@@ -1,4 +1,4 @@
-// Copyright 2020 The gVisor Authors.
+// Copyright 2021 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,29 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package stack
+package kvm
 
 import (
-	"math/rand"
-
-	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/ring0"
 )
 
-// lockedRandomSource provides a threadsafe rand.Source.
-type lockedRandomSource struct {
-	mu  sync.Mutex
-	src rand.Source
-}
-
-func (r *lockedRandomSource) Int63() (n int64) {
-	r.mu.Lock()
-	n = r.src.Int63()
-	r.mu.Unlock()
-	return n
-}
-
-func (r *lockedRandomSource) Seed(seed int64) {
-	r.mu.Lock()
-	r.src.Seed(seed)
-	r.mu.Unlock()
+// invalidate is the implementation for Invalidate.
+func (as *addressSpace) invalidate() {
+	bluepill(as.pageTables.Allocator.(*allocator).cpu)
+	ring0.FlushTlbAll()
 }
